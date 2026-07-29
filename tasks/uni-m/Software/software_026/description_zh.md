@@ -1,0 +1,17 @@
+**任务要求：**
+
+对 2024 年第四季度执行一次季度工程投资组合审查。在 OpenProject 项目 "API Gateway" 中，打开 Work packages 列表，并筛选状态为 Closed 且 Updated Date 位于 [2024-10-01, 2024-12-31] 的工作包；按 Work Package ID 升序最多取前 30 条结果。在 Baserow 中，创建数据库 "Portfolio Review Q4-2024" 和两张表。表 1 "Closed Work Packages"（字段：WP ID [primary number]、Subject [text]、Type [single-select: Task/Bug/Feature/Epic/Milestone]、Assignee [text]、Investment Bucket [single-select: NewFeature/TechDebt/Reliability/Security]、Team [single-select，取值为 ['Platform','Product','Data','Security','Reliability']]、Closed Date [date]）。对每个被选中的 work package 精确插入一行，并按以下规则分配 Investment Bucket：若 Subject 包含 ['security','auth','vulnerability','sso','saml','encrypt','secure'] 中任意词，则为 Security；若包含 ['reliability','sla','alert','monitor','latency','timeout','502','error','uptime','availability'] 中任意词，则为 Reliability；若 Type 为 Bug，或 Subject 包含 ['refactor','cleanup','migrate','upgrade','debt','legacy','tuning'] 中任意词，则为 TechDebt；否则为 NewFeature。Team 按 {'David Kim':'Platform','Frank Nguyen':'Product','Grace Patel':'Product','Henry Johnson':'Data','James Lee':'Platform','Liam Robinson':'Product','Mia Anderson':'Platform','Paul Harris':'Platform','Samuel Clark':'Security','OpenProject Admin':'Platform'}（以 Assignee 为键）分配。表 2 "Bucket Totals"（字段：Bucket [primary single-select: NewFeature/TechDebt/Reliability/Security]、Count [number]、Share Pct [number with 1 decimal]、Target Pct [number with 1 decimal]、Gap Pct [number with 1 decimal]）。精确插入 4 行，按 NewFeature、TechDebt、Reliability、Security 的顺序各一行；Count 为该 bucket 中的 Closed Work Packages 行数；Share Pct = round(Count / <total_closed> * 100, 1)；Target Pct 来自 {'NewFeature':50.0,'TechDebt':25.0,'Reliability':15.0,'Security':10.0}（以 bucket 名为键）；Gap Pct = round(Target Pct - Share Pct, 1)。在 code-server 中，创建一个新文件 devops-configs/docs/portfolio-review-Q4-2024.md，且恰好包含五行：第 1 行 "# Engineering Investment Portfolio — Q4-2024"，第 2 行 "Window: 2024-10-01 → 2024-12-31"，第 3 行 "Closed work packages: <total_closed>"，第 4 行 "Actual shares — NewFeature: <nf>%; TechDebt: <td>%; Reliability: <rel>%; Security: <sec>%"，第 5 行 "Target shares — NewFeature: <nf_t>%; TechDebt: <td_t>%; Reliability: <rel_t>%; Security: <sec_t>%"；保存文件。在 OpenProject 项目 "API Gateway" 中，为每一个 Gap Pct > 0（即 under-invested）的 bucket 创建恰好一个 Task-type work package，主题为 "Rebalance next quarter: <Bucket> (+<Gap Pct>%)"，assignee 为 OpenProject Admin，priority 为 Normal，描述精确为 "Current: <Share Pct>%; Target: <Target Pct>%; Quarter under review: Q4-2024"。
+
+**步骤：**
+
+1. 在 OpenProject API Gateway 中，筛选 Work packages 为 Status=Closed 且 Updated Date 位于 [2024-10-01,2024-12-31]，按 WP ID 升序取前 30 条。
+2. 在 Baserow 中，创建数据库 Portfolio Review Q4-2024 和表 "Closed Work Packages"，使用指定 schema；按 investment bucket 分类规则和 Assignee→Team 映射 {'David Kim':'Platform','Frank Nguyen':'Product','Grace Patel':'Product','Henry Johnson':'Data','James Lee':'Platform','Liam Robinson':'Product','Mia Anderson':'Platform','Paul Harris':'Platform','Samuel Clark':'Security','OpenProject Admin':'Platform'} 插入每个选中的 work package 一行。
+3. 创建 "Bucket Totals" 表，按指定顺序插入 4 行，并计算 Count、Share Pct、Target Pct（来自 {'NewFeature':50.0,'TechDebt':25.0,'Reliability':15.0,'Security':10.0}）以及 Gap Pct。
+4. 在 code-server 中，创建 devops-configs/docs/portfolio-review-Q4-2024.md，且仅包含指定的五行，并保存。
+5. 在 OpenProject 中，为 Gap Pct > 0 的每个 bucket 创建一个 Task work package，使用指定的主题、assignee、priority 和描述格式。
+
+**登录凭据：**
+
+- openproject: admin / AdminPass123!
+- baserow: admin@example.com / Admin1234
+- code-server: (no username) / 8a128206e2177bce1e48e565
