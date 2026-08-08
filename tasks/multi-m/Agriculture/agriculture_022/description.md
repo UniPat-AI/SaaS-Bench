@@ -1,25 +1,33 @@
 **Task Requirements:**
-The farm's organic audit requires reconciling the warehouse's delivery manifest against FarmOS harvest records. For each Grocy product below, the manifest records a batch number, which is supposed to be the exact name of the FarmOS harvest log the delivery came from.
+The organic audit manifest below maps real Grocy products to FarmOS batch names. Reconcile all eight rows against FarmOS and mark only the rows that have no exact **Harvest** log match.
 
-For each product in the manifest, query FarmOS (Logs → Harvest) and check whether a harvest log exists whose name is **exactly** the batch number from the manifest (character-for-character). If a product's batch number has NO matching FarmOS harvest log, you must do two things: 1) append the note `DISCREPANCY: No matching FarmOS harvest log found` to the product's description (keep the existing description text intact and add the note after it), and 2) append `[REVIEW REQUIRED]` to the end of the product's name. Do not modify products whose batch number has a matching FarmOS harvest log. Product names refer to the Grocy product with that exact name.
+A batch is matched only when FarmOS contains a log with `Type = Harvest` whose name is character-for-character identical to the batch number. Logs of every other type are non-matches even when their names are identical.
 
-**Delivery manifest (Grocy product → batch number):**
+The listed Grocy seed products have empty descriptions. For every unmatched row, make both changes below:
 
-| Grocy product | Batch number |
-|---|---|
-| 365 Everyday Value, Fat Free Skim Milk | Cow Milk — Weekly Collection August Week 1 |
-| Clover Honey | 2024 Honey Harvest — Hive A and B |
-| Pure Raw Honey | 2024 Honey Harvest — Hive A and B |
-| Black Forest Girl, Homemade Spaetzles, Egg Noodles | 2024 Egg Collection — Weekly Tally August Week 3 |
-| Nonfat Greek Yogurt | 2024 Goat Milk Collection — Weekly Tally September Week 1 |
-| Cottage Cheese | 2024 Sheep Milk Collection — Weekly Tally August Week 3 |
-| Kfactor 22 Manuka Honey | 2024 Manuka Honey Harvest — Hive C |
-| Monterey Jack Cheese | 2024 Cow Milk — Weekly Collection September Week 2 |
+- Rename the product to `<original exact name> [REVIEW REQUIRED]` with one terminal suffix.
+- Set its description to exactly `DISCREPANCY: No matching FarmOS harvest log found | batch=<batch number>` using that row's full batch number.
+
+Leave matched products unchanged and preserve all eight manifest barcodes. Do not place the review suffix or discrepancy marker on any product outside this manifest.
+
+**Delivery manifest:**
+
+| Grocy product (exact original name) | Barcode | Batch number |
+|---|---|---|
+| Caillé nature | 0002000014391 | Soybean Planting Activity |
+| Macarroni and cheese dinner | 0005329003107 | Irrigation System Check |
+| Hard Boiled Eggs | 00003100 | Cover Crop Seeding |
+| Creamed Honey, Multi-Floral & Clover Blossoms | 00015318 | Crop Scouting Report |
+| mostly mesquite honey | 00015349 | Hay Baling Operation |
+| West country luxury yogurt Rhubarb Custard | 00033893 | Spring Plowing Complete |
+| Victoria plum and bergamot yogurt | 00033909 | Bird Netting Installation |
+| Cornish Cove Grated Cheddar Mature | 00046473 | Grain Bin Inventory Check |
 
 **Steps:**
-1. For each manifest entry, look up the Grocy product and search the FarmOS harvest logs for the exact batch number.
-2. Identify the products whose batch number is missing from the FarmOS harvest logs.
-3. Flag each discrepant product: append the discrepancy note to its description and `[REVIEW REQUIRED]` to its name.
+1. Filter FarmOS Logs to Harvest and compare all batch names exactly.
+2. In Grocy, identify each product by its exact original name and barcode.
+3. Apply the exact name suffix and batch-specific description only to unmatched rows.
+4. Verify that matched products remain unchanged and that unrelated products carry no task review signal.
 
 **Login Credentials:**
 

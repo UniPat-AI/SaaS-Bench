@@ -3,6 +3,7 @@
   "category_id": "Agriculture",
   "meta_data": {
     "sites": [
+      "farmos",
       "e-label"
     ],
     "require_login": true

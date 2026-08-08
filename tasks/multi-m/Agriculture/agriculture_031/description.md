@@ -1,35 +1,19 @@
 **Task Requirements:**
-A customer uploaded a photo of a dish: **Beef and Broccoli Stir-Fry** (Chinese cuisine). Build the traceability chain for the dish's primary green vegetable — broccoli — across Recipya, Grocy and FarmOS.
 
-Step 1 — Recipya: search the recipe library for this dish. The library has no matching recipe yet, so create a new recipe:
+A customer supplied `tasks/multi-m/inputs/recipya_recipe_006.jpg`. Inspect the photo and infer the dish, cuisine, primary green vegetable, and primary protein. Do not rely on filename metadata as the answer. Build a traceability chain from that visual inference across Recipya, Grocy, and FarmOS.
 
-- Name: `Beef and Broccoli Stir-Fry`
-- Cuisine: Chinese
-- Ingredients: include one line with broccoli (e.g. `500 g broccoli, cut into florets`) and one line with beef (e.g. `300 g beef sirloin, sliced`), plus any seasonings you like
-- Save the recipe and note its numeric recipe ID (shown in the recipe page URL, e.g. `/recipes/301`)
+1. Recipya has no matching recipe. Create one under `admin@recipya.com` using the conventional English dish name supported by the photo. Set the inferred cuisine, include quantified ingredient lines for the primary green vegetable and primary protein, add at least four cooking instructions, and upload the supplied photo as that exact recipe's image. Record its numeric recipe ID.
+2. In Grocy, create the product whose name is exactly the primary green vegetable inferred from the photo and record a positive purchase so it has stock.
+3. In FarmOS, find the exact, most recent harvest log for that vegetable's side-shoot harvest from North Field East Bed. Ensure that log is linked to the land asset named exactly `North Field — East Bed`, then append the organic certification number `OMRI-ORG-2024-1187` to that exact log's notes; do not annotate another harvest log or another land asset.
+4. In the Grocy product description, preserve any existing text and append both exact lines:
+   - `Recipya recipe ID: <numeric recipe ID>`
+   - `OMRI certification: OMRI-ORG-2024-1187`
 
-Step 2 — Grocy: look up broccoli in the stock. There is no plain broccoli product yet, so:
+The Grocy traceability description is valid only when its recipe ID comes from the visually verified Recipya recipe and its certification is present in the exact FarmOS harvest log.
 
-- Create a new product named exactly `Broccoli`
-- Record a purchase/receipt for it (any amount), so the product has stock on hand
+**Input file:**
 
-Step 3 — FarmOS: open the most recent Harvest log for broccoli, `2024 Broccoli Harvest — North Field East Bed (Side Shoots)`. The supplying farm's organic certification number is `OMRI-ORG-2024-1187`. Edit this harvest log and add the certification number to its notes, so the harvest is linked to the farm's organic certification for the upcoming audit.
-
-Step 4 — Grocy: open the `Broccoli` product and append to its description both the Recipya recipe ID from Step 1 and the OMRI certification number `OMRI-ORG-2024-1187` from Step 3.
-
-**Steps:**
-1. Identify the dish in the photo as Beef and Broccoli Stir-Fry; in Recipya, create the recipe exactly as specified and note its numeric ID.
-2. In Grocy, create the `Broccoli` product and add stock via a purchase.
-3. In FarmOS, edit the latest broccoli harvest log and add the OMRI certification number `OMRI-ORG-2024-1187` to its notes.
-4. Back in Grocy, append the Recipya recipe ID and the OMRI certification number to the `Broccoli` product's description.
-
-**Input files:**
-- **File 1:** `tasks/multi-m/inputs/recipya_recipe_006.jpg`
-  - Type: image/jpeg
-  - Source app: recipya
-  - Metadata:
-    - name: Beef and Broccoli Stir-Fry
-    - cuisine: Chinese
+- `tasks/multi-m/inputs/recipya_recipe_006.jpg` — customer dish photo to inspect and upload to the target Recipya recipe
 
 **Login Credentials:**
 

@@ -1,19 +1,37 @@
 **Task Requirements:**
-In FarmOS, create an activity log on 'Vineyard Block 1' for spring plowing, upload the provided field photo as an attachment to the log, and record the batch number 'VINO-2025-001' in the notes. In Grocy, create a new product 'Organic Estate Wine 2025' and set its batch number (in the description or custom field) to exactly 'VINO-2025-001'. In e-label, draft a new wine record for 'Organic Estate Wine 2025' and set its batch number to 'VINO-2025-001'. The batch number must be character-for-character identical across all three systems.
+Build a three-system traceability chain from an existing FarmOS image record. FarmOS contains two Harvest logs named exactly `Spring Plowing Complete` on the asset `Vineyard Block 1`. Open both records and inspect their attached photos. Select the record whose photo shows **a farmer holding a tablet, a drone in the air, and a tractor beside a barn**; do not use the record whose photo shows empty field crates.
+
+In the selected FarmOS record, preserve the existing notes and append both exact lines:
+
+`TRACEABILITY BATCH: VINO-2025-081`
+
+`FIELD METHOD: Drone-assisted`
+
+Do not modify the notes of the other `Spring Plowing Complete` record.
+
+In Grocy, create exactly one product named `Drone-Assisted Estate Wine 2025`. Set its description to the following three lines:
+
+`TRACEABILITY BATCH: VINO-2025-081`
+
+`FIELD METHOD: Drone-assisted`
+
+`FARMOS SOURCE: Spring Plowing Complete | Vineyard Block 1`
+
+In e-label, create exactly one wine record with these values:
+
+- Name: `Drone-Assisted Estate Wine 2025`
+- Brand: `Drone-Assisted Estate`
+- SKU / batch number: `VINO-2025-081`
+- Vintage: `2025`
+- Additional information: `FIELD METHOD: Drone-assisted; FARMOS SOURCE: Spring Plowing Complete; Vineyard Block 1`
+
+The exact batch number, image-derived field method, product name, and FarmOS source must agree across all three systems.
 
 **Steps:**
-1. Log the spring plowing activity in FarmOS with the batch number and upload the field photo as an attachment.
-2. Create the corresponding wine product in Grocy, ensuring the batch number is included.
-3. Draft the compliance label in e-label using the exact same batch number.
-
-**Input files:**
-- **File 1:** `tasks/multi-m/inputs/farmos_crop_021.jpg`
-  - Type: image/jpeg
-  - Source app: farmos
-  - Metadata:
-    - log_name: Spring Plowing Complete
-    - asset_name: Vineyard Block 1
-    - notes: Plowed 120 acres. Soil conditions excellent. Ready for planting.
+1. Use the FarmOS attachments to identify the correct source record by visual content.
+2. Append the two traceability lines to that record without removing its existing notes or changing the other candidate record.
+3. Create the exact Grocy product and description.
+4. Create the exact e-label wine record and complete the required traceability fields.
 
 **Login Credentials:**
 

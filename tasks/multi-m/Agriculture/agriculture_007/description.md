@@ -1,10 +1,19 @@
 **Task Requirements:**
-Tomatoes are currently overstocked in Grocy. Access Recipya and search for a recipe that uses tomatoes as a main ingredient and would help use up the surplus (e.g., a tomato sauce, soup, salsa, or stewed-tomato recipe — any tomato-based recipe found in Recipya is acceptable). Read the full ingredient list of the chosen recipe. Cross-reference these ingredients against Grocy's current stock. Add any missing auxiliary ingredients (like specific herbs, vinegar, or canning salt) to the Grocy shopping list, noting the recipe name in the shopping list entry.
+
+Tomatoes are overstocked in Grocy. Use a tomato-forward recipe from Recipya to build an exact restocking plan in Grocy. The recipe selection must use both the actual cover image and the ingredient list.
+
+1. In Recipya, browse recipes owned by `admin@recipya.com` that have cover images. Select one recipe whose cover visibly presents tomato as the dominant ingredient or sauce base and whose ingredient list explicitly contains tomato or tomatoes. Do not select from the title alone. Record the recipe's numeric ID from its URL and its exact displayed name.
+2. In Grocy, compare every non-tomato ingredient in that recipe with the current positive stock. A product counts as stocked only when it can directly supply that culinary ingredient; a flavored or composite product that merely mentions the ingredient does not count. Ignore quantities and preparation words, and deduplicate repeated forms of the same ingredient.
+3. For each unique auxiliary ingredient that is not in positive stock, add exactly one Grocy shopping-list entry with amount `1`. Use an existing suitable Grocy product when available. If no suitable product exists, first create a product named exactly as the ingredient text displayed by Recipya, then add it.
+4. Every entry created for this task must use the exact note `AG007 | Recipya #<id> | <exact recipe name>`, substituting the selected recipe's generated numeric ID and exact displayed name. Use the same note on every task entry.
+5. Do not add tomato ingredients, already-stocked ingredients, unrelated extras, or duplicate entries. Do not modify stock amounts.
 
 **Steps:**
-1. Search Recipya for a tomato-based recipe suitable for using up the surplus.
-2. Compare the recipe's ingredient list against Grocy inventory.
-3. Add missing items to the Grocy shopping list with a reference to the recipe.
+
+1. Inspect Recipya recipe covers and ingredient lists, then choose a visually tomato-dominant recipe.
+2. Read its generated recipe ID and exact name.
+3. Compare all auxiliary ingredients against Grocy's positive stock.
+4. Add the exact missing set to the Grocy shopping list with the generated Recipya marker.
 
 **Login Credentials:**
 

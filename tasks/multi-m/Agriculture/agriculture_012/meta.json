@@ -3,7 +3,8 @@
   "category_id": "Agriculture",
   "meta_data": {
     "sites": [
-      "e-label"
+      "e-label",
+      "grocy"
     ],
     "require_login": true
   }

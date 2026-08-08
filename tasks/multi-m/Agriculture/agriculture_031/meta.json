@@ -13,7 +13,7 @@
     {
       "file": "tasks/multi-m/inputs/recipya_recipe_006.jpg",
       "type": "image",
-      "role": "recipya_asset"
+      "role": "customer_dish_photo"
     }
   ]
 }
