@@ -68,7 +68,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -126,14 +126,14 @@ def get_ground_truth_deps() -> dict[str, dict[str, str]]:
     for project in ("blog-engine", "weather-dashboard"):
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "cat", f"/home/coder/{project}/package.json",
+            "cat", f"/home/coder/workspace/{project}/package.json",
             timeout=10,
         )
         if rc != 0:
             # Try alternate path
             rc, out, err = docker_exec(
                 CODE_SERVER_CONTAINER,
-                "cat", f"/home/coder/project/{project}/package.json",
+                "cat", f"/home/coder/workspace/{project}/package.json",
                 timeout=10,
             )
         if rc != 0:
@@ -255,13 +255,13 @@ def check_5_baserow_captured_at(table_id: int | None) -> None:
 
         # Find the Captured At field column
         field_info = baserow_sql(
-            f"SELECT f.id, f.db_column FROM database_field f "
+            f"SELECT f.id FROM database_field f "
             f"WHERE f.table_id = {table_id} AND f.name = 'Captured At' AND f.trashed = false"
         )
         if not field_info:
             check("5. Captured At dates", 2, False, "Captured At field not found")
             return
-        db_column = field_info.split('|')[1].strip() if '|' in field_info else f"field_{field_info.split('|')[0].strip()}"
+        db_column = f"field_{field_info.strip()}"
 
         total = baserow_sql(f"SELECT count(*) FROM database_table_{table_id}")
         correct = baserow_sql(
@@ -284,14 +284,14 @@ def check_6_baserow_stale_boolean(table_id: int | None, ground_truth: dict[str, 
 
         # Get field column mappings
         fields_raw = baserow_sql(
-            f"SELECT f.name, f.db_column FROM database_field f "
+            f"SELECT f.name, f.id FROM database_field f "
             f"WHERE f.table_id = {table_id} AND f.trashed = false"
         )
         field_map = {}
         for line in fields_raw.split('\n'):
             if '|' in line:
-                name, col = line.split('|', 1)
-                field_map[name.strip()] = col.strip()
+                name, fid = line.split('|', 1)
+                field_map[name.strip()] = f"field_{fid.strip()}"
 
         dep_col = field_map.get("Dependency Name", "")
         proj_col = field_map.get("Project", "")

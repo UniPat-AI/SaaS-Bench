@@ -64,7 +64,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -73,7 +73,7 @@ def op_db_query(sql: str, timeout: int = 15) -> str:
     """Query OpenProject's embedded PostgreSQL."""
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject", "-t", "-A", "-c", sql,
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject", "-t", "-A", "-c", sql,
         timeout=timeout,
     )
     return out.strip()
@@ -92,7 +92,7 @@ def baserow_auth() -> dict:
     headers = {"Authorization": f"JWT {token}"}
     test = requests.get(f"{BASEROW_URL}/api/applications/", headers=headers, timeout=10)
     if test.status_code == 401:
-        headers = {"Authorization": f"Token {token}"}
+        headers = {"Authorization": f"JWT {token}"}
     return headers
 
 

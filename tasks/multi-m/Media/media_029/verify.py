@@ -62,7 +62,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -96,7 +96,7 @@ def _get_watcharr_db() -> str:
     tmp.close()
     r = subprocess.run(
         ["docker", "cp", f"{WATCHARR_CONTAINER}:{WATCHARR_DB}", tmp_path],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, errors="replace", timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"docker cp failed (watcharr db): {r.stderr.strip()}")

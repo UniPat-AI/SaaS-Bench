@@ -53,7 +53,7 @@ def get_siyuan_token() -> str:
     """Read the API token from SiYuan's conf.json inside the container."""
     r = subprocess.run(
         ["docker", "exec", SIYUAN_CONTAINER, "cat", "/siyuan/workspace/conf/conf.json"],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         return ""

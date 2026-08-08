@@ -63,7 +63,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -171,7 +171,7 @@ def check_1_job_requisition() -> None:
     """Job requisition submitted for Business Analyst in Human Resources - TVS"""
     try:
         result = hrms_sql(
-            "SELECT name, docstatus, department, designation "
+            "SELECT name, docstatus, status, department, designation "
             "FROM `tabJob Requisition` "
             "WHERE designation='Business Analyst' "
             "AND department='Human Resources - TVS'"
@@ -180,9 +180,14 @@ def check_1_job_requisition() -> None:
             check("1. Job requisition submitted", 1, False, "not found")
             return
         row = result.split("\n")[0].split("\t")
-        docstatus = row[1] if len(row) > 1 else ""
-        check("1. Job requisition submitted", 1, docstatus == "1",
-              f"docstatus={docstatus}")
+        docstatus = row[1].strip() if len(row) > 1 else ""
+        status = row[2].strip() if len(row) > 2 else ""
+        # Job Requisition is not a submittable DocType in this HRMS instance
+        # (is_submittable=0), so docstatus can never reach 1; the workflow
+        # equivalent of "submitted" is an approved/open status.
+        passed = docstatus == "1" or status in ("Open & Approved", "Approved")
+        check("1. Job requisition submitted", 1, passed,
+              f"docstatus={docstatus} status={status}")
     except Exception as e:
         check("1. Job requisition submitted", 1, False, f"exception: {e}")
 

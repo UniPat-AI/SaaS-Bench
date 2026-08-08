@@ -63,7 +63,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -75,7 +75,7 @@ def op_sql(query: str) -> str:
          "bash", "-c",
          f"PGPASSWORD={OP_PASS} psql -h 127.0.0.1 -U {OP_USER} -d {OP_DB} -t -A"],
         input=query,
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         raise RuntimeError(f"psql error: {r.stderr.strip()}")
@@ -184,11 +184,56 @@ def check_2_table_and_fields() -> None:
         check("2. Table & fields", 2, False, f"exception: {e}")
 
 
+
+def _high_option_ids() -> set[str]:
+    """IDs of select options labelled 'High' on the Migration Complexity field.
+
+    Baserow stores single_select_equal filter values as option IDs, so a
+    functionally correct filter carries the ID, not the label.
+    """
+    try:
+        fields = baserow_get(f"database/fields/table/{_br_table_id}/", _br_token)
+        for f in fields:
+            if f.get("name") == "Migration Complexity":
+                return {str(o.get("id")) for o in f.get("select_options", [])
+                        if o.get("value") == "High"}
+    except Exception:
+        pass
+    return set()
+
+
+_discovered_projects: list[str] | None = None
+
+
+def _discover_ts_projects() -> list[str]:
+    """Ground truth: projects whose manifest actually contains "typescript".
+
+    Computed from the code-server fixture at verify time so the expected set
+    tracks the seeded data instead of a hardcoded list.
+    """
+    global _discovered_projects
+    if _discovered_projects is not None:
+        return _discovered_projects
+    found = []
+    for proj in ("blog-engine", "tabler", "todo-api", "weather-dashboard"):
+        for base in ("/home/coder/workspace", "/home/coder", "/home/coder/project"):
+            rc, out, _ = docker_exec(
+                CODE_SERVER_CONTAINER, "bash", "-c",
+                f"grep -rls typescript {base}/{proj}/package.json "
+                f"{base}/{proj}/*/package.json {base}/{proj}/requirements.txt 2>/dev/null | head -1",
+            )
+            if rc == 0 and out.strip():
+                found.append(proj)
+                break
+    _discovered_projects = sorted(found)
+    return _discovered_projects
+
+
 def check_3_row_projects() -> None:
-    """4 rows with correct Project names in alphabetical order."""
+    """One row per discovered project, in alphabetical order."""
     try:
         projects = [r.get("Project", "") for r in _br_rows]
-        expected = ["blog-engine", "tabler", "todo-api", "weather-dashboard"]
+        expected = _discover_ts_projects()
         ok = projects == expected
         check("3. Row projects (alpha order)", 2, ok,
               f"expected {expected}, got {projects}")
@@ -276,7 +321,8 @@ def check_6_high_complexity_view() -> None:
         mc_field_id = _br_field_map.get("Migration Complexity")
         has_filter = False
         for f in filter_list:
-            if f.get("field") == mc_field_id and "High" in str(f.get("value", "")):
+            fv = str(f.get("value", ""))
+            if f.get("field") == mc_field_id and ("High" in fv or fv.strip() in _high_option_ids()):
                 has_filter = True
                 break
         check("6. High Complexity view", 2, has_filter,
@@ -306,10 +352,11 @@ def check_8_openproject_epic() -> None:
         description = parts[1].strip() if len(parts) > 1 else ""
 
         # Description should contain "Campaign Date: 2026-07-08; Target: 5.4.5; Projects: 4"
+        n_projects = len(_discover_ts_projects())
         desc_ok = (
             "Campaign Date: 2026-07-08" in description
             and "Target: 5.4.5" in description
-            and "Projects: 4" in description
+            and f"Projects: {n_projects}" in description
         )
         check("8. OpenProject Epic", 2, desc_ok,
               f"description OK" if desc_ok else f"description={description!r}")
@@ -361,14 +408,14 @@ def check_9_openproject_tasks() -> None:
                     "priority": cols[4],
                 })
 
-        # We expect 3 tasks (blog-engine is Done, so only tabler, todo-api, weather-dashboard)
+        # One child Task per Baserow row with Status=Pending; the description
+        # sets every discovered row to Pending, so expect one per discovered project.
         # Expected subjects pattern: [<Project>] Bump typescript <Current Version> → 5.4.5
-        # We don't know Current Version at verify time, so check pattern
         issues = []
-        if len(tasks) != 3:
-            issues.append(f"expected 3 tasks, found {len(tasks)}")
+        expected_projects = set(_discover_ts_projects())
+        if len(tasks) != len(expected_projects):
+            issues.append(f"expected {len(expected_projects)} tasks, found {len(tasks)}")
 
-        expected_projects = {"tabler", "todo-api", "weather-dashboard"}
         found_projects = set()
         for task in tasks:
             subj = task["subject"]

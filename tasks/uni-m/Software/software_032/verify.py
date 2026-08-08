@@ -39,7 +39,7 @@ for _var_name, _var_val in [
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BACKLOG = [
-    {"subject": "Fix race condition in cart merge on login", "type": "Bug", "priority": "High", "estimated_hours": 6.0, "assignee": "Judith Triplett", "target_module": "blog-engine/src/routes/api.js"},
+    {"subject": "Fix race condition in cart merge on login", "type": "Bug", "priority": "High", "estimated_hours": 6.0, "assignee": "OpenProject Admin", "target_module": "blog-engine/src/routes/api.js"},
     {"subject": "Add structured logging to checkout routes", "type": "Task", "priority": "Normal", "estimated_hours": 4.5, "assignee": "John Marshall", "target_module": "todo-api/tests/test_categories.py"},
     {"subject": "Slug generation helper supports unicode", "type": "Feature", "priority": "Normal", "estimated_hours": 8.0, "assignee": "Lena Hogan", "target_module": "blog-engine/src/utils/slugify.js"},
     {"subject": "Export analyzer summary as JSON", "type": "Feature", "priority": "Low", "estimated_hours": 5.0, "assignee": "Jane Dradder", "target_module": "data-analyzer/src/analyzer.py"},
@@ -61,7 +61,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -69,7 +69,7 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
 def op_query(sql: str) -> str:
     """Run a psql query inside the OpenProject container (embedded Postgres)."""
     rc, out, err = docker_exec(
-        OP_CONTAINER, "psql", "-U", "openproject", "-d", "openproject",
+        OP_CONTAINER, "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
         "-t", "-A", "-c", sql
     )
     return out.strip()

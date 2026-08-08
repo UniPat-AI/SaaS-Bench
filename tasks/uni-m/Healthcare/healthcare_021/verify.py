@@ -60,7 +60,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -508,8 +508,16 @@ def check_16_onlyoffice_spreadsheet_sheets() -> None:
 
         file_id = f.get("id")
         # Download the file
-        dl_url = f"{ONLYOFFICE_BASE}/api/2.0/files/file/{file_id}/download"
-        r = requests.get(dl_url, headers=headers, timeout=30)
+        token = headers.get("Authorization", "")
+        r = requests.get(
+            f"{ONLYOFFICE_BASE}/products/files/httphandlers/filehandler.ashx",
+            params={"action": "download", "fileid": str(file_id)},
+            headers=headers, cookies={"asc_auth_key": token},
+            timeout=30, allow_redirects=True,
+        )
+        if not (r.ok and len(r.content) > 100):
+            dl_url = f"{ONLYOFFICE_BASE}/api/2.0/files/file/{file_id}/download"
+            r = requests.get(dl_url, headers=headers, timeout=30)
         if not r.ok:
             check("16. OnlyOffice spreadsheet sheets", 2, False,
                   f"download failed: {r.status_code}")

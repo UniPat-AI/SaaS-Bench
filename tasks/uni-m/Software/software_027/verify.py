@@ -80,7 +80,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -99,7 +99,7 @@ def baserow_auth() -> str:
 def baserow_get(path: str, token: str) -> dict:
     r = requests.get(
         f"{BASEROW_URL}/api/{path}",
-        headers={"Authorization": f"Token {token}"},
+        headers={"Authorization": f"JWT {token}"},
         timeout=15,
     )
     r.raise_for_status()
@@ -124,12 +124,12 @@ def check_1_project_dirs() -> None:
         missing = []
         for proj in PROJECTS:
             rc, out, err = docker_exec(
-                CODE_SERVER_CONTAINER, "test", "-d", f"/home/coder/project/{proj}"
+                CODE_SERVER_CONTAINER, "test", "-d", f"/home/coder/workspace/{proj}"
             )
             if rc != 0:
                 # Try alternate paths
                 rc2, _, _ = docker_exec(
-                    CODE_SERVER_CONTAINER, "test", "-d", f"/home/coder/{proj}"
+                    CODE_SERVER_CONTAINER, "test", "-d", f"/home/coder/workspace/{proj}"
                 )
                 if rc2 != 0:
                     missing.append(proj)

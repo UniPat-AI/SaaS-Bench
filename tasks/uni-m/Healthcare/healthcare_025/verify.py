@@ -60,7 +60,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -199,17 +199,20 @@ def check_4_ros_findings() -> None:
         if not pid or not enc:
             check("4. ROS constitutional+respiratory", 2, False, "no patient/encounter")
             return
+        # Select the named columns explicitly: mysql -sN output contains only
+        # values (YES/NO), never column names, so grepping "fever" in fr.* can
+        # structurally never succeed.
         result = openemr_sql(
-            f"SELECT fr.* FROM form_ros fr "
+            f"SELECT fr.fever, fr.cough FROM form_ros fr "
             f"INNER JOIN forms f ON f.form_id=fr.id AND f.formdir='ros' "
             f"WHERE f.pid={pid} AND f.encounter={enc} ORDER BY fr.id DESC LIMIT 1"
         )
         if not result:
             check("4. ROS constitutional+respiratory", 2, False, "no ROS form found")
             return
-        low = result.lower()
-        fever_ok = "fever" in low
-        cough_ok = "cough" in low
+        parts = [p.strip().lower() for p in result.split("\t")]
+        fever_ok = len(parts) > 0 and parts[0] == "yes"
+        cough_ok = len(parts) > 1 and parts[1] == "yes"
         check("4. ROS constitutional+respiratory", 2, fever_ok and cough_ok,
               f"fever={'found' if fever_ok else 'not found'}, cough={'found' if cough_ok else 'not found'}")
     except Exception as e:

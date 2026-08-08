@@ -47,7 +47,7 @@ def pretix_sql(query: str, timeout: int = 15) -> str:
     r = subprocess.run(
         ["docker", "exec", PRETIX_DB_CONTAINER,
          "psql", "-U", "pretix", "-d", "pretix", "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.stdout.strip()
 
@@ -57,7 +57,7 @@ def twenty_sql(query: str, timeout: int = 15) -> str:
     r = subprocess.run(
         ["docker", "exec", TWENTY_DB_CONTAINER,
          "psql", "-U", "postgres", "-d", "default", "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.stdout.strip()
 

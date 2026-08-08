@@ -55,7 +55,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -421,7 +421,7 @@ def check_13_bc_journal() -> None:
     """Published journal entry: debit Revenue 15000, credit Restricted Fund 15000."""
     try:
         r = bc_q(
-            "SELECT mj.DATE, mj.DESCRIPTION, mj.STATUS, "
+            "SELECT mj.DATE, mj.DESCRIPTION, mj.PUBLISHED_AT, "
             "mje.DEBIT, mje.CREDIT, a.NAME "
             "FROM MANUAL_JOURNALS mj "
             "JOIN MANUAL_JOURNALS_ENTRIES mje ON mje.MANUAL_JOURNAL_ID = mj.ID "
@@ -443,8 +443,8 @@ def check_13_bc_journal() -> None:
             parts = line.split("\t")
             if len(parts) < 6:
                 continue
-            status = parts[2].strip().lower()
-            if status in ("published", "1", "true"):
+            published_at = parts[2].strip()
+            if published_at and published_at.upper() != "NULL":
                 published = True
             try:
                 debit = float(parts[3].strip() or "0")

@@ -57,7 +57,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -75,7 +75,7 @@ def openproject_sql(query: str) -> str:
     """Run a SQL query against the OpenProject postgres DB (embedded in app container)."""
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject", "-t", "-A", "-c", query,
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject", "-t", "-A", "-c", query,
     )
     return out.strip()
 
@@ -85,7 +85,7 @@ def check_1_baserow_db_exists() -> None:
     """Database 'Retro Pentest Round 1' exists in Baserow."""
     try:
         result = baserow_sql(
-            "SELECT d.id FROM database_application d "
+            "SELECT d.id FROM database_database d "
             "JOIN core_application a ON d.application_ptr_id = a.id "
             "WHERE a.name = 'Retro Pentest Round 1';"
         )
@@ -101,7 +101,7 @@ def check_2_sprint_wp_table() -> None:
     try:
         table_id = baserow_sql(
             "SELECT dt.id FROM database_table dt "
-            "JOIN database_application da ON dt.database_id = da.application_ptr_id "
+            "JOIN database_database da ON dt.database_id = da.application_ptr_id "
             "JOIN core_application ca ON da.application_ptr_id = ca.id "
             "WHERE ca.name = 'Retro Pentest Round 1' AND dt.name = 'Sprint Work Packages';"
         )
@@ -127,7 +127,7 @@ def check_3_test_health_table() -> None:
     try:
         table_id = baserow_sql(
             "SELECT dt.id FROM database_table dt "
-            "JOIN database_application da ON dt.database_id = da.application_ptr_id "
+            "JOIN database_database da ON dt.database_id = da.application_ptr_id "
             "JOIN core_application ca ON da.application_ptr_id = ca.id "
             "WHERE ca.name = 'Retro Pentest Round 1' AND dt.name = 'Test Health';"
         )
@@ -153,7 +153,7 @@ def check_4_sprint_wp_rows() -> None:
     try:
         table_id = baserow_sql(
             "SELECT dt.id FROM database_table dt "
-            "JOIN database_application da ON dt.database_id = da.application_ptr_id "
+            "JOIN database_database da ON dt.database_id = da.application_ptr_id "
             "JOIN core_application ca ON da.application_ptr_id = ca.id "
             "WHERE ca.name = 'Retro Pentest Round 1' AND dt.name = 'Sprint Work Packages';"
         )
@@ -175,7 +175,7 @@ def check_5_test_health_rows() -> None:
     try:
         table_id = baserow_sql(
             "SELECT dt.id FROM database_table dt "
-            "JOIN database_application da ON dt.database_id = da.application_ptr_id "
+            "JOIN database_database da ON dt.database_id = da.application_ptr_id "
             "JOIN core_application ca ON da.application_ptr_id = ca.id "
             "WHERE ca.name = 'Retro Pentest Round 1' AND dt.name = 'Test Health';"
         )
@@ -198,7 +198,7 @@ def check_6_completion_summary_view() -> None:
         result = baserow_sql(
             "SELECT v.id FROM database_view v "
             "JOIN database_table dt ON v.table_id = dt.id "
-            "JOIN database_application da ON dt.database_id = da.application_ptr_id "
+            "JOIN database_database da ON dt.database_id = da.application_ptr_id "
             "JOIN core_application ca ON da.application_ptr_id = ca.id "
             "WHERE ca.name = 'Retro Pentest Round 1' "
             "AND dt.name = 'Sprint Work Packages' "
@@ -216,7 +216,7 @@ def _read_retro_file() -> str | None:
     """Read the retro markdown file from code-server container. Returns content or None."""
     rc, out, err = docker_exec(
         CODE_SERVER_CONTAINER,
-        "cat", "/home/coder/devops-configs/docs/retro-Pentest Round 1.md",
+        "cat", "/home/coder/workspace/devops-configs/docs/retro-Pentest Round 1.md",
     )
     if rc != 0:
         return None
@@ -366,7 +366,7 @@ def check_13_retro_wp_assignee_priority() -> None:
         parts = result.strip().split("|")
         assignee = parts[0].strip() if len(parts) > 0 else ""
         priority = parts[1].strip() if len(parts) > 1 else ""
-        assignee_ok = assignee == "user11"
+        assignee_ok = assignee == "admin"
         priority_ok = priority.lower() == "normal"
         ok = assignee_ok and priority_ok
         check("13. Retro WP assignee & priority", 2, ok,

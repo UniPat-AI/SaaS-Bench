@@ -60,7 +60,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -344,6 +344,7 @@ def _oo_session() -> tuple[requests.Session, str]:
     if not token:
         raise RuntimeError(f"No auth token: {resp.text[:200]}")
     sess.headers["Authorization"] = token
+    sess.cookies.set("asc_auth_key", token)
     _oo_session_cache = (sess, base)
     return sess, base
 
@@ -365,7 +366,7 @@ def _oo_find_file(sess: requests.Session, base: str) -> dict | None:
 
 def _oo_download(sess: requests.Session, base: str, file_id: int) -> bytes:
     """Download a file from OnlyOffice as raw bytes."""
-    url = f"{base}/Products/Files/HttpHandlers/filehandler.ashx?action=download&fileid={file_id}"
+    url = f"{base}/products/files/httphandlers/filehandler.ashx?action=download&fileid={file_id}"
     resp = sess.get(url, timeout=30, allow_redirects=True)
     if resp.status_code == 200 and len(resp.content) > 100:
         return resp.content

@@ -69,7 +69,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -77,7 +77,7 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
 def op_sql(sql: str) -> str:
     """Query OpenProject embedded Postgres."""
     rc, out, err = docker_exec(
-        OP_CONTAINER, "psql", "-U", "openproject", "-d", "openproject",
+        OP_CONTAINER, "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
         "-t", "-A", "-c", sql, timeout=15,
     )
     return out.strip()
@@ -466,7 +466,7 @@ def check_8_codeserver_file_exists() -> None:
     try:
         rc, out, err = docker_exec(
             CS_CONTAINER, "test", "-f",
-            "/home/coder/project/devops-configs/docs/portfolio-review-Q4-2024.md",
+            "/home/coder/workspace/devops-configs/docs/portfolio-review-Q4-2024.md",
         )
         ok = rc == 0
         check("8. Code-server file exists", 1, ok,
@@ -481,7 +481,7 @@ def check_9_codeserver_file_content() -> None:
         compute_ground_truth()
         rc, out, err = docker_exec(
             CS_CONTAINER, "cat",
-            "/home/coder/project/devops-configs/docs/portfolio-review-Q4-2024.md",
+            "/home/coder/workspace/devops-configs/docs/portfolio-review-Q4-2024.md",
         )
         if rc != 0:
             check("9. Code-server file content", 2, False, "cannot read file")

@@ -71,7 +71,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -112,10 +112,10 @@ def op_db_query(sql: str) -> str:
             "docker", "exec",
             "-e", "PGPASSWORD=openproject",
             OPENPROJECT_CONTAINER,
-            "psql", "-U", "openproject", "-d", "openproject",
+            "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
             "-h", "127.0.0.1", "-t", "-A", "-c", sql,
         ],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, errors="replace", timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"psql failed: {r.stderr.strip()}")
@@ -405,7 +405,7 @@ def check_9_audit_md_exists() -> None:
     try:
         rc, stdout, stderr = docker_exec(
             CODE_SERVER_CONTAINER,
-            "cat", "/home/coder/project/devops-configs/docs/docker-audit-2026-04-12.md",
+            "cat", "/home/coder/workspace/devops-configs/docs/docker-audit-2026-04-12.md",
         )
         if rc != 0:
             check("9. Audit markdown file", 2, False, "file not found")
@@ -434,7 +434,7 @@ def check_10_audit_md_values() -> None:
     try:
         rc, stdout, _ = docker_exec(
             CODE_SERVER_CONTAINER,
-            "cat", "/home/coder/project/devops-configs/docs/docker-audit-2026-04-12.md",
+            "cat", "/home/coder/workspace/devops-configs/docs/docker-audit-2026-04-12.md",
         )
         if rc != 0:
             check("10. Audit md values", 2, False, "file not found")
@@ -478,7 +478,7 @@ def check_11_git_commit() -> None:
     try:
         rc, stdout, stderr = docker_exec(
             CODE_SERVER_CONTAINER,
-            "git", "-C", "/home/coder/project/devops-configs",
+            "git", "-C", "/home/coder/workspace/devops-configs",
             "log", "--oneline", "--all", "-50",
         )
         if rc != 0:

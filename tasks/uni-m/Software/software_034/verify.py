@@ -88,7 +88,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -407,7 +407,7 @@ def check_10_report_file_exists() -> None:
     """File devops-configs/docs/coverage-audit-2026-05-20.md exists in code-server."""
     try:
         rc, out, err = docker_exec(CODE_SERVER_CONTAINER,
-                                   "test", "-f", f"/home/coder/project/{REPORT_PATH}")
+                                   "test", "-f", f"/home/coder/workspace/{REPORT_PATH}")
         found = rc == 0
         if not found:
             # Try alternate paths
@@ -426,7 +426,7 @@ def check_10_report_file_exists() -> None:
 def check_11_report_file_content() -> None:
     """Report file has correct structure: header, projects line, per-project lines."""
     try:
-        rpath = _bstate.get("report_real_path", f"/home/coder/project/{REPORT_PATH}")
+        rpath = _bstate.get("report_real_path", f"/home/coder/workspace/{REPORT_PATH}")
         rc, out, err = docker_exec(CODE_SERVER_CONTAINER, "cat", rpath)
         if rc != 0:
             check("11. Report file content structure", 2, False, f"cannot read file: {err.strip()}")
