@@ -2,6 +2,7 @@
 """Verifier for agriculture_013: visual recipe selection -> Grocy stock plan."""
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ SOURCE_IMAGE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "inputs",
     "recipya_recipe_545.jpg",
 )
+EXPECTED_SOURCE_SHA256 = "a26e2ae865112384d040deae9e156a9d5c978422126c0b6f45dd4e354f697099"
 TARGET_STOCK = 5.0
 
 for name, value in [
@@ -163,11 +165,12 @@ def image_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
-def llm_compare_images(actual: bytes, recipe_summary: str, timeout: int = 45) -> tuple[bool, str]:
-    if not os.path.isfile(SOURCE_IMAGE):
-        return False, "source image missing"
-    with open(SOURCE_IMAGE, "rb") as source_file:
-        source = source_file.read()
+def llm_compare_images(
+    source: bytes,
+    actual: bytes,
+    recipe_summary: str,
+    timeout: int = 45,
+) -> tuple[bool, str]:
     prompt = (
         "Image 1 is the supplied restaurant photo. Image 2 is the image actually attached "
         "to the target Grocy recipe. Determine whether they depict the same dish and whether "
@@ -325,10 +328,22 @@ def check_2_grocy_recipe_matches_upstream() -> None:
 def check_3_actual_grocy_picture_matches() -> None:
     global _recipya_recipe, _grocy_recipe, _grocy_products, _picture_ok
     if not _recipya_ok or not _grocy_ok or not _candidate_chains:
-        check("3. target Grocy recipe has the supplied matching dish image", 3, False,
+        check("3. target Grocy recipe has the exact supplied dish image", 3, False,
               "gated: upstream recipe association is incomplete")
         return
     try:
+        if not os.path.isfile(SOURCE_IMAGE):
+            check("3. target Grocy recipe has the exact supplied dish image", 3, False,
+                  "source image missing")
+            return
+        with open(SOURCE_IMAGE, "rb") as source_file:
+            source = source_file.read()
+        source_digest = hashlib.sha256(source).hexdigest()
+        if source_digest != EXPECTED_SOURCE_SHA256:
+            check("3. target Grocy recipe has the exact supplied dish image", 3, False,
+                  f"source image hash={source_digest}, expected={EXPECTED_SOURCE_SHA256}")
+            return
+
         matches = []
         failures = []
         for chain in _candidate_chains:
@@ -339,28 +354,36 @@ def check_3_actual_grocy_picture_matches() -> None:
             if not actual:
                 failures.append(f"recipe_id={recipe['id']}: missing '{filename}'")
                 continue
+            actual_digest = hashlib.sha256(actual).hexdigest()
+            if actual_digest != source_digest:
+                failures.append(
+                    f"recipe_id={recipe['id']}: image hash={actual_digest}, "
+                    f"expected exact source hash={source_digest}"
+                )
+                continue
             summary = f"{upstream['name']}; ingredients: " + ", ".join(upstream["ingredients"])
-            passed, detail = llm_compare_images(actual, summary)
+            passed, detail = llm_compare_images(source, actual, summary)
             if passed:
-                matches.append((chain, filename, detail))
+                matches.append((chain, filename, actual_digest, detail))
             else:
                 failures.append(f"recipe_id={recipe['id']}: {detail}")
         if len(matches) != 1:
             detail = f"expected one visually matching association, found {len(matches)}"
             if failures:
                 detail += "; " + "; ".join(failures[:3])
-            check("3. target Grocy recipe has the supplied matching dish image", 3, False,
+            check("3. target Grocy recipe has the exact supplied dish image", 3, False,
                   detail)
             return
-        selected, filename, detail = matches[0]
+        selected, filename, actual_digest, detail = matches[0]
         _recipya_recipe = selected["recipya"]
         _grocy_recipe = selected["grocy"]
         _grocy_products = selected["products"]
         _picture_ok = True
-        check("3. target Grocy recipe has the supplied matching dish image", 3, True,
-              f"recipe_id={_grocy_recipe['id']}; file='{filename}'; {detail}")
+        check("3. target Grocy recipe has the exact supplied dish image", 3, True,
+              f"recipe_id={_grocy_recipe['id']}; file='{filename}'; "
+              f"sha256={actual_digest}; {detail}")
     except Exception as exc:
-        check("3. target Grocy recipe has the supplied matching dish image", 3, False,
+        check("3. target Grocy recipe has the exact supplied dish image", 3, False,
               f"exception: {exc}")
 
 
@@ -381,10 +404,10 @@ def check_4_exact_conditional_shopping_plan() -> None:
                 expected[product_id] = TARGET_STOCK - stock
 
         exact_note = f"Bistrot Provençal — {_recipya_recipe['name']}"
-        marker = _recipya_recipe["name"].replace("'", "''")
         rows = grocy_query(
             "SELECT sl.id,sl.product_id,sl.amount,COALESCE(sl.note,'') AS note "
-            "FROM shopping_list sl WHERE sl.note LIKE '%" + marker + "%'"
+            "FROM shopping_list sl "
+            "WHERE COALESCE(sl.note,'') LIKE 'Bistrot Provençal%'"
         )
         actual: dict[int, list[dict]] = {}
         for row in rows:

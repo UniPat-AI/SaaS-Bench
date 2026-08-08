@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from datetime import datetime
 
 
 GROCY_CONTAINER = os.getenv("GROCY_CONTAINER")
@@ -23,7 +24,7 @@ GROCY_DB_CANDIDATES = [
     "/config/data/data/grocy.db",
     "/var/www/data/grocy.db",
 ]
-MARKER_RE = re.compile(r"^AG007 \| Recipya #(\d+) \| (.+)$")
+SELECTION_RE = re.compile(r"^AG007 SELECTED \| Recipya #(\d+) \| (.+)$")
 
 for _name, _value in [
     ("GROCY_CONTAINER", GROCY_CONTAINER),
@@ -41,9 +42,14 @@ _marked_rows: list[dict] = []
 _recipe: dict = {}
 _ingredients: list[str] = []
 _image_bytes = b""
+_grocy_started_at = ""
+_grocy_started_epoch: int | None = None
+_recipya_started_at = ""
+_recipya_started_epoch: int | None = None
 _recipe_ok = False
 _visual_ok = False
 _marker_ok = False
+_stock_untouched = False
 
 
 def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
@@ -125,6 +131,32 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def container_started_epoch(container: str) -> tuple[str, int]:
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.StartedAt}}", container],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"container start audit failed: {result.stderr.strip()}")
+    started_at = result.stdout.strip()
+    try:
+        normalized = re.sub(r"(\.\d{6})\d+(?=Z|[+-]\d{2}:\d{2}$)", r"\1", started_at)
+        started_epoch = int(
+            datetime.fromisoformat(normalized.replace("Z", "+00:00")).timestamp()
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"invalid container StartedAt={started_at!r}") from exc
+    return started_at, started_epoch
+
+
+def description_lines(value: str) -> list[str]:
+    value = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", value or "")
+    value = html.unescape(re.sub(r"<[^>]+>", "", value))
+    return [line.strip() for line in value.splitlines() if line.strip()]
+
+
 def read_recipe_image(image_id: str) -> bytes:
     image_id = (image_id or "").strip()
     if not image_id or os.path.basename(image_id) != image_id:
@@ -204,48 +236,71 @@ def mindra_yes_no(prompt: str, image_bytes: bytes | None = None, timeout: int = 
 
 def load_context() -> None:
     global _marked_rows, _recipe, _ingredients, _image_bytes
+    global _grocy_started_at, _grocy_started_epoch
+    global _recipya_started_at, _recipya_started_epoch
+    _grocy_started_at, _grocy_started_epoch = container_started_epoch(GROCY_CONTAINER)
+    _recipya_started_at, _recipya_started_epoch = container_started_epoch(RECIPYA_CONTAINER)
+    admin_recipes = recipya_query(
+        "SELECT DISTINCT r.id,r.name,COALESCE(r.description,'') AS description,"
+        "COALESCE(r.image,'') AS image,COALESCE(r.created_at,'') AS created_at,"
+        "CAST(strftime('%s',r.created_at) AS INTEGER) AS created_epoch "
+        "FROM recipes r JOIN user_recipe ur ON ur.recipe_id=r.id "
+        "JOIN users u ON u.id=ur.user_id "
+        "WHERE LOWER(u.email)='admin@recipya.com' ORDER BY r.id"
+    )
+    selections: list[tuple[dict, re.Match[str]]] = []
+    selection_lines = 0
+    for row in admin_recipes:
+        for line in description_lines(row.get("description") or ""):
+            if "AG007 SELECTED" not in line:
+                continue
+            selection_lines += 1
+            match = SELECTION_RE.fullmatch(line)
+            if match is not None:
+                selections.append((row, match))
+
+    if selection_lines == 1 and len(selections) == 1:
+        row, match = selections[0]
+        recipe_name = html.unescape(row.get("name") or "")
+        try:
+            created_epoch = int(row["created_epoch"])
+        except (KeyError, TypeError, ValueError):
+            created_epoch = 0
+        if (int(match.group(1)) == int(row["id"])
+                and html.unescape(match.group(2)) == recipe_name
+                and _recipya_started_epoch is not None
+                and 0 < created_epoch < _recipya_started_epoch):
+            _recipe = row
+            _recipe["name"] = recipe_name
+            recipe_id = int(row["id"])
+            _ingredients = [html.unescape(ingredient["name"]) for ingredient in recipya_query(
+                "SELECT i.name FROM ingredient_recipe ir "
+                "JOIN ingredients i ON i.id=ir.ingredient_id "
+                f"WHERE ir.recipe_id={recipe_id} ORDER BY ir.ingredient_order"
+            )]
+            _image_bytes = read_recipe_image(_recipe.get("image") or "")
+
     _marked_rows = grocy_query(
         "SELECT sl.id,sl.product_id,sl.amount,COALESCE(sl.note,'') AS note,"
         "COALESCE(p.name,'') AS product_name "
         "FROM shopping_list sl LEFT JOIN products p ON p.id=sl.product_id "
         "WHERE sl.note LIKE 'AG007%';"
     )
-    markers = {row.get("note") or "" for row in _marked_rows}
-    parsed = [MARKER_RE.fullmatch(marker) for marker in markers]
-    if len(markers) != 1 or len(parsed) != 1 or parsed[0] is None:
-        return
-    recipe_id = int(parsed[0].group(1))
-    recipe_name = html.unescape(parsed[0].group(2))
-    rows = recipya_query(
-        "SELECT r.id,r.name,r.image FROM recipes r "
-        "JOIN user_recipe ur ON ur.recipe_id=r.id "
-        "JOIN users u ON u.id=ur.user_id "
-        f"WHERE r.id={recipe_id} AND LOWER(u.email)='admin@recipya.com'"
-    )
-    if len(rows) != 1 or html.unescape(rows[0]["name"]) != recipe_name:
-        return
-    _recipe = rows[0]
-    _recipe["name"] = html.unescape(_recipe["name"])
-    _ingredients = [html.unescape(row["name"]) for row in recipya_query(
-        "SELECT i.name FROM ingredient_recipe ir "
-        "JOIN ingredients i ON i.id=ir.ingredient_id "
-        f"WHERE ir.recipe_id={recipe_id} ORDER BY ir.ingredient_order"
-    )]
-    _image_bytes = read_recipe_image(_recipe.get("image") or "")
 
 
 def check_1_exact_admin_recipe() -> None:
     global _recipe_ok
     has_tomato = any(re.search(r"\btomato(?:es)?\b", value, re.IGNORECASE) for value in _ingredients)
     _recipe_ok = bool(
-        _recipe and _ingredients and has_tomato and _image_bytes and len(_marked_rows) > 0
+        _recipe and _ingredients and has_tomato and _image_bytes
     )
     check(
         "1. exact admin-owned Recipya recipe with real cover",
         4,
         _recipe_ok,
-        f"id={_recipe.get('id')} name='{_recipe.get('name')}' ingredients={len(_ingredients)} image_bytes={len(_image_bytes)}"
-        if _recipe else "one exact AG007 marker did not resolve to an admin recipe",
+        f"id={_recipe.get('id')} name='{_recipe.get('name')}' ingredients={len(_ingredients)} "
+        f"image_bytes={len(_image_bytes)} recipya_started={_recipya_started_at}"
+        if _recipe else "one exact standalone Recipya selection line did not resolve uniquely",
     )
 
 
@@ -265,15 +320,14 @@ def check_2_actual_cover_is_tomato_dominant() -> None:
 
 
 def check_3_exact_unique_marker_rows() -> None:
-    global _marker_ok
+    global _marker_ok, _stock_untouched
     if not _visual_ok:
-        check("3. exact unique Grocy task entries", 1, False, "gated: visual recipe invalid")
+        check("3. exact task entries and untouched task-start stock", 1, False,
+              "gated: visual recipe invalid")
         return
     expected_note = f"AG007 | Recipya #{int(_recipe['id'])} | {_recipe['name']}"
     product_ids = [row.get("product_id") for row in _marked_rows]
     problems = []
-    if not _marked_rows:
-        problems.append("no task shopping entries")
     if any((row.get("note") or "") != expected_note for row in _marked_rows):
         problems.append("inexact or mixed task marker")
     if any(product_id is None for product_id in product_ids):
@@ -285,25 +339,102 @@ def check_3_exact_unique_marker_rows() -> None:
     if any(re.search(r"\btomato(?:es)?\b", row.get("product_name") or "", re.IGNORECASE)
            for row in _marked_rows):
         problems.append("tomato appears in task shopping entries")
+
+    stock_query_ok = True
+    try:
+        stock_logs = grocy_query(
+            "SELECT id,COALESCE(row_created_timestamp,'') AS created_at,"
+            "CAST(strftime('%s',row_created_timestamp,'utc') AS INTEGER) AS created_epoch,"
+            "COALESCE(transaction_type,'') AS transaction_type,COALESCE(undone,0) AS undone,"
+            "COALESCE(undone_timestamp,'') AS undone_at,"
+            "CASE WHEN undone_timestamp IS NULL OR TRIM(undone_timestamp) = '' THEN NULL "
+            "ELSE CAST(strftime('%s',undone_timestamp,'utc') AS INTEGER) END AS undone_epoch "
+            "FROM stock_log ORDER BY id"
+        )
+    except Exception as exc:
+        stock_query_ok = False
+        stock_logs = []
+        problems.append(f"stock-log audit unavailable: {exc}")
+    late_created_logs = []
+    late_undone_logs = []
+    invalid_timestamps = []
+    invalid_undo_states = []
+    for row in stock_logs:
+        try:
+            created_epoch = int(row["created_epoch"])
+        except (KeyError, TypeError, ValueError):
+            invalid_timestamps.append(f"created:{row.get('id')}")
+        else:
+            if (_grocy_started_epoch is not None
+                    and created_epoch >= _grocy_started_epoch):
+                late_created_logs.append(row)
+
+        try:
+            undone = int(row.get("undone") or 0)
+        except (TypeError, ValueError):
+            invalid_undo_states.append(row.get("id"))
+            continue
+        undone_at = str(row.get("undone_at") or "").strip()
+        undone_epoch_raw = row.get("undone_epoch")
+        if undone not in (0, 1) or (undone == 0 and (undone_at or undone_epoch_raw is not None)):
+            invalid_undo_states.append(row.get("id"))
+            continue
+        if undone == 1:
+            try:
+                undone_epoch = int(undone_epoch_raw) if undone_at else None
+            except (TypeError, ValueError):
+                undone_epoch = None
+            if undone_epoch is None:
+                invalid_timestamps.append(f"undone:{row.get('id')}")
+            elif (_grocy_started_epoch is not None
+                  and undone_epoch >= _grocy_started_epoch):
+                late_undone_logs.append(row)
+    if _grocy_started_epoch is None:
+        problems.append("invalid Grocy container start baseline")
+    if invalid_timestamps:
+        problems.append(f"unparseable stock-log timestamps={invalid_timestamps[:5]}")
+    if invalid_undo_states:
+        problems.append(f"inconsistent stock-log undo states={invalid_undo_states[:5]}")
+    if late_created_logs:
+        problems.append(
+            "Grocy stock changed during the task "
+            f"(new log ids={[row.get('id') for row in late_created_logs[:5]]})"
+        )
+    if late_undone_logs:
+        problems.append(
+            "Grocy stock booking was undone during the task "
+            f"(log ids={[row.get('id') for row in late_undone_logs[:5]]})"
+        )
+    _stock_untouched = (
+        stock_query_ok and _grocy_started_epoch is not None
+        and not invalid_timestamps and not invalid_undo_states
+        and not late_created_logs and not late_undone_logs
+    )
     _marker_ok = not problems
     check(
-        "3. exact unique Grocy task entries",
+        "3. exact task entries and untouched task-start stock",
         1,
         _marker_ok,
-        f"entries={len(_marked_rows)}" if _marker_ok else "; ".join(problems),
+        f"entries={len(_marked_rows)}, container_started={_grocy_started_at}" if _marker_ok
+        else "; ".join(problems),
     )
 
 
 def check_4_exact_inventory_deficit_set() -> None:
-    if not (_visual_ok and _marker_ok):
+    if not (_recipe_ok and _visual_ok and _marker_ok and _stock_untouched):
         check("4. exact auxiliary-ingredient deficit set", 10, False,
-              "gated: visual/marker chain invalid")
+              "gated: selection/visual/stock/row chain invalid")
         return
-    products = grocy_query(
-        "SELECT p.id,p.name,"
-        "COALESCE((SELECT SUM(s.amount) FROM stock s WHERE s.product_id=p.id),0) AS stock "
-        "FROM products p ORDER BY p.name,p.id"
-    )
+    try:
+        products = grocy_query(
+            "SELECT p.id,p.name,"
+            "COALESCE((SELECT SUM(s.amount) FROM stock s WHERE s.product_id=p.id),0) AS stock "
+            "FROM products p ORDER BY p.name,p.id"
+        )
+    except Exception as exc:
+        check("4. exact auxiliary-ingredient deficit set", 10, False,
+              f"inventory read failed: {exc}")
+        return
     shopping_products = [
         f"#{row.get('product_id')} {row.get('product_name') or ''}"
         for row in _marked_rows
@@ -325,7 +456,9 @@ def check_4_exact_inventory_deficit_set() -> None:
             f"#{row['id']} | {row['name']} | {float(row.get('stock') or 0):g}"
             for row in products
         ) +
-        "\n\nMARKED SHOPPING PRODUCTS:\n- " + "\n- ".join(shopping_products)
+        "\n\nMARKED SHOPPING PRODUCTS:\n" + (
+            "- " + "\n- ".join(shopping_products) if shopping_products else "(none)"
+        )
     )
     passed, detail = mindra_yes_no(prompt, timeout=75)
     check("4. exact auxiliary-ingredient deficit set", 10, passed, detail)

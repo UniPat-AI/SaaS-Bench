@@ -45,19 +45,27 @@ GROCY_DB_CANDIDATES = [
 SOURCE_LOG_NAME = "Spring Plowing Complete"
 SOURCE_ASSET_NAME = "Vineyard Block 1"
 BASE_NOTES = "Plowed 120 acres. Soil conditions excellent. Ready for planting."
-EXPECTED_ATTACHMENT_SHA256 = "317c3ce01ab6cb8598a43335a61d518c926e906341946100236c8a252321e633"
+CANDIDATE_METHOD_BY_SHA256 = {
+    "0184ddd5515204b69cc87f1db84ffefa722fb0f4046a7dd0f742b01e35bd8922": "Manual",
+    "317c3ce01ab6cb8598a43335a61d518c926e906341946100236c8a252321e633": "Drone-assisted",
+}
+METHOD_RANK = {"Manual": 0, "Tractor-only": 1, "Drone-assisted": 2}
+EXPECTED_ATTACHMENT_SHA256 = max(
+    CANDIDATE_METHOD_BY_SHA256,
+    key=lambda digest: METHOD_RANK[CANDIDATE_METHOD_BY_SHA256[digest]],
+)
 EXPECTED_BATCH = "VINO-2025-081"
-EXPECTED_METHOD = "Drone-assisted"
-EXPECTED_PRODUCT_NAME = "Drone-Assisted Estate Wine 2025"
-EXPECTED_BRAND = "Drone-Assisted Estate"
+EXPECTED_METHOD = CANDIDATE_METHOD_BY_SHA256[EXPECTED_ATTACHMENT_SHA256]
+EXPECTED_PRODUCT_NAME = f"{EXPECTED_METHOD} Estate Wine 2025"
+EXPECTED_BRAND = f"{EXPECTED_METHOD} Estate"
 EXPECTED_VINTAGE = "2025"
 EXPECTED_GROCY_LINES = (
-    "TRACEABILITY BATCH: VINO-2025-081",
-    "FIELD METHOD: Drone-assisted",
+    f"TRACEABILITY BATCH: {EXPECTED_BATCH}",
+    f"FIELD METHOD: {EXPECTED_METHOD}",
     "FARMOS SOURCE: Spring Plowing Complete | Vineyard Block 1",
 )
 EXPECTED_ELABEL_INFO = (
-    "FIELD METHOD: Drone-assisted; FARMOS SOURCE: Spring Plowing Complete; "
+    f"FIELD METHOD: {EXPECTED_METHOD}; FARMOS SOURCE: Spring Plowing Complete; "
     "Vineyard Block 1"
 )
 EXPECTED_FARMOS_LINES = (
@@ -223,7 +231,7 @@ def _attachment_sha256(uri: str) -> str:
 
 _candidate_logs: list[dict] | None = None
 _attachments_by_log: dict[int, list[dict]] = {}
-_visual_source: tuple[dict, dict] | None = None
+_visual_source: tuple[dict, dict, str] | None = None
 
 
 def _load_candidate_logs() -> list[dict]:
@@ -261,20 +269,41 @@ def _load_attachments(log_id: int) -> list[dict]:
     return _attachments_by_log[log_id]
 
 
-def _find_visual_source() -> tuple[dict, dict]:
+def _find_visual_source() -> tuple[dict, dict, str]:
     global _visual_source
     if _visual_source is not None:
         return _visual_source
-    matches: list[tuple[dict, dict]] = []
+
+    recognized: list[tuple[dict, dict, str, str]] = []
     for log in _load_candidate_logs():
-        for attachment in _load_attachments(int(log["id"])):
-            if _attachment_sha256(str(attachment["uri"])) == EXPECTED_ATTACHMENT_SHA256:
-                matches.append((log, attachment))
-    if len(matches) != 1:
+        attachments = _load_attachments(int(log["id"]))
+        if len(attachments) != 1:
+            raise RuntimeError(
+                f"candidate log #{log['id']} must have exactly one classification image, "
+                f"found {len(attachments)}"
+            )
+        attachment = attachments[0]
+        digest = _attachment_sha256(str(attachment["uri"]))
+        method = CANDIDATE_METHOD_BY_SHA256.get(digest)
+        if method is None:
+            raise RuntimeError(
+                f"candidate log #{log['id']} has an unrecognized classification image"
+            )
+        recognized.append((log, attachment, method, digest))
+
+    digests = {match[3] for match in recognized}
+    if digests != set(CANDIDATE_METHOD_BY_SHA256):
         raise RuntimeError(
-            f"expected one source record with the farmer/drone/tractor attachment, found {len(matches)}"
+            f"candidate classification image set changed: found {sorted(digests)}"
         )
-    _visual_source = matches[0]
+
+    highest_rank = max(METHOD_RANK[match[2]] for match in recognized)
+    highest = [match for match in recognized if METHOD_RANK[match[2]] == highest_rank]
+    if len(highest) != 1:
+        raise RuntimeError(f"expected one uniquely higher-ranked visual source, found {len(highest)}")
+
+    source_log, attachment, method, _ = highest[0]
+    _visual_source = (source_log, attachment, method)
     return _visual_source
 
 
@@ -282,12 +311,13 @@ _farmos_ok = False
 _grocy_ok = False
 _elabel_ok = False
 _source_log_id = 0
+_source_method = ""
 _grocy_product_id = ""
 _elabel_product_id = ""
 
 
 def check_1_farmos_visual_source_and_notes() -> None:
-    global _farmos_ok, _source_log_id
+    global _farmos_ok, _source_log_id, _source_method
     try:
         candidates = _load_candidate_logs()
         if len(candidates) != 2:
@@ -298,9 +328,13 @@ def check_1_farmos_visual_source_and_notes() -> None:
                 f"expected two exact source candidates, found {len(candidates)}",
             )
             return
-        source_log, attachment = _find_visual_source()
+        source_log, attachment, _source_method = _find_visual_source()
         _source_log_id = int(source_log["id"])
         problems = []
+        if _source_method != EXPECTED_METHOD:
+            problems.append(
+                f"selected method={_source_method!r}, expected controlled class {EXPECTED_METHOD!r}"
+            )
         if _text_lines(str(source_log.get("notes", ""))) != list(EXPECTED_FARMOS_LINES):
             problems.append("selected record does not preserve baseline notes plus both exact trace lines")
         for candidate in candidates:
@@ -315,7 +349,8 @@ def check_1_farmos_visual_source_and_notes() -> None:
             "1. FarmOS visual source and preserved notes",
             5,
             _farmos_ok,
-            f"log #{_source_log_id}, attachment={attachment.get('filename', '')}"
+            f"log #{_source_log_id}, method={_source_method}, "
+            f"attachment={attachment.get('filename', '')}"
             if _farmos_ok else "; ".join(problems),
         )
     except Exception as exc:
@@ -329,10 +364,12 @@ def check_2_grocy_exact_trace_product() -> None:
               "gated: image-selected FarmOS source is invalid")
         return
     try:
+        safe_name = EXPECTED_PRODUCT_NAME.replace("'", "''")
+        safe_batch = EXPECTED_BATCH.replace("'", "''")
         rows = grocy_sql_json(
             "SELECT id, name, COALESCE(description, '') AS description FROM products "
-            "WHERE name = 'Drone-Assisted Estate Wine 2025' "
-            "OR description LIKE '%VINO-2025-081%' ORDER BY id"
+            f"WHERE name = '{safe_name}' "
+            f"OR description LIKE '%{safe_batch}%' ORDER BY id"
         )
         problems = []
         if len(rows) != 1:
@@ -366,11 +403,12 @@ def check_3_elabel_exact_trace_record() -> None:
         safe_info = (
             "REPLACE(REPLACE(ISNULL(FBOAdditionalInfo,''), CHAR(13), ' '), CHAR(10), ' ')"
         )
+        safe_name = EXPECTED_PRODUCT_NAME.replace("'", "''")
+        safe_batch = EXPECTED_BATCH.replace("'", "''")
         rows = elabel_rows(
             "SELECT CAST(Id AS NVARCHAR(36)), Name, ISNULL(Sku,''), ISNULL(Brand,''), "
             "CAST(WineVintage AS NVARCHAR(10)), " + safe_info + " FROM Product "
-            "WHERE Name = N'Drone-Assisted Estate Wine 2025' OR Sku = 'VINO-2025-081' "
-            "ORDER BY CreatedOn"
+            f"WHERE Name = N'{safe_name}' OR Sku = '{safe_batch}' ORDER BY CreatedOn"
         )
         problems = []
         if len(rows) != 1 or len(rows[0]) < 6:

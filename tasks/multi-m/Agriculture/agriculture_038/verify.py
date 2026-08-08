@@ -219,27 +219,68 @@ def check_2_no_spurious_discrepancies() -> None:
         return
     try:
         rows = grocy_sql_json(
-            "SELECT p.name, COALESCE(p.description, '') AS description, pb.barcode "
-            "FROM products p JOIN product_barcodes pb ON pb.product_id = p.id "
-            "WHERE p.description LIKE '%DISCREPANCY: No FarmOS Harvest Log%'"
+            "SELECT p.id, p.name, COALESCE(p.description, '') AS description, pb.barcode "
+            "FROM products p LEFT JOIN product_barcodes pb ON pb.product_id = p.id "
+            "WHERE p.description LIKE '%DISCREPANCY: No FarmOS Harvest Log%' "
+            "ORDER BY p.id, pb.barcode"
         )
-        expected = {
-            (name, spec["barcode"], _annotation(spec["batch"]))
-            for name, spec in MANIFEST.items() if not spec["matched"]
-        }
-        actual = {
-            (str(row.get("name", "")), str(row.get("barcode", "")),
-             _normalize(str(row.get("description", ""))))
-            for row in rows
-        }
-        unexpected = actual - expected
-        passed = not unexpected and len(rows) == len(actual)
+        signaled: dict[int, dict] = {}
+        for row in rows:
+            product_id = int(row["id"])
+            product = signaled.setdefault(
+                product_id,
+                {
+                    "name": str(row.get("name", "")),
+                    "description": _normalize(str(row.get("description", ""))),
+                    "barcodes": set(),
+                },
+            )
+            barcode = row.get("barcode")
+            if barcode not in (None, ""):
+                product["barcodes"].add(str(barcode))
+
+        expected: dict[int, tuple[str, str, str]] = {}
+        for name, spec in MANIFEST.items():
+            if spec["matched"]:
+                continue
+            candidate = _candidate_rows(name, spec["barcode"])[0]
+            expected[int(candidate["id"])] = (
+                name,
+                spec["barcode"],
+                _annotation(spec["batch"]),
+            )
+
+        problems = []
+        unexpected_ids = sorted(set(signaled) - set(expected))
+        missing_ids = sorted(set(expected) - set(signaled))
+        if unexpected_ids:
+            details = [
+                f"#{product_id} {signaled[product_id]['name']!r} "
+                f"barcodes={sorted(signaled[product_id]['barcodes'])}"
+                for product_id in unexpected_ids
+            ]
+            problems.append("unexpected signaled products: " + ", ".join(details))
+        if missing_ids:
+            problems.append(f"expected signaled product IDs missing: {missing_ids}")
+        for product_id in sorted(set(signaled) & set(expected)):
+            expected_name, expected_barcode, expected_description = expected[product_id]
+            product = signaled[product_id]
+            if product["name"] != expected_name:
+                problems.append(
+                    f"product #{product_id} name={product['name']!r}, expected={expected_name!r}"
+                )
+            if product["description"] != expected_description:
+                problems.append(f"product #{product_id} has inexact discrepancy description")
+            if expected_barcode not in product["barcodes"]:
+                problems.append(
+                    f"product #{product_id} lacks manifest barcode {expected_barcode!r}"
+                )
         check(
             "2. no_spurious_discrepancies",
             4,
-            passed,
-            f"unexpected/duplicate discrepancy rows={sorted(unexpected)}" if not passed
-            else "no matched or unrelated product carries the task discrepancy marker",
+            not problems,
+            "; ".join(problems)
+            if problems else "only exact unmatched manifest products carry the task discrepancy marker",
         )
     except Exception as exc:
         check("2. no_spurious_discrepancies", 4, False, f"exception: {exc}")

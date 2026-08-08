@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -142,14 +143,41 @@ def description_lines(value: str) -> list[str]:
     return [line.strip() for line in value.splitlines() if line.strip()]
 
 
-def http_get(path: str) -> tuple[int, str]:
+def http_get(path: str) -> tuple[int, str, str]:
     try:
         with urllib.request.urlopen(BASE_URL + path, timeout=15) as response:
-            return response.status, response.read().decode("utf-8", errors="replace")
+            return (
+                response.status,
+                response.read().decode("utf-8", errors="replace"),
+                response.geturl(),
+            )
     except urllib.error.HTTPError as exc:
-        return exc.code, ""
+        return exc.code, "", exc.geturl()
     except Exception:
-        return 0, ""
+        return 0, "", ""
+
+
+def label_code_from_final_url(final_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(final_url)
+        base = urllib.parse.urlparse(BASE_URL)
+        same_origin = (
+            parsed.scheme.casefold() == base.scheme.casefold()
+            and (parsed.hostname or "").casefold() == (base.hostname or "").casefold()
+            and parsed.port == base.port
+        )
+    except (TypeError, ValueError):
+        return ""
+    if (not same_origin or parsed.username is not None or parsed.password is not None
+            or parsed.params or parsed.query or parsed.fragment):
+        return ""
+    match = re.fullmatch(r"/l/([^/]+)/?", parsed.path)
+    if match is None:
+        return ""
+    code = urllib.parse.unquote(match.group(1)).strip()
+    if not code or "/" in code or "\\" in code:
+        return ""
+    return code
 
 
 _elabel_rows: list[list[str]] = []
@@ -170,24 +198,26 @@ def load_context() -> None:
         "CAST(WineVintage AS NVARCHAR(10)), ISNULL(WineAppellation,''), "
         "CAST(WineAlcohol AS NVARCHAR(20)), CAST(WineType AS NVARCHAR(10)), "
         "ISNULL(FBOName,''), CAST(ISNULL(Certifications_Organic,0) AS NVARCHAR(5)), "
-        "ISNULL(Sku,'') FROM Product "
+        "ISNULL(Sku,''), ISNULL(CAST(Ean AS NVARCHAR(30)),''), "
+        "ISNULL(RedirectUrl,''), ISNULL(ExternalShortUrl,'') "
+        "FROM Product "
         "WHERE LOWER(LTRIM(RTRIM(Name))) = 'boutique organic chardonnay' "
         "ORDER BY CreatedOn"
     )
-    if len(_elabel_rows) == 1 and len(_elabel_rows[0]) >= 10:
+    if len(_elabel_rows) == 1 and len(_elabel_rows[0]) >= 13:
         row = _elabel_rows[0]
         _product = {
             "id": row[0], "name": row[1], "volume": row[2], "vintage": row[3],
             "appellation": row[4], "alcohol": row[5], "type": row[6],
-            "fbo": row[7], "organic": row[8], "sku": row[9],
+            "fbo": row[7], "organic": row[8], "sku": row[9], "ean": row[10],
+            "redirect_url": row[11], "external_short_url": row[12],
         }
-        _label_code = _product["sku"] if _product["sku"] and _product["sku"].upper() != "NULL" else _product["id"]
-        status, body = http_get(f"/l/{_label_code}")
-        if status != 200 and _label_code != _product["id"]:
-            status, body = http_get(f"/l/{_product['id']}")
-            if status == 200:
-                _label_code = _product["id"]
-        if status == 200 and len(body) > 100:
+        locator = urllib.parse.quote(_product["id"], safe="")
+        status, body, final_url = http_get(f"/l/{locator}")
+        final_code = label_code_from_final_url(final_url)
+        if (status == 200 and len(body) > 100
+                and final_code == _product["id"]):
+            _label_code = final_code
             _public_html = body
             text = strip_html(body)
             _public_ok = (
@@ -224,6 +254,9 @@ def check_1_elabel_core_fields() -> None:
             problems.append(f"numeric field error: {exc}")
         if _product.get("appellation", "").strip().casefold() != "loire":
             problems.append(f"appellation='{_product.get('appellation', '')}'")
+        for field in ("sku", "ean", "redirect_url", "external_short_url"):
+            if _product.get(field, "").strip():
+                problems.append(f"{field} must be blank")
     _core_ok = not problems
     check("1. exact Chardonnay core fields", 3, _core_ok, "; ".join(problems))
 
@@ -233,11 +266,17 @@ def check_2_exact_compliance() -> None:
     if not _core_ok:
         check("2. exact organic compliance", 2, False, "gated: core product invalid")
         return
-    ingredients = elabel_rows(
-        "SELECT i.Name, CAST(ISNULL(i.Allergen,0) AS NVARCHAR(5)) "
-        "FROM ProductIngredient pi JOIN Ingredient i ON i.Id = pi.IngredientId "
-        f"WHERE pi.ProductId = '{_product['id']}' ORDER BY i.Name"
-    )
+    try:
+        ingredients = elabel_rows(
+            "SELECT i.Name, CAST(ISNULL(i.Allergen,0) AS NVARCHAR(5)) "
+            "FROM ProductIngredient pi JOIN Ingredient i ON i.Id = pi.IngredientId "
+            f"WHERE pi.ProductId = '{_product['id']}' ORDER BY i.Name"
+        )
+    except Exception as exc:
+        _compliance_ok = False
+        check("2. exact organic compliance", 2, False,
+              f"compliance read failed: {exc}")
+        return
     names = [row[0].strip() for row in ingredients if row]
     sulphites = [
         row for row in ingredients
@@ -273,9 +312,9 @@ def check_3_public_label() -> None:
 
 def check_4_grocy_generated_code_link() -> None:
     global _grocy_link_ok
-    if not _public_ok:
+    if not (_core_ok and _compliance_ok and _public_ok):
         check("4. Grocy links generated e-label code", 6, False,
-              "gated: public label unavailable")
+              "gated: complete compliant public label unavailable")
         return
     if len(_grocy_rows) != 1:
         check(
@@ -301,15 +340,21 @@ def check_4_grocy_generated_code_link() -> None:
 
 
 def check_5_calculation_and_exclusive_trace() -> None:
-    if not _grocy_link_ok:
-        check("5. calculated servings and exclusive trace", 4, False, "gated: public/Grocy link missing")
+    if not (_core_ok and _compliance_ok and _public_ok and _grocy_link_ok):
+        check("5. calculated servings and exclusive trace", 4, False,
+              "gated: complete public/Grocy chain missing")
         return
     safe_code = _label_code.replace("'", "''")
     target_id = int(_grocy_rows[0]["id"])
-    other_rows = grocy_query(
-        "SELECT id, name FROM products "
-        f"WHERE description LIKE '%{safe_code}%' AND id <> {target_id}"
-    )
+    try:
+        other_rows = grocy_query(
+            "SELECT id, name FROM products "
+            f"WHERE description LIKE '%{safe_code}%' AND id <> {target_id}"
+        )
+    except Exception as exc:
+        check("5. calculated servings and exclusive trace", 4, False,
+              f"exclusive-trace read failed: {exc}")
+        return
     lines = description_lines(_grocy_rows[0].get("description") or "")
     serving_ok = len(lines) == 3 and lines[1] == "125 mL servings per bottle: 6"
     passed = serving_ok and not other_rows

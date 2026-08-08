@@ -2,6 +2,7 @@
 """Verifier for agriculture_031: visual recipe -> stock -> farm traceability."""
 
 import base64
+import hashlib
 import html
 import json
 import os
@@ -30,6 +31,14 @@ EXPECTED_PRODUCT = "Broccoli"
 TARGET_LOG_NAME = "2024 Broccoli Harvest — North Field East Bed (Side Shoots)"
 TARGET_ASSET_NAME = "North Field — East Bed"
 EXPECTED_OMRI = "OMRI-ORG-2024-1187"
+EXPECTED_SOURCE_SHA256 = "951f50e302e49b45f60d3186b0c1c5860ede1cca2065e72893848b86dd4f02b6"
+# Expected WebP bytes produced by the deployed Recipya image pipeline for this source.
+EXPECTED_STORED_SHA256 = "4b69b0cb9fb0a62dbaa8967a3b795d8a99f16f0759247924e7d653ae2496b1e5"
+EXPECTED_FARMOS_NOTES = f"OMRI certification: {EXPECTED_OMRI}"
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 for name, value in [
     ("RECIPYA_CONTAINER", RECIPYA_CONTAINER),
@@ -146,27 +155,19 @@ def image_mime(data: bytes) -> str:
 
 def read_recipya_image(image_id: str) -> bytes | None:
     image_id = (image_id or "").strip()
-    if not image_id or os.path.basename(image_id) != image_id:
+    if not UUID_RE.fullmatch(image_id):
         return None
-    names = [image_id]
-    if not image_id.lower().endswith((".webp", ".jpg", ".jpeg", ".png", ".gif")):
-        names.insert(0, image_id + ".webp")
-    for name in names:
-        path = f"/root/.config/Recipya/Images/{name}"
-        rc, stdout, _ = docker_exec(RECIPYA_CONTAINER, "base64", path)
-        if rc == 0 and stdout.strip():
-            try:
-                return base64.b64decode(stdout)
-            except ValueError:
-                continue
+    path = f"/root/.config/Recipya/Images/{image_id}.webp"
+    rc, stdout, _ = docker_exec(RECIPYA_CONTAINER, "base64", path)
+    if rc == 0 and stdout.strip():
+        try:
+            return base64.b64decode(stdout)
+        except ValueError:
+            return None
     return None
 
 
-def compare_attached_image(actual: bytes, summary: str) -> tuple[bool, str]:
-    if not os.path.isfile(SOURCE_IMAGE):
-        return False, "source image missing"
-    with open(SOURCE_IMAGE, "rb") as source_file:
-        source = source_file.read()
+def compare_attached_image(source: bytes, actual: bytes, summary: str) -> tuple[bool, str]:
     prompt = (
         "Image 1 is the supplied customer dish photo. Image 2 is the image actually "
         "attached to the candidate Recipya recipe. Are they the same dish, and do both "
@@ -264,21 +265,40 @@ def check_1_complete_visually_linked_recipe() -> None:
             problems.append("no quantified beef ingredient")
         if len(instructions) < 4:
             problems.append(f"only {len(instructions)} instructions")
+        source_image = b""
+        if not os.path.isfile(SOURCE_IMAGE):
+            problems.append("source image missing")
+        else:
+            with open(SOURCE_IMAGE, "rb") as source_file:
+                source_image = source_file.read()
+            source_digest = hashlib.sha256(source_image).hexdigest()
+            if source_digest != EXPECTED_SOURCE_SHA256:
+                problems.append(
+                    f"source image hash={source_digest}, expected={EXPECTED_SOURCE_SHA256}"
+                )
         actual_image = read_recipya_image(_recipe.get("image") or "")
         if not actual_image:
             problems.append(f"associated image file missing for image='{_recipe.get('image')}'")
-        else:
-            summary = f"{_recipe['name']}; cuisine={','.join(cuisines)}; ingredients=" \
-                      + ", ".join(ingredients)
-            image_ok, detail = compare_attached_image(actual_image, summary)
-            if not image_ok:
-                problems.append(detail)
+        elif source_image and hashlib.sha256(source_image).hexdigest() == EXPECTED_SOURCE_SHA256:
+            actual_digest = hashlib.sha256(actual_image).hexdigest()
+            if actual_digest != EXPECTED_STORED_SHA256:
+                problems.append(
+                    f"stored image hash={actual_digest}, expected Recipya WebP hash="
+                    f"{EXPECTED_STORED_SHA256}"
+                )
+            else:
+                summary = f"{_recipe['name']}; cuisine={','.join(cuisines)}; ingredients=" \
+                          + ", ".join(ingredients)
+                image_ok, detail = compare_attached_image(source_image, actual_image, summary)
+                if not image_ok:
+                    problems.append(detail)
         _recipe_ok = not problems
         check(
             "1. complete visually linked Recipya recipe",
             4,
             _recipe_ok,
-            f"recipe_id={recipe_id}; image={_recipe.get('image')}"
+            f"recipe_id={recipe_id}; image={_recipe.get('image')}; "
+            f"stored_sha256={EXPECTED_STORED_SHA256}"
             if _recipe_ok else "; ".join(problems),
         )
     except Exception as exc:
@@ -324,9 +344,9 @@ def check_3_exact_farmos_log_annotation() -> None:
             "AND name COLLATE BINARY='2024 Broccoli Harvest — North Field East Bed (Side Shoots)' "
             "ORDER BY timestamp DESC,id DESC"
         )
-        if not exact_rows:
-            check("3. exact FarmOS harvest log has exclusive OMRI annotation", 3, False,
-                  "exact target harvest log not found")
+        if len(exact_rows) != 1:
+            check("3. unique FarmOS harvest log has exact final notes and asset", 3, False,
+                  f"expected one exact target harvest log, found {len(exact_rows)}")
             return
         _target_log = exact_rows[0]
         target_id = int(_target_log["id"])
@@ -342,34 +362,39 @@ def check_3_exact_farmos_log_annotation() -> None:
             asset_id = int(asset_rows[0]["id"])
             linked_rows = farmos_query(
                 "SELECT la.asset_target_id,a.type FROM log__asset la "
-                "JOIN asset_field_data a ON a.id=la.asset_target_id "
+                "LEFT JOIN asset_field_data a ON a.id=la.asset_target_id "
                 f"WHERE la.entity_id={target_id} AND la.deleted=0 ORDER BY la.asset_target_id"
             )
-            linked_land = [int(row["asset_target_id"]) for row in linked_rows
-                           if row.get("type") == "land"]
-            if linked_land != [asset_id]:
-                problems.append(f"land asset links={linked_land}, expected [{asset_id}]")
-        if EXPECTED_OMRI not in notes:
-            problems.append("OMRI number absent from exact target log notes")
+            linked_assets = [
+                (int(row["asset_target_id"]), row.get("type")) for row in linked_rows
+            ]
+            if linked_assets != [(asset_id, "land")]:
+                problems.append(
+                    f"asset links={linked_assets}, expected only [({asset_id}, 'land')]"
+                )
+        if notes != EXPECTED_FARMOS_NOTES:
+            problems.append(
+                f"notes={notes!r}, expected exact {EXPECTED_FARMOS_NOTES!r}"
+            )
         other_rows = farmos_query(
-            "SELECT id,name FROM log_field_data WHERE type='harvest' "
-            f"AND id<>{target_id} AND notes__value LIKE '%OMRI-ORG-2024-1187%' "
+            "SELECT id,name,type FROM log_field_data "
+            f"WHERE id<>{target_id} AND notes__value LIKE '%OMRI-ORG-2024-1187%' "
             "ORDER BY id"
         )
         if other_rows:
             problems.append(
-                "OMRI number also appears on non-target harvest IDs "
+                "OMRI number also appears on non-target log IDs "
                 + str([int(row["id"]) for row in other_rows])
             )
         _farmos_ok = not problems
         check(
-            "3. exact FarmOS harvest log has exclusive OMRI annotation",
+            "3. unique FarmOS harvest log has exact final notes and asset",
             3,
             _farmos_ok,
             f"log_id={target_id}" if _farmos_ok else "; ".join(problems),
         )
     except Exception as exc:
-        check("3. exact FarmOS harvest log has exclusive OMRI annotation", 3, False,
+        check("3. unique FarmOS harvest log has exact final notes and asset", 3, False,
               f"exception: {exc}")
 
 
@@ -388,23 +413,14 @@ def check_4_gated_exact_traceability_description() -> None:
         recipe_line = f"Recipya recipe ID: {int(_recipe['id'])}"
         omri_line = f"OMRI certification: {EXPECTED_OMRI}"
         problems = []
-        if lines.count(recipe_line) != 1:
-            problems.append(f"expected one exact line '{recipe_line}'")
-        if lines.count(omri_line) != 1:
-            problems.append(f"expected one exact line '{omri_line}'")
-        conflicting_recipe = [line for line in lines
-                              if line.lower().startswith("recipya recipe id:")
-                              and line != recipe_line]
-        conflicting_omri = [line for line in lines
-                            if line.lower().startswith("omri certification:")
-                            and line != omri_line]
-        if conflicting_recipe or conflicting_omri:
-            problems.append("conflicting traceability lines are present")
+        expected_lines = [recipe_line, omri_line]
+        if lines != expected_lines:
+            problems.append(f"description lines={lines!r}, expected={expected_lines!r}")
         check(
             "4. Grocy description exactly traces validated recipe and harvest",
             10,
             not problems,
-            "both exact lines occur once" if not problems else "; ".join(problems),
+            "exact two-line final description" if not problems else "; ".join(problems),
         )
     except Exception as exc:
         check("4. Grocy description exactly traces validated recipe and harvest", 10, False,
