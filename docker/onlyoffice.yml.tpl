@@ -3,6 +3,9 @@ version: "3.8"
 networks:
   $prefix-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: $subnet
 
 services:
   $prefix-mysql:
@@ -92,8 +95,12 @@ services:
       - -c
       - |
         chown -R onlyoffice:onlyoffice /var/www/onlyoffice/Data /var/log/onlyoffice 2>/dev/null || true
+        sed -i '/files.docservice.url.portal/s!value="[^"]*"!value="http://$hostname:$port/"!' /var/www/onlyoffice/WebStudio/web.appsettings.config
         exec /app/run-community-server.sh
     environment:
+      - PUBLIC_URL=http://$hostname:$port
+      - PORTAL_URL=http://$hostname:$port
+      - ONLYOFFICE_PORTAL_URL=http://$hostname:$port
       - MYSQL_SERVER_HOST=$prefix-mysql
       - MYSQL_SERVER_PORT=3306
       - MYSQL_SERVER_DB_NAME=onlyoffice
@@ -118,12 +125,22 @@ services:
 
 volumes:
   ${prefix}_mysql_data:
+    name: ${prefix}_mysql_data
   ${prefix}_es_data:
+    name: ${prefix}_es_data
   ${prefix}_community_data:
+    name: ${prefix}_community_data
   ${prefix}_community_logs:
+    name: ${prefix}_community_logs
   ${prefix}_community_letsencrypt:
+    name: ${prefix}_community_letsencrypt
   ${prefix}_ds_data:
+    name: ${prefix}_ds_data
   ${prefix}_ds_logs:
+    name: ${prefix}_ds_logs
   ${prefix}_ds_cache:
+    name: ${prefix}_ds_cache
   ${prefix}_ds_files:
+    name: ${prefix}_ds_files
   ${prefix}_ds_fonts:
+    name: ${prefix}_ds_fonts

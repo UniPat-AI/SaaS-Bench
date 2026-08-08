@@ -9,22 +9,23 @@ Compose project:  rollout_{slot_id}_{app_name}
 
 import os
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from string import Template
 
+import tempfile
 
 _BASE_PORT = int(os.environ.get("SAAS_BASE_PORT", 30000))
-_SLOT_OFFSET = 40  # 23 apps (index 0-22); 40 gives headroom
+_SLOT_OFFSET = 40  # web apps use indices 0-22; 40 leaves headroom for DB ports
 _SLOT_PREFIX = os.environ.get("SAAS_SLOT_PREFIX", "rollout")
 
-
+# Transient compose files live under SAAS_BENCH_TMP (defaults to the system
+# temp dir) so parallel rollouts with different prefixes stay isolated.
 _TMP_DIR = os.environ.get(
-    "SAAS_BENCH_TMP",
-    os.path.join(tempfile.gettempdir(), "saas_bench"),
+    "SAAS_BENCH_TMP", os.path.join(tempfile.gettempdir(), f"saas_bench_{_SLOT_PREFIX}")
 )
 os.makedirs(_TMP_DIR, exist_ok=True)
 
@@ -35,38 +36,115 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _READY_OK_STATUSES = {200, 301, 302, 303, 401, 403}
 _READY_INTERVAL = 2.0
+_PROBE_BODY_LIMIT = 128 * 1024
 
 
-def _wait_ready(port: int, health_path: str, timeout: int, hostname: str = "localhost") -> float:
-    """Poll http://{hostname}:{port}{health_path} until ready or timeout.
+def _probe_http(
+    port: int,
+    path: str,
+    hostname: str,
+    bad_markers: list[str] | None = None,
+    required_markers: list[str] | None = None,
+) -> tuple[bool, str]:
+    url = f"http://{hostname}:{port}{path}"
+    status = None
+    body = ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rollout-probe/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            status = r.status
+            body = r.read(_PROBE_BODY_LIMIT).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            body = e.read(_PROBE_BODY_LIMIT).decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+    except Exception as e:
+        return False, f"{url}: {type(e).__name__}: {str(e)[:100]}"
+
+    if status not in _READY_OK_STATUSES:
+        return False, f"{url}: HTTP {status}"
+
+    for marker in bad_markers or []:
+        if marker and marker in body:
+            return False, f"{url}: HTTP {status}, bad marker {marker!r}"
+
+    for marker in required_markers or []:
+        if marker and marker not in body:
+            return False, f"{url}: HTTP {status}, missing marker {marker!r}"
+
+    return True, f"{url}: HTTP {status}"
+
+
+def _health_paths(cfg: dict) -> list[str]:
+    paths = [cfg.get("health_path", "/")]
+    paths.extend(cfg.get("extra_health_paths", []) or [])
+    return list(dict.fromkeys(paths))
+
+
+def _wait_ready(port: int, cfg: dict, timeout: int, hostname: str = "localhost") -> float:
+    """Poll configured HTTP health paths until ready or timeout.
 
     Accepts response statuses in _READY_OK_STATUSES as ready.
     Raises RuntimeError on timeout (caller treats as fatal task failure).
     Returns elapsed seconds when ready.
     """
-    url = f"http://{hostname}:{port}{health_path}"
     start = time.time()
     deadline = start + timeout
     last_err = "no probe attempted"
+    paths = _health_paths(cfg)
+    bad_markers = cfg.get("health_bad_markers", []) or []
+    required_markers = cfg.get("health_required_markers", []) or []
     while time.time() < deadline:
-        status = None
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "rollout-probe/1.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                status = r.status
-        except urllib.error.HTTPError as e:
-            status = e.code
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)[:100]}"
-        if status is not None:
-            if status in _READY_OK_STATUSES:
-                return round(time.time() - start, 1)
-            last_err = f"HTTP {status}"
+        failures = []
+        for path in paths:
+            ok, detail = _probe_http(port, path, hostname, bad_markers, required_markers)
+            if not ok:
+                failures.append(detail)
+        if not failures:
+            return round(time.time() - start, 1)
+        last_err = "; ".join(failures[-3:])
         time.sleep(_READY_INTERVAL)
     elapsed = round(time.time() - start, 1)
     raise RuntimeError(
         f"app on port {port} not ready in {timeout}s "
-        f"(probed {url}, last={last_err}, elapsed={elapsed}s)"
+        f"(probed {paths}, last={last_err}, elapsed={elapsed}s)"
+    )
+
+
+def _docker_health_status(container: str) -> tuple[str, str]:
+    cmd = (
+        "docker inspect "
+        "--format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "
+        f"{container}"
+    )
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        return "missing", r.stderr.strip() or r.stdout.strip()
+    status = r.stdout.strip()
+    return status, status
+
+
+def _wait_compose_health(prefix: str, services: list[str], timeout: int) -> float:
+    start = time.time()
+    deadline = start + timeout
+    last = "no inspect attempted"
+    while time.time() < deadline:
+        pending = []
+        for service in services:
+            container = prefix if service in ("", ".") else f"{prefix}-{service}"
+            status, detail = _docker_health_status(container)
+            if status not in {"healthy", "running"}:
+                pending.append(f"{container}={detail}")
+        if not pending:
+            return round(time.time() - start, 1)
+        last = "; ".join(pending)
+        time.sleep(_READY_INTERVAL)
+    elapsed = round(time.time() - start, 1)
+    raise RuntimeError(
+        f"compose services for {prefix} not healthy in {timeout}s "
+        f"(last={last}, elapsed={elapsed}s)"
     )
 
 
@@ -74,6 +152,7 @@ class SlotManager:
     def __init__(self, apps_config: dict, slot_id: int):
         self.apps = apps_config
         self.slot_id = slot_id
+        self._validate_port_layout()
 
     # -- Public interface -----------------------------------------------------
 
@@ -92,6 +171,35 @@ class SlotManager:
         if offset is not None:
             return self.get_port(app) + int(offset)
         return None
+
+    def _validate_port_layout(self) -> None:
+        claims: dict[int, str] = {}
+        for app, cfg in self.apps.items():
+            app_index = int(cfg["app_index"])
+            if not 0 <= app_index < _SLOT_OFFSET:
+                raise ValueError(
+                    f"app_index for {app} must be within slot range 0-{_SLOT_OFFSET - 1}: {app_index}"
+                )
+            claim = claims.get(app_index)
+            if claim is not None:
+                raise ValueError(f"slot port index {app_index} is shared by {claim} and {app}")
+            claims[app_index] = app
+
+            pg_offset = cfg.get("pg_port_offset")
+            if pg_offset is None:
+                continue
+            pg_index = app_index + int(pg_offset)
+            if not 0 <= pg_index < _SLOT_OFFSET:
+                raise ValueError(
+                    f"Postgres port index for {app} must be within slot range "
+                    f"0-{_SLOT_OFFSET - 1}: {pg_index}"
+                )
+            claim = claims.get(pg_index)
+            if claim is not None:
+                raise ValueError(
+                    f"slot port index {pg_index} is shared by {claim} and {app} Postgres"
+                )
+            claims[pg_index] = f"{app} Postgres"
 
     def start_apps(self, apps: list[str], hostname: str = "localhost") -> None:
         # Stop any stale containers first (sequentially, fast)
@@ -130,10 +238,12 @@ class SlotManager:
                 raise RuntimeError(f"[slot {self.slot_id}] failed to start {app}: {r.stderr.strip()}")
 
         # Readiness probe (replaces fixed sleep)
-        health_path = cfg.get("health_path", "/")
         timeout = cfg.get("startup_wait", 600)
         try:
-            elapsed = _wait_ready(port, health_path, timeout, hostname)
+            elapsed = _wait_ready(port, cfg, timeout, hostname)
+            compose_services = cfg.get("compose_health_services", []) or []
+            if compose_services:
+                _wait_compose_health(name, compose_services, min(120, timeout))
             print(f"  [slot {self.slot_id}] {app} ready in {elapsed}s", flush=True)
         except RuntimeError as e:
             ps = subprocess.run(
@@ -157,23 +267,49 @@ class SlotManager:
             here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             tpl_path = os.path.join(here, tpl_path)
 
+        network_key = f"{_SLOT_PREFIX}:{self.slot_id}:{app}".encode()
+        network_index = zlib.crc32(network_key) % (64 * 256)
+        subnet = f"100.{64 + network_index // 256}.{network_index % 256}.0/24"
         with open(tpl_path) as f:
-            content = Template(f.read()).safe_substitute(prefix=prefix, port=port, hostname=hostname)
+            content = Template(f.read()).safe_substitute(
+                prefix=prefix,
+                port=port,
+                hostname=hostname,
+                subnet=subnet,
+            )
 
-        tmp = f"{_TMP_DIR}/{prefix}.yml"
-        with open(tmp, "w") as f:
-            f.write(content)
+        attempts = int(os.environ.get("SAAS_COMPOSE_START_ATTEMPTS", "2"))
+        errors = []
+        for attempt in range(1, attempts + 1):
+            tmp = f"{_TMP_DIR}/{prefix}.yml"
+            with open(tmp, "w") as f:
+                f.write(content)
 
-        cmd = f"docker compose --project-name {prefix} -f {tmp} up -d"
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"[slot {self.slot_id}] compose failed for {app}: {r.stderr.strip()}")
+            cmd = f"docker compose --project-name {prefix} -f {tmp} up -d"
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if r.returncode == 0:
+                return
+            errors.append(f"attempt {attempt}: {r.stderr.strip()}")
+            self._stop_one(app)
+            if attempt < attempts:
+                time.sleep(3)
+
+        raise RuntimeError(
+            f"[slot {self.slot_id}] compose failed for {app} after {attempts} attempts: "
+            + " | ".join(errors)
+        )
 
     def _stop_one(self, app: str) -> None:
         cfg = self._get(app)
         prefix = self.get_container_name(app)
 
         if cfg.get("start_type") == "compose":
+            tmp = f"{_TMP_DIR}/{prefix}.yml"
+            if os.path.exists(tmp):
+                subprocess.run(
+                    f"docker compose --project-name {prefix} -f {tmp} down -v --remove-orphans --timeout 10",
+                    shell=True, capture_output=True, text=True,
+                )
             # Stop and remove all containers created by compose (without relying on docker compose down)
             containers = self._compose_containers(app, cfg, prefix)
             for c in containers:
