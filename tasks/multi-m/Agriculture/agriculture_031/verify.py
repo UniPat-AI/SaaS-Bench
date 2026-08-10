@@ -1,19 +1,9 @@
-"""
-Verifier for agriculture_031: Chef dish photo → Recipya recipe lookup/create →
-Grocy product+stock → FarmOS harvest log OMRI annotation → update Grocy product
-description.
-
-Checks: 10 weighted checks across recipya, grocy, farmos.
-Strategy: host-side SQLite via docker cp (recipya, grocy), authenticated FarmOS
-JSON:API session (web login; anonymous access sees no log data), llm_judge_vision.
-
-Required env vars:
-  SERVER_HOSTNAME, RECIPYA_PORT, RECIPYA_CONTAINER,
-  GROCY_PORT, GROCY_CONTAINER,
-  FARMOS_PORT, FARMOS_CONTAINER
-"""
+#!/usr/bin/env python3
+"""Verifier for agriculture_031: visual recipe -> stock -> farm traceability."""
 
 import base64
+import hashlib
+import html
 import json
 import os
 import re
@@ -21,38 +11,53 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
-import requests
 
-# ── Config (from env) ─────────────────────────────────────────────────────────
-HOST = os.getenv("SERVER_HOSTNAME", "localhost")
-
-RECIPYA_PORT = os.environ.get("RECIPYA_PORT")
-RECIPYA_CONTAINER = os.environ.get("RECIPYA_CONTAINER")
-GROCY_PORT = os.environ.get("GROCY_PORT")
-GROCY_CONTAINER = os.environ.get("GROCY_CONTAINER")
-FARMOS_PORT = os.environ.get("FARMOS_PORT")
-FARMOS_CONTAINER = os.environ.get("FARMOS_CONTAINER")
-
-for var in ("RECIPYA_PORT", "RECIPYA_CONTAINER", "GROCY_PORT", "GROCY_CONTAINER",
-            "FARMOS_PORT", "FARMOS_CONTAINER"):
-    if not os.environ.get(var):
-        print(f"FATAL: {var} not set", file=sys.stderr)
-        sys.exit(1)
-
+RECIPYA_CONTAINER = os.getenv("RECIPYA_CONTAINER")
+GROCY_CONTAINER = os.getenv("GROCY_CONTAINER")
+FARMOS_CONTAINER = os.getenv("FARMOS_CONTAINER")
 RECIPYA_DB = "/root/.config/Recipya/Database/recipya.db"
 GROCY_DB = "/config/data/grocy.db"
+FARMOS_DB = "/opt/drupal/web/sites/default/files/.ht.sqlite"
 
-_INPUTS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "inputs"
+SOURCE_IMAGE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "inputs",
+    "recipya_recipe_006.jpg",
+)
+EXPECTED_RECIPE = "Beef and Broccoli Stir-Fry"
+EXPECTED_CUISINE = "Chinese"
+EXPECTED_PRODUCT = "Broccoli"
+TARGET_LOG_NAME = "2024 Broccoli Harvest — North Field East Bed (Side Shoots)"
+TARGET_ASSET_NAME = "North Field — East Bed"
+EXPECTED_OMRI = "OMRI-ORG-2024-1187"
+EXPECTED_SOURCE_SHA256 = "951f50e302e49b45f60d3186b0c1c5860ede1cca2065e72893848b86dd4f02b6"
+# Expected WebP bytes produced by the deployed Recipya image pipeline for this source.
+EXPECTED_STORED_SHA256 = "4b69b0cb9fb0a62dbaa8967a3b795d8a99f16f0759247924e7d653ae2496b1e5"
+EXPECTED_FARMOS_NOTES = f"OMRI certification: {EXPECTED_OMRI}"
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
 )
 
-INPUT_FILES = [
-    os.path.join(_INPUTS_DIR, "recipya_recipe_006.jpg"),
-]
+for name, value in [
+    ("RECIPYA_CONTAINER", RECIPYA_CONTAINER),
+    ("GROCY_CONTAINER", GROCY_CONTAINER),
+    ("FARMOS_CONTAINER", FARMOS_CONTAINER),
+]:
+    if not value:
+        print(f"FATAL: {name} not set", file=sys.stderr)
+        sys.exit(1)
 
-# ── Result accumulator ────────────────────────────────────────────────────────
+
 _checks: list[tuple[str, int, bool, str]] = []
+_db_copies: dict[tuple[str, str], str] = {}
+_recipe: dict | None = None
+_product: dict | None = None
+_target_log: dict | None = None
+_recipe_ok = False
+_grocy_ok = False
+_farmos_ok = False
 
 
 def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
@@ -62,531 +67,376 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
     print(f"[{status}] ({weight}pt) {label}{tail}", file=sys.stderr)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
-    r = subprocess.run(
+def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str, str]:
+    result = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
-    return r.returncode, r.stdout, r.stderr
+    return result.returncode, result.stdout, result.stderr
 
 
-def _sqlite_via_docker_cp(
-    container: str, db_path: str, query: str, timeout: int = 20
-) -> str:
-    """Query a SQLite DB inside a container that has no sqlite3 CLI.
-
-    Copies the DB file (plus -wal/-shm when present) to a host temp dir via
-    ``docker cp`` and runs the query with the host Python's sqlite3 module.
-    Output mimics ``sqlite3 -separator "|"``: columns joined by "|", NULL as
-    empty string, one row per line, no header.
-    """
-    with tempfile.TemporaryDirectory(prefix="verify_sqlite_") as tmpdir:
-        local_db = os.path.join(tmpdir, os.path.basename(db_path))
-        r = subprocess.run(
+def sqlite_copy_query(container: str, db_path: str, sql: str) -> list[dict]:
+    key = (container, db_path)
+    local_db = _db_copies.get(key)
+    if local_db is None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        local_db = tmp.name
+        tmp.close()
+        result = subprocess.run(
             ["docker", "cp", f"{container}:{db_path}", local_db],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"docker cp {container}:{db_path} failed: {r.stderr.strip()}"
-            )
-        # Best effort: copy WAL/SHM so un-checkpointed data is visible too.
+        if result.returncode != 0:
+            raise RuntimeError(f"DB copy failed for {db_path}: {result.stderr.strip()}")
         for suffix in ("-wal", "-shm"):
             subprocess.run(
                 ["docker", "cp", f"{container}:{db_path}{suffix}", local_db + suffix],
-                capture_output=True, text=True, timeout=timeout,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
+        _db_copies[key] = local_db
+    connection = sqlite3.connect(local_db)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute(sql).fetchall()]
+    finally:
+        connection.close()
+
+
+def recipya_query(sql: str) -> list[dict]:
+    return sqlite_copy_query(RECIPYA_CONTAINER, RECIPYA_DB, sql)
+
+
+def grocy_query(sql: str) -> list[dict]:
+    return sqlite_copy_query(GROCY_CONTAINER, GROCY_DB, sql)
+
+
+def farmos_query(sql: str) -> list[dict]:
+    encoded = base64.b64encode(sql.encode()).decode()
+    php = (
+        "$sql=base64_decode('" + encoded + "');"
+        "$db=new SQLite3('" + FARMOS_DB + "');"
+        "$result=$db->query($sql);"
+        "if($result===false){fwrite(STDERR,$db->lastErrorMsg());exit(2);}"
+        "$rows=[];while($row=$result->fetchArray(SQLITE3_ASSOC)){$rows[]=$row;}"
+        "echo json_encode($rows);"
+    )
+    rc, stdout, stderr = docker_exec(FARMOS_CONTAINER, "php", "-r", php)
+    if rc != 0:
+        raise RuntimeError(f"FarmOS query failed: {stderr.strip()}")
+    return json.loads(stdout) if stdout.strip() else []
+
+
+def strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def description_lines(value: str) -> list[str]:
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", value or "")
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def image_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def read_recipya_image(image_id: str) -> bytes | None:
+    image_id = (image_id or "").strip()
+    if not UUID_RE.fullmatch(image_id):
+        return None
+    path = f"/root/.config/Recipya/Images/{image_id}.webp"
+    rc, stdout, _ = docker_exec(RECIPYA_CONTAINER, "base64", path)
+    if rc == 0 and stdout.strip():
         try:
-            conn = sqlite3.connect(local_db)
-            try:
-                rows = conn.execute(query).fetchall()
-            finally:
-                conn.close()
-        except sqlite3.Error as e:
-            raise RuntimeError(f"sqlite3 query on {db_path} failed: {e}")
-    lines = []
-    for row in rows:
-        lines.append("|".join(
-            "" if v is None
-            else v.decode("utf-8", "replace") if isinstance(v, bytes)
-            else str(v)
-            for v in row
-        ))
-    return "\n".join(lines).strip()
+            return base64.b64decode(stdout)
+        except ValueError:
+            return None
+    return None
 
 
-def recipya_sql(query: str) -> str:
-    try:
-        return _sqlite_via_docker_cp(RECIPYA_CONTAINER, RECIPYA_DB, query)
-    except Exception as e:
-        raise RuntimeError(f"recipya sql error: {e}")
-
-
-def grocy_sql(query: str) -> str:
-    try:
-        return _sqlite_via_docker_cp(GROCY_CONTAINER, GROCY_DB, query)
-    except Exception as e:
-        raise RuntimeError(f"grocy sql error: {e}")
-
-
-def _farmos_session() -> "requests.Session":
-    """Authenticated FarmOS session.
-
-    FarmOS JSON:API hides log/asset data from anonymous and HTTP-basic
-    requests, so authenticate through the web-login form and reuse the
-    resulting session cookie.
-    """
-    global _FARMOS_SESSION
-    if _FARMOS_SESSION is not None:
-        return _FARMOS_SESSION
-    s = requests.Session()
-    base = f"http://{HOST}:{FARMOS_PORT}"
-    try:
-        login_page = s.get(f"{base}/user/login", timeout=15)
-        m = re.search(r'name="form_build_id" value="([^"]+)"', login_page.text)
-        s.post(
-            f"{base}/user/login",
-            data={
-                "name": os.getenv("FARMOS_USER", "admin"),
-                "pass": os.getenv("FARMOS_PASS", "admin123456"),
-                "form_build_id": m.group(1) if m else "",
-                "form_id": "user_login_form",
-                "op": "Log in",
-            },
-            timeout=15,
-        )
-    except Exception:
-        pass
-    _FARMOS_SESSION = s
-    return s
-
-
-_FARMOS_SESSION: "requests.Session | None" = None
-
-
-def farmos_api_get(path: str) -> dict:
-    url = f"http://{HOST}:{FARMOS_PORT}{path}"
-    resp = _farmos_session().get(url, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+def compare_attached_image(source: bytes, actual: bytes, summary: str) -> tuple[bool, str]:
     prompt = (
-        f"Does the following content satisfy this condition?\n"
-        f"Condition: {condition}\n\n"
-        f"Content:\n{content}\n\n"
-        f"Answer only YES or NO."
+        "Image 1 is the supplied customer dish photo. Image 2 is the image actually "
+        "attached to the candidate Recipya recipe. Are they the same dish, and do both "
+        "support the recipe summary as a Chinese beef-and-broccoli stir-fry? A generic, "
+        "unrelated, or merely similar image must be NO.\n\n"
+        f"Recipe summary: {summary}\nAnswer only YES or NO."
     )
+    payload = {
+        "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url":
+                    f"data:{image_mime(source)};base64,{base64.b64encode(source).decode()}"}},
+                {"type": "image_url", "image_url": {"url":
+                    f"data:{image_mime(actual)};base64,{base64.b64encode(actual).decode()}"}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+        "max_tokens": 64,
+    }
     try:
-        resp = requests.post(
-            f"{api_base}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 512},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
-        return answer.startswith("YES"), answer
-    except Exception as e:
-        return False, f"llm_judge error: {e}"
-
-
-def llm_judge_vision(
-    image_path: str,
-    recorded_value: str,
-    condition: str,
-    timeout: int = 45,
-) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
-    ext = os.path.splitext(image_path)[1].lower()
-    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "png": "image/png", "gif": "image/gif",
-            "webp": "image/webp"}.get(ext.lstrip("."), "image/jpeg")
-    if not os.path.isfile(image_path):
-        return False, f"image not found: {image_path}"
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    prompt = (
-        f"You are given an image and a value that an AI agent extracted from it.\n"
-        f"Recorded value: «{recorded_value}»\n"
-        f"Condition: {condition}\n\n"
-        f"Does the recorded value accurately match the information visible in the image, "
-        f"satisfying the condition above?\n"
-        f"Answer only YES or NO."
-    )
-    try:
-        resp = requests.post(
-            f"{api_base}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-                "max_tokens": 512,
+        request = urllib.request.Request(
+            os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
+            + "/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {os.getenv('MINDRA_API_KEY', '')}",
+                "Content-Type": "application/json",
             },
-            timeout=timeout,
+            method="POST",
         )
-        resp.raise_for_status()
-        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+        with urllib.request.urlopen(request, timeout=45) as response:
+            body = json.loads(response.read())
+        message = body.get("choices", [{}])[0].get("message", {})
+        answer = (message.get("content") or "").strip().upper()
+        if not answer:
+            return False, "vision judge returned no message content"
         return answer.startswith("YES"), answer
-    except Exception as e:
-        return False, f"llm_judge_vision error: {e}"
+    except Exception as exc:
+        return False, f"vision judge error: {exc}"
 
 
-# ── Individual checks ─────────────────────────────────────────────────────────
-
-def check_0_input_files_exist() -> None:
-    missing = [p for p in INPUT_FILES if not os.path.isfile(p)]
-    if missing:
-        check("0. input_files_exist", 1, False, "missing: " + ", ".join(missing))
-    else:
-        check("0. input_files_exist", 1, True)
+def quantified(value: str) -> bool:
+    return re.search(r"\d|[¼½¾⅓⅔⅛]", value or "") is not None
 
 
-def check_1_recipe_exists_in_recipya() -> str | None:
-    """The recipe 'Beef and Broccoli Stir-Fry' (created per the task) must exist in Recipya."""
+def check_1_complete_visually_linked_recipe() -> None:
+    global _recipe, _recipe_ok
     try:
-        rows = recipya_sql(
-            "SELECT id, name FROM recipes "
-            "WHERE LOWER(TRIM(name)) = 'beef and broccoli stir-fry';"
+        rows = recipya_query(
+            "SELECT r.id,r.name,r.image FROM recipes r "
+            "JOIN user_recipe ur ON ur.recipe_id=r.id "
+            "JOIN users u ON u.id=ur.user_id "
+            "WHERE r.name='Beef and Broccoli Stir-Fry' "
+            "AND LOWER(u.email)='admin@recipya.com' ORDER BY r.id"
         )
-        if rows:
-            first = rows.split("\n")[0]
-            rid, rname = first.split("|", 1)
-            check("1. recipe_exists_in_recipya", 2, True, f"id={rid} name={rname}")
-            return rid
-        near = recipya_sql(
-            "SELECT id, name FROM recipes WHERE LOWER(name) LIKE '%broccoli%';"
-        )
-        check("1. recipe_exists_in_recipya", 2, False,
-              "recipe 'Beef and Broccoli Stir-Fry' not found"
-              + (f"; other broccoli recipes: {near.split(chr(10))[:3]}" if near else ""))
-        return None
-    except Exception as e:
-        check("1. recipe_exists_in_recipya", 2, False, f"exception: {e}")
-        return None
-
-
-def check_2_cross_modal_recipe_matches_image(recipe_name: str | None) -> None:
-    """The recipe found in Recipya should match the dish visible in the photo."""
-    if not recipe_name:
-        check("2. cross_modal_recipe_matches_image", 2, False,
-              "skipped: no recipe found to validate")
-        return
-    if not os.path.isfile(INPUT_FILES[0]):
-        check("2. cross_modal_recipe_matches_image", 2, False,
-              "skipped: input file missing")
-        return
-    try:
-        passed, raw = llm_judge_vision(
-            INPUT_FILES[0],
-            recipe_name,
-            "The dish visible in the photo is consistent with a recipe named "
-            f"'{recipe_name}'. The photo should show a dish that could reasonably "
-            "be described by this recipe name.",
-        )
-        check("2. cross_modal_recipe_matches_image", 2, passed, raw)
-    except Exception as e:
-        check("2. cross_modal_recipe_matches_image", 2, False, f"exception: {e}")
-
-
-def check_3_broccoli_ingredient_in_recipe(recipe_id: str | None) -> None:
-    """Broccoli must be an ingredient of the identified recipe."""
-    if not recipe_id:
-        check("3. broccoli_ingredient_in_recipe", 1, False,
-              "skipped: no recipe found")
-        return
-    try:
-        rows = recipya_sql(
-            f"SELECT i.name FROM ingredient_recipe ir "
-            f"JOIN ingredients i ON i.id = ir.ingredient_id "
-            f"WHERE ir.recipe_id = {recipe_id} AND LOWER(i.name) LIKE '%broccoli%';"
-        )
-        if rows:
-            check("3. broccoli_ingredient_in_recipe", 1, True, rows.split("\n")[0])
+        if len(rows) != 1:
+            check("1. complete visually linked Recipya recipe", 4, False,
+                  f"expected one exact admin recipe, found {len(rows)}")
+            return
+        _recipe = rows[0]
+        recipe_id = int(_recipe["id"])
+        ingredients = [row["name"] for row in recipya_query(
+            "SELECT i.name FROM ingredient_recipe ir "
+            "JOIN ingredients i ON i.id=ir.ingredient_id "
+            f"WHERE ir.recipe_id={recipe_id} ORDER BY ir.ingredient_order"
+        )]
+        instructions = [row["name"] for row in recipya_query(
+            "SELECT i.name FROM instruction_recipe ir "
+            "JOIN instructions i ON i.id=ir.instruction_id "
+            f"WHERE ir.recipe_id={recipe_id} ORDER BY ir.instruction_order"
+        )]
+        cuisines = [row["name"] for row in recipya_query(
+            "SELECT c.name FROM cuisine_recipe cr "
+            "JOIN cuisines c ON c.id=cr.cuisine_id "
+            f"WHERE cr.recipe_id={recipe_id} ORDER BY c.name"
+        )]
+        broccoli = []
+        protein = []
+        for value in ingredients:
+            words = set(re.findall(r"[a-z]+", value.lower()))
+            if "broccoli" in words and not words & {"soup", "powder", "extract"}:
+                broccoli.append(value)
+            if words & {"beef", "steak", "sirloin", "flank"} and not words & {
+                "bouillon", "broth", "flavor", "flavour", "sauce", "seasoning", "stock",
+            }:
+                protein.append(value)
+        problems = []
+        if EXPECTED_CUISINE not in cuisines:
+            problems.append(f"cuisine={cuisines}, expected Chinese")
+        if not any(quantified(value) for value in broccoli):
+            problems.append("no quantified broccoli ingredient")
+        if not any(quantified(value) for value in protein):
+            problems.append("no quantified beef ingredient")
+        if len(instructions) < 4:
+            problems.append(f"only {len(instructions)} instructions")
+        source_image = b""
+        if not os.path.isfile(SOURCE_IMAGE):
+            problems.append("source image missing")
         else:
-            all_ing = recipya_sql(
-                f"SELECT i.name FROM ingredient_recipe ir "
-                f"JOIN ingredients i ON i.id = ir.ingredient_id "
-                f"WHERE ir.recipe_id = {recipe_id};"
+            with open(SOURCE_IMAGE, "rb") as source_file:
+                source_image = source_file.read()
+            source_digest = hashlib.sha256(source_image).hexdigest()
+            if source_digest != EXPECTED_SOURCE_SHA256:
+                problems.append(
+                    f"source image hash={source_digest}, expected={EXPECTED_SOURCE_SHA256}"
+                )
+        actual_image = read_recipya_image(_recipe.get("image") or "")
+        if not actual_image:
+            problems.append(f"associated image file missing for image='{_recipe.get('image')}'")
+        elif source_image and hashlib.sha256(source_image).hexdigest() == EXPECTED_SOURCE_SHA256:
+            actual_digest = hashlib.sha256(actual_image).hexdigest()
+            if actual_digest != EXPECTED_STORED_SHA256:
+                problems.append(
+                    f"stored image hash={actual_digest}, expected Recipya WebP hash="
+                    f"{EXPECTED_STORED_SHA256}"
+                )
+            else:
+                summary = f"{_recipe['name']}; cuisine={','.join(cuisines)}; ingredients=" \
+                          + ", ".join(ingredients)
+                image_ok, detail = compare_attached_image(source_image, actual_image, summary)
+                if not image_ok:
+                    problems.append(detail)
+        _recipe_ok = not problems
+        check(
+            "1. complete visually linked Recipya recipe",
+            4,
+            _recipe_ok,
+            f"recipe_id={recipe_id}; image={_recipe.get('image')}; "
+            f"stored_sha256={EXPECTED_STORED_SHA256}"
+            if _recipe_ok else "; ".join(problems),
+        )
+    except Exception as exc:
+        check("1. complete visually linked Recipya recipe", 4, False,
+              f"exception: {exc}")
+
+
+def check_2_exact_grocy_product_with_stock() -> None:
+    global _product, _grocy_ok
+    try:
+        rows = grocy_query(
+            "SELECT id,name,COALESCE(description,'') AS description FROM products "
+            "WHERE name='Broccoli' ORDER BY id"
+        )
+        if len(rows) != 1:
+            check("2. exact Grocy vegetable product has positive stock", 3, False,
+                  f"expected one exact Broccoli product, found {len(rows)}")
+            return
+        _product = rows[0]
+        product_id = int(_product["id"])
+        stock_rows = grocy_query(
+            f"SELECT COALESCE(SUM(amount),0) AS amount FROM stock WHERE product_id={product_id}"
+        )
+        stock = float(stock_rows[0]["amount"] or 0) if stock_rows else 0.0
+        _grocy_ok = stock > 0
+        check(
+            "2. exact Grocy vegetable product has positive stock",
+            3,
+            _grocy_ok,
+            f"product_id={product_id}; stock={stock:g}",
+        )
+    except Exception as exc:
+        check("2. exact Grocy vegetable product has positive stock", 3, False,
+              f"exception: {exc}")
+
+
+def check_3_exact_farmos_log_annotation() -> None:
+    global _target_log, _farmos_ok
+    try:
+        exact_rows = farmos_query(
+            "SELECT id,name,timestamp,notes__value FROM log_field_data "
+            "WHERE type='harvest' "
+            "AND name COLLATE BINARY='2024 Broccoli Harvest — North Field East Bed (Side Shoots)' "
+            "ORDER BY timestamp DESC,id DESC"
+        )
+        if len(exact_rows) != 1:
+            check("3. unique FarmOS harvest log has exact final notes and asset", 3, False,
+                  f"expected one exact target harvest log, found {len(exact_rows)}")
+            return
+        _target_log = exact_rows[0]
+        target_id = int(_target_log["id"])
+        notes = strip_html(_target_log.get("notes__value") or "")
+        problems = []
+        asset_rows = farmos_query(
+            "SELECT id FROM asset_field_data WHERE type='land' "
+            "AND name='North Field — East Bed' ORDER BY id"
+        )
+        if len(asset_rows) != 1:
+            problems.append(f"expected one exact East Bed land asset, found {len(asset_rows)}")
+        else:
+            asset_id = int(asset_rows[0]["id"])
+            linked_rows = farmos_query(
+                "SELECT la.asset_target_id,a.type FROM log__asset la "
+                "LEFT JOIN asset_field_data a ON a.id=la.asset_target_id "
+                f"WHERE la.entity_id={target_id} AND la.deleted=0 ORDER BY la.asset_target_id"
             )
-            check("3. broccoli_ingredient_in_recipe", 1, False,
-                  f"broccoli not found; ingredients: {all_ing[:200]}")
-    except Exception as e:
-        check("3. broccoli_ingredient_in_recipe", 1, False, f"exception: {e}")
-
-
-def check_4_broccoli_product_in_grocy() -> str | None:
-    """The product named exactly 'Broccoli' (created per the task) must exist in Grocy."""
-    try:
-        rows = grocy_sql(
-            "SELECT id, name FROM products WHERE LOWER(TRIM(name)) = 'broccoli';"
-        )
-        if rows:
-            first = rows.split("\n")[0]
-            pid, pname = first.split("|", 1)
-            check("4. broccoli_product_in_grocy", 1, True, f"id={pid} name={pname}")
-            return pid
-        check("4. broccoli_product_in_grocy", 1, False,
-              "no product named exactly 'Broccoli' found in grocy")
-        return None
-    except Exception as e:
-        check("4. broccoli_product_in_grocy", 1, False, f"exception: {e}")
-        return None
-
-
-def check_5_broccoli_in_grocy_stock(product_id: str | None) -> None:
-    """Broccoli must have stock entries in Grocy."""
-    if not product_id:
-        check("5. broccoli_in_grocy_stock", 1, False,
-              "skipped: no broccoli product found")
-        return
-    try:
-        rows = grocy_sql(
-            f"SELECT SUM(amount) FROM stock WHERE product_id = {product_id};"
-        )
-        amount = float(rows) if rows and rows != "" else 0.0
-        if amount > 0:
-            check("5. broccoli_in_grocy_stock", 1, True, f"stock amount={amount}")
-        else:
-            check("5. broccoli_in_grocy_stock", 1, False,
-                  f"stock amount is 0 or empty for product {product_id}")
-    except Exception as e:
-        check("5. broccoli_in_grocy_stock", 1, False, f"exception: {e}")
-
-
-TARGET_LOG_NAME = "2024 broccoli harvest — north field east bed (side shoots)"
-EXPECTED_OMRI = "OMRI-ORG-2024-1187"
-
-
-def check_6_farmos_harvest_log_exists() -> dict | None:
-    """The broccoli harvest log named in the task must exist in FarmOS."""
-    try:
-        data = farmos_api_get("/api/log/harvest")
-        logs = data.get("data", [])
-        broccoli_logs = []
-        for log in logs:
-            attrs = log.get("attributes", {})
-            name = (attrs.get("name") or "").lower()
-            notes_val = ""
-            notes = attrs.get("notes")
-            if isinstance(notes, dict):
-                notes_val = (notes.get("value") or "").lower()
-            elif isinstance(notes, str):
-                notes_val = notes.lower()
-            if "broccoli" in name or "broccoli" in notes_val:
-                broccoli_logs.append(log)
-        if broccoli_logs:
-            named = [
-                log for log in broccoli_logs
-                if (log.get("attributes", {}).get("name") or "").strip().lower()
-                == TARGET_LOG_NAME
+            linked_assets = [
+                (int(row["asset_target_id"]), row.get("type")) for row in linked_rows
             ]
-            if named:
-                latest = named[0]
-            else:
-                broccoli_logs.sort(
-                    key=lambda x: x.get("attributes", {}).get("timestamp", ""),
-                    reverse=True,
+            if linked_assets != [(asset_id, "land")]:
+                problems.append(
+                    f"asset links={linked_assets}, expected only [({asset_id}, 'land')]"
                 )
-                latest = broccoli_logs[0]
-            log_name = latest.get("attributes", {}).get("name", "?")
-            check("6. farmos_harvest_log_exists", 2, True,
-                  f"found: {log_name}")
-            return latest
-        check("6. farmos_harvest_log_exists", 2, False,
-              "no harvest log mentioning broccoli found in FarmOS")
-        return None
-    except Exception as e:
-        check("6. farmos_harvest_log_exists", 2, False, f"exception: {e}")
-        return None
-
-
-def check_7_farmos_omri_cert_in_log(harvest_log: dict | None) -> str | None:
-    """The FarmOS harvest log notes must contain the OMRI certification
-    number given in the task (OMRI-ORG-2024-1187)."""
-    if not harvest_log:
-        check("7. farmos_omri_cert_number", 2, False,
-              "skipped: no harvest log found")
-        return None
-    try:
-        attrs = harvest_log.get("attributes", {})
-        notes = attrs.get("notes")
-        notes_text = ""
-        if isinstance(notes, dict):
-            notes_text = notes.get("value") or ""
-        elif isinstance(notes, str):
-            notes_text = notes
-        name = attrs.get("name") or ""
-        search_text = f"{name} {notes_text}"
-        if EXPECTED_OMRI in search_text:
-            check("7. farmos_omri_cert_number", 2, True,
-                  f"OMRI cert: {EXPECTED_OMRI}")
-            return EXPECTED_OMRI
-        check("7. farmos_omri_cert_number", 2, False,
-              f"{EXPECTED_OMRI} not found in log notes (first 200 chars: {search_text[:200]})")
-        return None
-    except Exception as e:
-        check("7. farmos_omri_cert_number", 2, False, f"exception: {e}")
-        return None
-
-
-def check_8_grocy_description_has_recipe_id(
-    product_id: str | None, recipe_id: str | None
-) -> None:
-    """Grocy product description must contain the Recipya Recipe ID."""
-    if not product_id:
-        check("8. grocy_desc_has_recipe_id", 2, False,
-              "skipped: no broccoli product in grocy")
-        return
-    if not recipe_id:
-        check("8. grocy_desc_has_recipe_id", 2, False,
-              "skipped: no recipe ID found")
-        return
-    try:
-        desc = grocy_sql(
-            f"SELECT description FROM products WHERE id = {product_id};"
-        )
-        if not desc:
-            check("8. grocy_desc_has_recipe_id", 2, False,
-                  "product description is empty")
-            return
-        if recipe_id in desc or f"Recipe ID" in desc or f"recipe" in desc.lower():
-            id_found = recipe_id in desc
-            if id_found:
-                check("8. grocy_desc_has_recipe_id", 2, True,
-                      f"recipe ID {recipe_id} found in description")
-            else:
-                passed_llm, reason = llm_judge(
-                    desc,
-                    f"The text contains a reference to Recipya Recipe ID {recipe_id}.",
-                )
-                check("8. grocy_desc_has_recipe_id", 2, passed_llm,
-                      f"llm_judge: {reason}")
-        else:
-            check("8. grocy_desc_has_recipe_id", 2, False,
-                  f"recipe ID {recipe_id} not found in description: {desc[:200]}")
-    except Exception as e:
-        check("8. grocy_desc_has_recipe_id", 2, False, f"exception: {e}")
-
-
-def check_9_grocy_description_has_omri_cert(
-    product_id: str | None, omri_cert: str | None
-) -> None:
-    """Grocy product description must contain the OMRI certification number from FarmOS."""
-    if not product_id:
-        check("9. grocy_desc_has_omri_cert", 3, False,
-              "skipped: no broccoli product in grocy")
-        return
-    if not omri_cert:
-        check("9. grocy_desc_has_omri_cert", 3, False,
-              "skipped: no OMRI cert found in FarmOS")
-        return
-    try:
-        desc = grocy_sql(
-            f"SELECT description FROM products WHERE id = {product_id};"
-        )
-        if not desc:
-            check("9. grocy_desc_has_omri_cert", 3, False,
-                  "product description is empty")
-            return
-        omri_digits = re.sub(r'[^A-Za-z0-9]', '', omri_cert)
-        desc_normalized = re.sub(r'[^A-Za-z0-9]', '', desc)
-        if omri_digits in desc_normalized or omri_cert in desc:
-            check("9. grocy_desc_has_omri_cert", 3, True,
-                  f"OMRI cert '{omri_cert}' found in description")
-        elif "omri" in desc.lower():
-            passed_llm, reason = llm_judge(
-                desc,
-                f"The text contains the OMRI certification number '{omri_cert}' "
-                f"or an equivalent reference to it.",
+        if notes != EXPECTED_FARMOS_NOTES:
+            problems.append(
+                f"notes={notes!r}, expected exact {EXPECTED_FARMOS_NOTES!r}"
             )
-            check("9. grocy_desc_has_omri_cert", 3, passed_llm,
-                  f"llm_judge: {reason}")
-        else:
-            check("9. grocy_desc_has_omri_cert", 3, False,
-                  f"OMRI cert '{omri_cert}' not found in description: {desc[:200]}")
-    except Exception as e:
-        check("9. grocy_desc_has_omri_cert", 3, False, f"exception: {e}")
+        other_rows = farmos_query(
+            "SELECT id,name,type FROM log_field_data "
+            f"WHERE id<>{target_id} AND notes__value LIKE '%OMRI-ORG-2024-1187%' "
+            "ORDER BY id"
+        )
+        if other_rows:
+            problems.append(
+                "OMRI number also appears on non-target log IDs "
+                + str([int(row["id"]) for row in other_rows])
+            )
+        _farmos_ok = not problems
+        check(
+            "3. unique FarmOS harvest log has exact final notes and asset",
+            3,
+            _farmos_ok,
+            f"log_id={target_id}" if _farmos_ok else "; ".join(problems),
+        )
+    except Exception as exc:
+        check("3. unique FarmOS harvest log has exact final notes and asset", 3, False,
+              f"exception: {exc}")
 
 
-def check_10_cross_modal_grocy_desc_consistent(product_id: str | None) -> None:
-    """The updated Grocy description must be consistent with data derivable from the dish image."""
-    if not product_id:
-        check("10. cross_modal_grocy_desc", 2, False,
-              "skipped: no broccoli product in grocy")
-        return
-    if not os.path.isfile(INPUT_FILES[0]):
-        check("10. cross_modal_grocy_desc", 2, False,
-              "skipped: input file missing")
+def check_4_gated_exact_traceability_description() -> None:
+    if not _recipe_ok or not _recipe or not _grocy_ok or not _product or not _farmos_ok:
+        check("4. Grocy description exactly traces validated recipe and harvest", 10, False,
+              "gated: visual recipe, Grocy stock, or exact FarmOS update is invalid")
         return
     try:
-        desc = grocy_sql(
-            f"SELECT description FROM products WHERE id = {product_id};"
+        rows = grocy_query(
+            f"SELECT COALESCE(description,'') AS description FROM products "
+            f"WHERE id={int(_product['id'])}"
         )
-        if not desc or len(desc) < 5:
-            check("10. cross_modal_grocy_desc", 2, False,
-                  f"product description too short or empty: '{desc}'")
-            return
-        passed, raw = llm_judge_vision(
-            INPUT_FILES[0],
-            desc,
-            "The product description references information that is consistent with "
-            "the dish shown in the photo. The photo shows a dish that uses broccoli "
-            "as a primary green vegetable, and the description contains traceability "
-            "data (recipe ID, certification number) that could have been derived from "
-            "a workflow starting with this dish photo.",
+        description = rows[0]["description"] if rows else ""
+        lines = description_lines(description)
+        recipe_line = f"Recipya recipe ID: {int(_recipe['id'])}"
+        omri_line = f"OMRI certification: {EXPECTED_OMRI}"
+        problems = []
+        expected_lines = [recipe_line, omri_line]
+        if lines != expected_lines:
+            problems.append(f"description lines={lines!r}, expected={expected_lines!r}")
+        check(
+            "4. Grocy description exactly traces validated recipe and harvest",
+            10,
+            not problems,
+            "exact two-line final description" if not problems else "; ".join(problems),
         )
-        check("10. cross_modal_grocy_desc", 2, passed, raw)
-    except Exception as e:
-        check("10. cross_modal_grocy_desc", 2, False, f"exception: {e}")
+    except Exception as exc:
+        check("4. Grocy description exactly traces validated recipe and harvest", 10, False,
+              f"exception: {exc}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    check_0_input_files_exist()
-    recipe_id = check_1_recipe_exists_in_recipya()
-    recipe_name = None
-    if recipe_id:
-        try:
-            recipe_name = recipya_sql(
-                f"SELECT name FROM recipes WHERE id = {recipe_id};"
-            )
-        except Exception:
-            pass
-    check_2_cross_modal_recipe_matches_image(recipe_name)
-    check_3_broccoli_ingredient_in_recipe(recipe_id)
-    grocy_product_id = check_4_broccoli_product_in_grocy()
-    check_5_broccoli_in_grocy_stock(grocy_product_id)
-    harvest_log = check_6_farmos_harvest_log_exists()
-    omri_cert = check_7_farmos_omri_cert_in_log(harvest_log)
-    check_8_grocy_description_has_recipe_id(grocy_product_id, recipe_id)
-    check_9_grocy_description_has_omri_cert(grocy_product_id, omri_cert)
-    check_10_cross_modal_grocy_desc_consistent(grocy_product_id)
-
-    total = sum(w for _, w, _, _ in _checks)
-    earned = sum(w for _, w, p, _ in _checks if p)
-    all_pass = all(p for _, _, p, _ in _checks) and bool(_checks)
-    score = (earned / total) if total else 0.0
-
-    print(
-        f"SCORE: {score:.3f}  PASS: {all_pass}  ({earned}/{total})",
-        file=sys.stderr,
-    )
+    check_1_complete_visually_linked_recipe()
+    check_2_exact_grocy_product_with_stock()
+    check_3_exact_farmos_log_annotation()
+    check_4_gated_exact_traceability_description()
+    total = sum(weight for _, weight, _, _ in _checks)
+    earned = sum(weight for _, weight, passed, _ in _checks if passed)
+    all_pass = bool(_checks) and all(passed for _, _, passed, _ in _checks)
+    print(f"SCORE: {earned / total if total else 0:.3f}  PASS: {all_pass}  ({earned}/{total})",
+          file=sys.stderr)
     sys.exit(0 if all_pass else 1)
 
 

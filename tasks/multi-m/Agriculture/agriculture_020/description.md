@@ -1,10 +1,13 @@
 **Task Requirements:**
-Search Recipya for the `Layered Zucchini Casserole` recipe to retrieve its ingredient list. If it is not visible in the logged-in account, create it with the five main vegetables: zucchini, eggplant, onion, mushrooms, and fresh tomatoes. For each of those vegetables, check the current inventory level in Grocy. Treat 5 units as the target stock level. Add every under-stocked or missing vegetable to the Grocy shopping list with the quantity needed to reach 5 units, and use the exact note `Bistrot Provençal menu expansion`. Do not add vegetables that already have at least 5 units in stock.
 
-**Steps:**
-1. Search Recipya for the Layered Zucchini Casserole recipe; create it with the five specified vegetables if it is not visible to the logged-in account.
-2. Check Grocy for the stock levels of these specific ingredients, accounting for naming variations.
-3. Add every deficient ingredient, in the quantity needed to reach 5 units, with the specified restaurant note.
+Reconcile the `Layered Zucchini Casserole` recipe in Recipya with Grocy stock and create an exact conditional shopping plan.
+
+1. In Recipya, use the recipe named exactly `Layered Zucchini Casserole` owned by `admin@recipya.com`. If it is absent, create it. Its ingredient list must include all five main vegetables: zucchini, eggplant, onion, mushrooms, and fresh tomatoes.
+2. In Grocy, locate the product representing each vegetable, accounting for the direct aliases courgette/zucchini and aubergine/eggplant. Processed tomato products, onion powder, mushroom soup, prepared dishes, and other substring-only matches do not count. If no direct product exists for a vegetable, create one using its canonical name: `Zucchini`, `Eggplant`, `Onion`, `Mushrooms`, or `Fresh Tomatoes`. If more than one direct product represents a vegetable, choose the one with the greatest current stock; break a tie by the lowest product ID.
+3. Treat 5 units as the target stock. For each selected product below 5 units, compute the deficit `5 - current stock` and add exactly one shopping-list entry for that amount. Use the exact note `Bistrot Provençal menu expansion`.
+4. Do not add selected products already at or above 5 units. Do not add unrelated products, alternate aliases, or duplicate entries with the task note. If none of the five selected products is deficient, the correct result is no shopping-list entry with the task note.
+
+The complete Recipya recipe is the prerequisite for the Grocy plan. A shopping list created without the exact recipe and all five ingredients is invalid.
 
 **Login Credentials:**
 

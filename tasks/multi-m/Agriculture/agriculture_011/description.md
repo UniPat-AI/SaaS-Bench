@@ -1,58 +1,25 @@
 **Task Requirements:**
 
-Step 1 — Sequential visual analysis:
-Examine `tasks/multi-m/inputs/farmos_crop_043.jpg` first (full-field overview): note the overall canopy condition and whether infestation is detectable from distance. Then examine `tasks/multi-m/inputs/farmos_crop_044.jpg` (close-up of tassel/leaf sheath): look for dense aphid clusters, shed skins, and leaf damage. Combine both observations to determine severity using this table:
+Inspect the two supplied corn images in sequence and use the visual evidence to choose the response. Do not assume a severity before examining both images.
 
-| Severity | Visual criteria | Intervention |
-|----------|----------------|--------------|
-| Low | Scattered insects, no clustering, no visible leaf damage | Monitor only, re-inspect in 3 days |
-| Medium | Localised clusters, mild yellowing or leaf curl | Apply Neem Oil (OMRI-listed) |
-| **High** | Dense insect mass at tassel/leaf sheath, shed skins visible | Apply Pyrethrin (OMRI-listed) |
+| Severity | Visual criteria | Response | Follow-up |
+|---|---|---|---|
+| Low | Scattered insects, no clustering, no visible leaf damage | Monitor only; do not create a treatment Input log | Today + 3 days |
+| Medium | Localised clusters with mild yellowing or leaf curl | `Neem Oil (OMRI-listed)`, `1.0 L/acre`, certification `OMRI-2024-NEEM-002` | Today + 5 days |
+| High | Dense insect mass at the tassel or leaf-sheath base, with shed skins visible | `Pyrethrin (OMRI-listed)`, `200 mL/acre`, certification `OMRI-2023-PY-001` | Today + 7 days |
 
-Step 2 — Locate corn plant asset in FarmOS:
-Find the existing corn plant asset named `2023 Sweet Corn Planting 1` (an English name under Assets → Plants). Use this existing asset for all corn-related logs below — do not create a new asset.
-
-Step 3 — Create four logs (all field content must be in English):
-
-**Log A — Emergency Observation Log (today):**
-- Log type: Observation
-- Asset: corn plant asset
-- Attach `tasks/multi-m/inputs/farmos_crop_044.jpg` as the photo evidence
-- In the notes field, record: (1) what tasks/multi-m/inputs/farmos_crop_043.jpg shows about overall canopy condition (note that it cannot confirm or rule out aphid density at distance), (2) what tasks/multi-m/inputs/farmos_crop_044.jpg shows about dense aphid clustering at the tassel/leaf sheath base (shed skins visible), (3) final severity determination: "High"
-- The log must clearly state the severity "High" (e.g. in its name or in the notes field — farmOS has no separate severity field)
-
-**Log B — Input Log (today):**
-- Log type: Input
-- Asset: corn plant asset (same as Log A)
-- Notes must include: pesticide name "Pyrethrin (OMRI-listed)", application rate "200 mL/acre", organic certification number "OMRI-2023-PY-001", operator "Li Shifu", equipment "Tractor-Mounted Boom Sprayer"
-
-**Log C — Follow-up Observation Log (today + 7 days):**
-- Log type: Observation
-- Asset: corn plant asset (same as Log A)
-- Date must be exactly 7 calendar days after today (handle cross-month arithmetic correctly, e.g. Jan 27 + 7 = Feb 3, not Jan 34)
-- Notes must describe: aphid count reduced by approximately 70%, recommend continued monitoring for 7 more days before deciding on re-application
-
-**Log D — Maintenance Log (today):**
-- Log type: Maintenance
-- Asset: **equipment asset** "Tractor-Mounted Boom Sprayer" (NOT the corn plant asset)
-- Notes: post-spray equipment cleaning with water rinse to prevent organic pesticide cross-contamination
-
-**Steps:**
-1. Examine tasks/multi-m/inputs/farmos_crop_043.jpg (full-field) and tasks/multi-m/inputs/farmos_crop_044.jpg (close-up) in sequence; document your observations.
-2. Locate the existing corn plant asset `2023 Sweet Corn Planting 1` in FarmOS (do not create a new asset).
-3. Create Emergency Observation Log (today) on corn plant asset: attach tasks/multi-m/inputs/farmos_crop_044.jpg, record dual-image observations, state severity "High".
-4. Create Input Log (today) on corn plant asset: include Pyrethrin, 200 mL/acre, cert# OMRI-2023-PY-001, operator Li Shifu, equipment Tractor-Mounted Boom Sprayer.
-5. Create Follow-up Observation Log (today + 7 days) on corn plant asset: ~70% reduction, continued monitoring recommendation.
-6. Create Maintenance Log (today) on the **equipment** asset "Tractor-Mounted Boom Sprayer": post-spray water rinse.
+1. In FarmOS, use the existing plant asset `2023 Sweet Corn Planting 1`. Create one Observation log named exactly `AG011 - Corn Aphid Emergency Assessment`, dated today. Attach both supplied images to this log. In notes, separately describe what the field overview establishes, what the close-up establishes, and end with `Severity: <Low|Medium|High>` using your visual conclusion.
+2. Apply the matching rubric response. For Medium or High, create one Input log named exactly `AG011 - Corn Aphid Treatment`, dated today, on the same corn asset. Include the exact treatment, rate, certification, operator `Li Shifu`, and equipment `Tractor-Mounted Boom Sprayer`.
+3. Create one Observation log named exactly `AG011 - Corn Aphid Follow-up` on the same corn asset at the rubric's follow-up date. For the selected treatment response, record `Aphid count reduced by approximately 70%. Continue monitoring for 7 more days before deciding on re-application.`
+4. If treatment was applied, create one Maintenance log named exactly `AG011 - Sprayer Decontamination`, dated today, on the existing equipment asset `Tractor-Mounted Boom Sprayer`. Record a post-spray water rinse to prevent organic pesticide cross-contamination.
+5. In Grocy, ensure there is exactly one product with the exact selected treatment name, creating it if necessary. Add one shopping-list entry for that product with amount `1` and exact note `AG011 | FarmOS input #<input_log_id> | <exact treatment name>`, substituting the generated numeric FarmOS Input-log ID. Do not create an AG011-marked entry for an alternative treatment.
 
 **Input files:**
-- **File 1:** `tasks/multi-m/inputs/farmos_crop_043.jpg`
-  - Type: image
-  - Role: full_field_overview_corn
-- **File 2:** `tasks/multi-m/inputs/farmos_crop_044.jpg`
-  - Type: image
-  - Role: close_up_aphid_infestation_tassel
+
+- `tasks/multi-m/inputs/farmos_crop_043.jpg` — full-field overview
+- `tasks/multi-m/inputs/farmos_crop_044.jpg` — tassel/leaf-sheath close-up
 
 **Login Credentials:**
 
 - farmos: admin / admin123456
+- grocy: admin / admin

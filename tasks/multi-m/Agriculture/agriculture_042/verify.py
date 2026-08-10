@@ -1,28 +1,19 @@
-"""
-Verifier for agriculture_042: Spring plowing traceability — batch number VINO-2025-001
-across FarmOS activity log, Grocy product, and e-label wine record.
+"""Verifier for agriculture_042: image-selected three-system traceability.
 
-Checks: 10 weighted checks (17 total points) across farmos, grocy, e-label.
-Strategy: farmos via docker exec php/PDO (SQLite); grocy via docker exec sqlite3/php;
-          e-label via docker exec sqlcmd.
-
-Required env vars:
-  SERVER_HOSTNAME, FARMOS_PORT, FARMOS_CONTAINER,
-  GROCY_PORT, GROCY_CONTAINER,
-  E_LABEL_PORT, E_LABEL_CONTAINER.
+The source FarmOS record is selected by hashing the image attached to the
+actual record, not by reading a fixed task input. Each downstream system is
+gated by the preceding validated state, so copied trace text cannot replace
+the image-selected FarmOS source.
 """
 
-import base64
+import hashlib
+import html
 import json
 import os
 import re
 import subprocess
 import sys
-
-import requests
-
-# ── Config (from env) ─────────────────────────────────────────────────────────
-HOST = os.getenv("SERVER_HOSTNAME", "localhost")
+import tempfile
 
 FARMOS_PORT = os.getenv("FARMOS_PORT")
 FARMOS_CONTAINER = os.getenv("FARMOS_CONTAINER")
@@ -43,45 +34,46 @@ for _var_name, _var_val in [
         print(f"FATAL: {_var_name} not set", file=sys.stderr)
         sys.exit(1)
 
-def _derive_elabel_db_container() -> str:
-    explicit = os.getenv("E_LABEL_DB_CONTAINER")
-    if explicit:
-        return explicit
-    candidates = [
-        E_LABEL_CONTAINER.replace("-app", "-db"),
-        E_LABEL_CONTAINER + "-db",
-    ]
-    for c in candidates:
-        r = subprocess.run(
-            ["docker", "inspect", c],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            return c
-    return candidates[0]
-
-
-E_LABEL_DB_CONTAINER = _derive_elabel_db_container()
-
 FARMOS_SQLITE = "/opt/drupal/web/sites/default/files/.ht.sqlite"
-
+FARMOS_FILES_ROOT = "/opt/drupal/web/sites/default/files"
 GROCY_DB_CANDIDATES = [
     "/config/data/grocy.db",
     "/config/data/data/grocy.db",
     "/var/www/data/grocy.db",
 ]
 
-EXPECTED_BATCH = "VINO-2025-001"
-
-_INPUTS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "inputs"
+SOURCE_LOG_NAME = "Spring Plowing Complete"
+SOURCE_ASSET_NAME = "Vineyard Block 1"
+BASE_NOTES = "Plowed 120 acres. Soil conditions excellent. Ready for planting."
+CANDIDATE_METHOD_BY_SHA256 = {
+    "0184ddd5515204b69cc87f1db84ffefa722fb0f4046a7dd0f742b01e35bd8922": "Manual",
+    "317c3ce01ab6cb8598a43335a61d518c926e906341946100236c8a252321e633": "Drone-assisted",
+}
+METHOD_RANK = {"Manual": 0, "Tractor-only": 1, "Drone-assisted": 2}
+EXPECTED_ATTACHMENT_SHA256 = max(
+    CANDIDATE_METHOD_BY_SHA256,
+    key=lambda digest: METHOD_RANK[CANDIDATE_METHOD_BY_SHA256[digest]],
+)
+EXPECTED_BATCH = "VINO-2025-081"
+EXPECTED_METHOD = CANDIDATE_METHOD_BY_SHA256[EXPECTED_ATTACHMENT_SHA256]
+EXPECTED_PRODUCT_NAME = f"{EXPECTED_METHOD} Estate Wine 2025"
+EXPECTED_BRAND = f"{EXPECTED_METHOD} Estate"
+EXPECTED_VINTAGE = "2025"
+EXPECTED_GROCY_LINES = (
+    f"TRACEABILITY BATCH: {EXPECTED_BATCH}",
+    f"FIELD METHOD: {EXPECTED_METHOD}",
+    "FARMOS SOURCE: Spring Plowing Complete | Vineyard Block 1",
+)
+EXPECTED_ELABEL_INFO = (
+    f"FIELD METHOD: {EXPECTED_METHOD}; FARMOS SOURCE: Spring Plowing Complete; "
+    "Vineyard Block 1"
+)
+EXPECTED_FARMOS_LINES = (
+    BASE_NOTES,
+    f"TRACEABILITY BATCH: {EXPECTED_BATCH}",
+    f"FIELD METHOD: {EXPECTED_METHOD}",
 )
 
-INPUT_FILES: list[str] = [
-    os.path.join(_INPUTS_DIR, "farmos_crop_021.jpg"),
-]
-
-# ── Result accumulator ────────────────────────────────────────────────────────
 _checks: list[tuple[str, int, bool, str]] = []
 
 
@@ -92,29 +84,28 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
     print(f"[{status}] ({weight}pt) {label}{tail}", file=sys.stderr)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
-    r = subprocess.run(
+def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str, str]:
+    result = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
-    return r.returncode, r.stdout, r.stderr
+    return result.returncode, result.stdout, result.stderr
 
 
-def farmos_sql(query: str) -> str:
+def farmos_sql_json(query: str) -> list[dict]:
     php_script = (
         '$db = new PDO("sqlite:' + FARMOS_SQLITE + '");'
         '$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);'
         '$r = $db->query(' + json.dumps(query) + ');'
-        'while($row=$r->fetch(PDO::FETCH_NUM))'
-        '{ echo implode("|",$row)."\\n"; }'
+        '$rows = $r->fetchAll(PDO::FETCH_ASSOC);'
+        'echo json_encode($rows);'
     )
-    rc, stdout, stderr = docker_exec(
-        FARMOS_CONTAINER, "php", "-r", php_script, timeout=15,
-    )
+    rc, stdout, stderr = docker_exec(FARMOS_CONTAINER, "php", "-r", php_script)
     if rc != 0:
         raise RuntimeError(f"farmos php error (rc={rc}): {stderr.strip()}")
-    return stdout.strip()
+    return json.loads(stdout) if stdout.strip() else []
 
 
 _grocy_db_path = ""
@@ -133,458 +124,335 @@ def _find_grocy_db() -> str:
     return _grocy_db_path
 
 
-def grocy_sql(query: str) -> str:
+def grocy_sql_json(query: str) -> list[dict]:
     db = _find_grocy_db()
-    rc, stdout, stderr = docker_exec(
-        GROCY_CONTAINER,
-        "sqlite3", "-separator", "|", db, query,
-        timeout=15,
-    )
-    if rc == 0:
-        return stdout.strip()
     php_script = (
-        f'$db = new PDO("sqlite:{db}");'
-        f'$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);'
-        f'$r = $db->query("{query.replace(chr(34), chr(92)+chr(34))}");'
-        f'while($row=$r->fetch(PDO::FETCH_NUM))'
-        f'{{ echo implode("|",$row)."\\n"; }}'
+        '$db = new PDO("sqlite:' + db + '");'
+        '$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);'
+        '$r = $db->query(' + json.dumps(query) + ');'
+        '$rows = $r->fetchAll(PDO::FETCH_ASSOC);'
+        'echo json_encode($rows);'
     )
-    rc2, stdout2, stderr2 = docker_exec(
-        GROCY_CONTAINER, "php", "-r", php_script, timeout=15,
-    )
-    if rc2 != 0:
-        raise RuntimeError(
-            f"grocy query failed: sqlite3({stderr.strip()}) php({stderr2.strip()})"
-        )
-    return stdout2.strip()
+    rc, stdout, stderr = docker_exec(GROCY_CONTAINER, "php", "-r", php_script)
+    if rc != 0:
+        raise RuntimeError(f"grocy php error (rc={rc}): {stderr.strip()}")
+    return json.loads(stdout) if stdout.strip() else []
 
 
-def elabel_sql(query: str) -> str:
-    full_query = f"SET NOCOUNT ON; {query}"
-    for sqlcmd in ["/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd"]:
+def _resolve_elabel_db() -> str:
+    candidates = [
+        os.getenv("E_LABEL_DB_CONTAINER", ""),
+        E_LABEL_CONTAINER.replace("-app", "-db") if "-app" in E_LABEL_CONTAINER else "",
+        E_LABEL_CONTAINER + "-db",
+        E_LABEL_CONTAINER,
+        "elabel-db",
+    ]
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        try:
+            rc, _, _ = docker_exec(candidate, "echo", "ok", timeout=5)
+            if rc == 0:
+                return candidate
+        except Exception:
+            continue
+    return E_LABEL_CONTAINER
+
+
+E_LABEL_DB_CONTAINER = _resolve_elabel_db()
+
+
+def elabel_rows(query: str) -> list[list[str]]:
+    last_error = "sqlcmd not found"
+    for binary in ["/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd"]:
         rc, stdout, stderr = docker_exec(
             E_LABEL_DB_CONTAINER,
-            sqlcmd,
-            "-S", "localhost", "-U", "sa", "-P", "Elabel2024!Strong",
-            "-d", "elabel", "-C", "-h", "-1", "-s", "|", "-W",
-            "-Q", full_query,
-            timeout=15,
+            binary,
+            "-S", "localhost",
+            "-U", "sa",
+            "-P", "Elabel2024!Strong",
+            "-d", "elabel",
+            "-C",
+            "-h", "-1",
+            "-W",
+            "-s", "|",
+            "-Q", "SET NOCOUNT ON; " + query,
         )
         if rc == 0:
-            lines = [
-                l for l in stdout.strip().split("\n")
-                if l.strip()
-                and not l.strip().startswith("Msg ")
-                and "Changed database context" not in l
-            ]
-            return "\n".join(lines)
-        stderr_lower = stderr.lower()
-        if "no such file" not in stderr_lower and "not found" not in stderr_lower:
-            raise RuntimeError(f"sqlcmd error (rc={rc}): {stderr.strip()}")
-    raise RuntimeError("sqlcmd not found at known paths")
+            rows = []
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line or "rows affected" in line.lower():
+                    continue
+                rows.append([part.strip() for part in line.split("|")])
+            return rows
+        last_error = stderr.strip() or stdout.strip()
+        if "not found" not in last_error.lower():
+            break
+    raise RuntimeError(last_error)
 
 
-def _strip_html(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    text = text.replace("&quot;", '"').replace("&#39;", "'")
-    return text.strip()
+def _normalize(text: str) -> str:
+    visible = re.sub(r"<[^>]+>", " ", html.unescape(text or ""))
+    return re.sub(r"\s+", " ", visible).strip()
 
 
-def llm_judge_vision(
-    image_path: str,
-    recorded_value: str,
-    condition: str,
-    timeout: int = 45,
-) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+def _text_lines(text: str) -> list[str]:
+    visible = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", text or "")
+    visible = html.unescape(re.sub(r"<[^>]+>", "", visible))
+    return [re.sub(r"\s+", " ", line).strip()
+            for line in visible.splitlines() if line.strip()]
 
-    ext = os.path.splitext(image_path)[1].lower().lstrip(".")
-    mime = {
-        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-        "gif": "image/gif", "webp": "image/webp",
-    }.get(ext, "image/jpeg")
 
-    if not os.path.isfile(image_path):
-        return False, f"image not found: {image_path}"
+def _container_file_path(uri: str) -> str:
+    if uri.startswith("public://"):
+        return FARMOS_FILES_ROOT + "/" + uri.removeprefix("public://").lstrip("/")
+    if uri.startswith("/"):
+        return uri
+    raise ValueError(f"unsupported FarmOS file URI: {uri!r}")
 
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
 
-    prompt = (
-        f"You are given an image and a value that an AI agent extracted from it.\n"
-        f"Recorded value: «{recorded_value}»\n"
-        f"Condition: {condition}\n\n"
-        f"Does the recorded value accurately match the information visible in the image, "
-        f"satisfying the condition above?\n"
-        f"Answer only YES or NO."
-    )
-    try:
-        resp = requests.post(
-            f"{api_base}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-                "max_tokens": 512,
-            },
-            timeout=timeout,
+def _attachment_sha256(uri: str) -> str:
+    source_path = _container_file_path(uri)
+    with tempfile.TemporaryDirectory(prefix="agriculture_042_") as temp_dir:
+        local_path = os.path.join(temp_dir, os.path.basename(source_path) or "attachment")
+        result = subprocess.run(
+            ["docker", "cp", f"{FARMOS_CONTAINER}:{source_path}", local_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        resp.raise_for_status()
-        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
-        return answer.startswith("YES"), answer
-    except Exception as e:
-        return False, f"llm_judge_vision error: {e}"
+        if result.returncode != 0:
+            raise RuntimeError(f"docker cp failed for {source_path}: {result.stderr.strip()}")
+        digest = hashlib.sha256()
+        with open(local_path, "rb") as attachment:
+            for chunk in iter(lambda: attachment.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
 
-# ── Cached state ──────────────────────────────────────────────────────────────
-_farmos_log_id = 0
-_farmos_notes = ""
-_farmos_batch = ""
-_grocy_product_id = 0
-_grocy_batch = ""
-_elabel_batch = ""
-
-FARMOS_NOTES_COL = "notes__value"
+_candidate_logs: list[dict] | None = None
+_attachments_by_log: dict[int, list[dict]] = {}
+_visual_source: tuple[dict, dict, str] | None = None
 
 
-# ── Individual checks ─────────────────────────────────────────────────────────
-def check_0_input_files_exist() -> None:
-    missing = [p for p in INPUT_FILES if not os.path.isfile(p)]
-    if missing:
-        check("0. input_files_exist", 1, False, "missing: " + ", ".join(missing))
-    else:
-        check("0. input_files_exist", 1, True)
-
-
-def check_1_farmos_activity_log_exists() -> None:
-    global _farmos_log_id
-    try:
-        rows = farmos_sql(
-            "SELECT lfd.id, lfd.name "
+def _load_candidate_logs() -> list[dict]:
+    global _candidate_logs
+    if _candidate_logs is None:
+        _candidate_logs = farmos_sql_json(
+            "SELECT DISTINCT lfd.id, lfd.name, lfd.type, "
+            "COALESCE(lfd.notes__value, '') AS notes, afd.name AS asset_name "
             "FROM log_field_data lfd "
-            "JOIN log__asset la ON la.entity_id = lfd.id "
+            "JOIN log__asset la ON la.entity_id = lfd.id AND la.deleted = 0 "
             "JOIN asset_field_data afd ON afd.id = la.asset_target_id "
-            "WHERE lfd.type = 'activity' "
-            "AND (afd.name LIKE '%Vineyard Block 1%' "
-            "OR afd.name LIKE '%vineyard%block%1%') "
-            "ORDER BY lfd.id DESC LIMIT 1"
+            "WHERE lfd.type = 'harvest' "
+            "AND lfd.name = 'Spring Plowing Complete' "
+            "AND afd.name = 'Vineyard Block 1' ORDER BY lfd.id"
         )
-        if not rows:
-            rows = farmos_sql(
-                f"SELECT id, name FROM log_field_data "
-                f"WHERE type = 'activity' AND "
-                f"({FARMOS_NOTES_COL} LIKE '%VINO-2025-001%' "
-                f"OR name LIKE '%plow%' OR name LIKE '%Vineyard%Block%1%') "
-                f"ORDER BY id DESC LIMIT 1"
-            )
-        if not rows:
-            rows = farmos_sql(
-                f"SELECT id, name FROM log_field_data "
-                f"WHERE {FARMOS_NOTES_COL} LIKE '%VINO-2025-001%' "
-                f"OR name LIKE '%VINO-2025-001%' "
-                f"ORDER BY id DESC LIMIT 1"
-            )
-        if not rows:
-            check("1. farmos_activity_log_exists", 2, False,
-                  "no activity log for 'Vineyard Block 1' with batch VINO-2025-001")
-            return
-        parts = rows.split("\n")[0].split("|", 1)
-        _farmos_log_id = int(parts[0])
-        log_name = parts[1] if len(parts) > 1 else ""
-        check("1. farmos_activity_log_exists", 2, True,
-              f"log #{_farmos_log_id}: {log_name}")
-    except Exception as e:
-        check("1. farmos_activity_log_exists", 2, False, f"exception: {e}")
+    return _candidate_logs
 
 
-def check_2_farmos_batch_in_notes() -> None:
-    global _farmos_batch, _farmos_notes
-    try:
-        if not _farmos_log_id:
-            check("2. farmos_batch_VINO-2025-001", 2, False, "no activity log found")
-            return
-        raw = farmos_sql(
-            f"SELECT {FARMOS_NOTES_COL} FROM log_field_data WHERE id = {_farmos_log_id}"
-        )
-        if not raw:
-            raw = farmos_sql(
-                f"SELECT name FROM log_field_data WHERE id = {_farmos_log_id}"
-            )
-        _farmos_notes = _strip_html(raw) if raw else ""
-
-        has_batch = EXPECTED_BATCH in _farmos_notes
-        if has_batch:
-            _farmos_batch = EXPECTED_BATCH
-        else:
-            m = re.search(r"VINO-\d{4}-\d{3}", _farmos_notes, re.IGNORECASE)
-            if m:
-                _farmos_batch = m.group()
-
-        passed = _farmos_batch == EXPECTED_BATCH
-        detail = f"batch='{_farmos_batch}'" if _farmos_batch else "batch not found in notes"
-        check("2. farmos_batch_VINO-2025-001", 2, passed, detail)
-    except Exception as e:
-        check("2. farmos_batch_VINO-2025-001", 2, False, f"exception: {e}")
-
-
-def check_3_farmos_image_attached() -> None:
-    try:
-        if not _farmos_log_id:
-            check("3. farmos_image_attached", 1, False, "no activity log found")
-            return
-        rows = farmos_sql(
-            f"SELECT fm.fid, fm.uri, fm.filename "
-            f"FROM log__image li "
-            f"JOIN file_managed fm ON fm.fid = li.image_target_id "
-            f"WHERE li.entity_id = {_farmos_log_id} LIMIT 1"
-        )
-        if not rows:
-            rows = farmos_sql(
-                f"SELECT fm.fid, fm.uri, fm.filename "
-                f"FROM log__file lf "
-                f"JOIN file_managed fm ON fm.fid = lf.file_target_id "
-                f"WHERE lf.entity_id = {_farmos_log_id} "
-                f"AND fm.filemime LIKE 'image/%' LIMIT 1"
-            )
-        if not rows:
-            check("3. farmos_image_attached", 1, False,
-                  "no image attached to activity log")
-            return
-        parts = rows.split("|")
-        fid = parts[0].strip() if parts else ""
-        filename = parts[2].strip() if len(parts) > 2 else ""
-        check("3. farmos_image_attached", 1, True, f"fid={fid}, file={filename}")
-    except Exception as e:
-        check("3. farmos_image_attached", 1, False, f"exception: {e}")
-
-
-def check_4_grocy_product_exists() -> None:
-    global _grocy_product_id
-    try:
-        rows = grocy_sql(
-            "SELECT id, name FROM products "
-            "WHERE name LIKE '%Organic Estate Wine 2025%' "
-            "OR name LIKE '%Organic%Estate%Wine%2025%' "
-            "OR (LOWER(name) LIKE '%organic%estate%wine%' AND LOWER(name) LIKE '%2025%') "
-            "LIMIT 1;"
-        )
-        if not rows:
-            rows = grocy_sql(
-                "SELECT id, name FROM products "
-                "WHERE LOWER(name) LIKE '%organic%estate%wine%' "
-                "OR LOWER(name) LIKE '%vino-2025%' "
-                "LIMIT 1;"
-            )
-        if not rows:
-            check("4. grocy_product_exists", 1, False,
-                  "no product matching 'Organic Estate Wine 2025'")
-            return
-        parts = rows.split("\n")[0].split("|", 1)
-        _grocy_product_id = int(parts[0])
-        name = parts[1] if len(parts) > 1 else ""
-        check("4. grocy_product_exists", 1, True,
-              f"id={_grocy_product_id}, name='{name}'")
-    except Exception as e:
-        check("4. grocy_product_exists", 1, False, f"exception: {e}")
-
-
-def check_5_grocy_batch() -> None:
-    global _grocy_batch
-    try:
-        if not _grocy_product_id:
-            check("5. grocy_batch_VINO-2025-001", 2, False, "product not found")
-            return
-        rows = grocy_sql(
-            f"SELECT description FROM products WHERE id = {_grocy_product_id};"
-        )
-        desc = rows.strip() if rows else ""
-        if EXPECTED_BATCH in desc:
-            _grocy_batch = EXPECTED_BATCH
-            check("5. grocy_batch_VINO-2025-001", 2, True,
-                  f"batch in description: '{desc[:80]}'")
-            return
-
-        ufield_rows = grocy_sql(
-            f"SELECT uv.value FROM userfield_values uv "
-            f"JOIN userfields uf ON uf.id = uv.field_id "
-            f"WHERE uf.entity = 'products' "
-            f"AND uv.object_id = CAST({_grocy_product_id} AS TEXT) "
-            f"AND (LOWER(uf.name) LIKE '%batch%' OR LOWER(uf.name) LIKE '%lot%') "
-            f"LIMIT 1;"
-        )
-        if ufield_rows and EXPECTED_BATCH in ufield_rows:
-            _grocy_batch = EXPECTED_BATCH
-            check("5. grocy_batch_VINO-2025-001", 2, True,
-                  f"batch in userfield: '{ufield_rows.strip()}'")
-            return
-
-        stock_rows = grocy_sql(
-            f"SELECT stock_id FROM stock "
-            f"WHERE product_id = {_grocy_product_id} "
-            f"AND stock_id IS NOT NULL AND TRIM(stock_id) != '' LIMIT 1;"
-        )
-        if stock_rows and EXPECTED_BATCH in stock_rows:
-            _grocy_batch = EXPECTED_BATCH
-            check("5. grocy_batch_VINO-2025-001", 2, True,
-                  f"batch in stock_id: '{stock_rows.strip()}'")
-            return
-
-        all_text = f"{desc} {ufield_rows or ''} {stock_rows or ''}"
-        m = re.search(r"VINO-\d{4}-\d{3}", all_text, re.IGNORECASE)
-        if m:
-            _grocy_batch = m.group()
-        check("5. grocy_batch_VINO-2025-001", 2, _grocy_batch == EXPECTED_BATCH,
-              f"batch='{_grocy_batch}'" if _grocy_batch
-              else "VINO-2025-001 not found in description, userfields, or stock")
-    except Exception as e:
-        check("5. grocy_batch_VINO-2025-001", 2, False, f"exception: {e}")
-
-
-def check_6_elabel_wine_record_exists() -> None:
-    try:
-        rows = elabel_sql(
-            "SELECT TOP 1 Id, Name FROM Product "
-            "WHERE Name LIKE '%Organic Estate Wine 2025%' "
-            "OR Name LIKE '%Organic%Estate%Wine%' "
-            "OR Sku = 'VINO-2025-001' "
-            "ORDER BY CreatedOn DESC;"
-        )
-        lines = [
-            l for l in rows.split("\n")
-            if l.strip() and not l.startswith("---")
-            and "rows affected" not in l.lower()
-        ]
-        if not lines:
-            check("6. elabel_wine_record_exists", 1, False,
-                  "no wine record matching 'Organic Estate Wine 2025'")
-            return
-        parts = [p.strip() for p in lines[0].split("|")]
-        pid = parts[0] if parts else ""
-        name = parts[1] if len(parts) > 1 else ""
-        check("6. elabel_wine_record_exists", 1, True,
-              f"id={pid}, name='{name}'")
-    except Exception as e:
-        check("6. elabel_wine_record_exists", 1, False, f"exception: {e}")
-
-
-def check_7_elabel_batch() -> None:
-    global _elabel_batch
-    try:
-        rows = elabel_sql(
-            "SELECT TOP 1 Name, Sku, Brand, FBOAdditionalInfo "
-            "FROM Product "
-            "WHERE Name LIKE '%Organic Estate Wine 2025%' "
-            "OR Name LIKE '%Organic%Estate%Wine%' "
-            "OR Sku = 'VINO-2025-001' "
-            "ORDER BY CreatedOn DESC;"
-        )
-        lines = [
-            l for l in rows.split("\n")
-            if l.strip() and not l.startswith("---")
-            and "rows affected" not in l.lower()
-        ]
-        if not lines:
-            check("7. elabel_batch_VINO-2025-001", 2, False,
-                  "no wine record found in e-label")
-            return
-        parts = [p.strip() for p in lines[0].split("|")]
-        name = parts[0] if parts else ""
-        sku = parts[1] if len(parts) > 1 else ""
-        full_text = " ".join(parts)
-
-        if EXPECTED_BATCH in sku:
-            _elabel_batch = EXPECTED_BATCH
-        elif EXPECTED_BATCH in full_text:
-            _elabel_batch = EXPECTED_BATCH
-        else:
-            m = re.search(r"VINO-\d{4}-\d{3}", full_text, re.IGNORECASE)
-            if m:
-                _elabel_batch = m.group()
-
-        passed = _elabel_batch == EXPECTED_BATCH
-        check("7. elabel_batch_VINO-2025-001", 2, passed,
-              f"name='{name}', sku='{sku}', batch='{_elabel_batch}'")
-    except Exception as e:
-        check("7. elabel_batch_VINO-2025-001", 2, False, f"exception: {e}")
-
-
-def check_8_cross_app_batch_consistency() -> None:
-    try:
-        batches: dict[str, str] = {}
-        if _farmos_batch:
-            batches["farmos"] = _farmos_batch
-        if _grocy_batch:
-            batches["grocy"] = _grocy_batch
-        if _elabel_batch:
-            batches["elabel"] = _elabel_batch
-
-        if len(batches) < 2:
-            check("8. cross_app_batch_consistency", 3, False,
-                  f"need batch from >=2 systems, got: {batches}")
-            return
-
-        vals = list(batches.values())
-        all_same = all(v == vals[0] for v in vals)
-        all_correct = all_same and vals[0] == EXPECTED_BATCH
-        all_three = len(batches) == 3
-        check("8. cross_app_batch_consistency", 3,
-              all_correct and all_three,
-              f"all='{vals[0]}', systems={list(batches.keys())}" if all_correct
-              else f"mismatch or incomplete: {batches}")
-    except Exception as e:
-        check("8. cross_app_batch_consistency", 3, False, f"exception: {e}")
-
-
-def check_9_cross_modal_plowing_photo() -> None:
-    try:
-        img_path = INPUT_FILES[0] if INPUT_FILES else ""
-        if not img_path or not os.path.isfile(img_path):
-            check("9. cross_modal_plowing_photo", 2, False,
-                  "skipped: input file missing")
-            return
-        condition = (
-            "The image depicts a farm or agricultural scene — showing plowed fields, "
-            "vineyard rows, tractors, soil preparation, or farming activity. "
-            "It is consistent with a 'spring plowing complete' field photo."
-        )
-        passed, raw = llm_judge_vision(img_path, "spring plowing field photo", condition)
-        check("9. cross_modal_plowing_photo", 2, passed, f"llm_judge_vision: {raw}")
-    except Exception as e:
-        check("9. cross_modal_plowing_photo", 2, False, f"exception: {e}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main() -> None:
-    check_0_input_files_exist()
-    check_1_farmos_activity_log_exists()
-    check_2_farmos_batch_in_notes()
-    check_3_farmos_image_attached()
-    check_4_grocy_product_exists()
-    check_5_grocy_batch()
-    check_6_elabel_wine_record_exists()
-    check_7_elabel_batch()
-    check_8_cross_app_batch_consistency()
-    check_9_cross_modal_plowing_photo()
-
-    total = sum(w for _, w, _, _ in _checks)
-    earned = sum(w for _, w, p, _ in _checks if p)
-    all_pass = all(p for _, _, p, _ in _checks) and bool(_checks)
-    score = (earned / total) if total else 0.0
-
-    print(
-        f"SCORE: {score:.3f}  PASS: {all_pass}  ({earned}/{total})",
-        file=sys.stderr,
+def _load_attachments(log_id: int) -> list[dict]:
+    if log_id in _attachments_by_log:
+        return _attachments_by_log[log_id]
+    rows = farmos_sql_json(
+        "SELECT fm.fid, fm.uri, fm.filename, fm.filemime, 'image' AS field_name "
+        "FROM log__image li JOIN file_managed fm ON fm.fid = li.image_target_id "
+        f"WHERE li.entity_id = {log_id} AND li.deleted = 0"
     )
+    file_rows = farmos_sql_json(
+        "SELECT fm.fid, fm.uri, fm.filename, fm.filemime, 'file' AS field_name "
+        "FROM log__file lf JOIN file_managed fm ON fm.fid = lf.file_target_id "
+        f"WHERE lf.entity_id = {log_id} AND lf.deleted = 0 "
+        "AND fm.filemime LIKE 'image/%'"
+    )
+    unique = {str(row["fid"]): row for row in rows + file_rows}
+    _attachments_by_log[log_id] = list(unique.values())
+    return _attachments_by_log[log_id]
+
+
+def _find_visual_source() -> tuple[dict, dict, str]:
+    global _visual_source
+    if _visual_source is not None:
+        return _visual_source
+
+    recognized: list[tuple[dict, dict, str, str]] = []
+    for log in _load_candidate_logs():
+        attachments = _load_attachments(int(log["id"]))
+        if len(attachments) != 1:
+            raise RuntimeError(
+                f"candidate log #{log['id']} must have exactly one classification image, "
+                f"found {len(attachments)}"
+            )
+        attachment = attachments[0]
+        digest = _attachment_sha256(str(attachment["uri"]))
+        method = CANDIDATE_METHOD_BY_SHA256.get(digest)
+        if method is None:
+            raise RuntimeError(
+                f"candidate log #{log['id']} has an unrecognized classification image"
+            )
+        recognized.append((log, attachment, method, digest))
+
+    digests = {match[3] for match in recognized}
+    if digests != set(CANDIDATE_METHOD_BY_SHA256):
+        raise RuntimeError(
+            f"candidate classification image set changed: found {sorted(digests)}"
+        )
+
+    highest_rank = max(METHOD_RANK[match[2]] for match in recognized)
+    highest = [match for match in recognized if METHOD_RANK[match[2]] == highest_rank]
+    if len(highest) != 1:
+        raise RuntimeError(f"expected one uniquely higher-ranked visual source, found {len(highest)}")
+
+    source_log, attachment, method, _ = highest[0]
+    _visual_source = (source_log, attachment, method)
+    return _visual_source
+
+
+_farmos_ok = False
+_grocy_ok = False
+_elabel_ok = False
+_source_log_id = 0
+_source_method = ""
+_grocy_product_id = ""
+_elabel_product_id = ""
+
+
+def check_1_farmos_visual_source_and_notes() -> None:
+    global _farmos_ok, _source_log_id, _source_method
+    try:
+        candidates = _load_candidate_logs()
+        if len(candidates) != 2:
+            check(
+                "1. FarmOS visual source and preserved notes",
+                5,
+                False,
+                f"expected two exact source candidates, found {len(candidates)}",
+            )
+            return
+        source_log, attachment, _source_method = _find_visual_source()
+        _source_log_id = int(source_log["id"])
+        problems = []
+        if _source_method != EXPECTED_METHOD:
+            problems.append(
+                f"selected method={_source_method!r}, expected controlled class {EXPECTED_METHOD!r}"
+            )
+        if _text_lines(str(source_log.get("notes", ""))) != list(EXPECTED_FARMOS_LINES):
+            problems.append("selected record does not preserve baseline notes plus both exact trace lines")
+        for candidate in candidates:
+            if int(candidate["id"]) == _source_log_id:
+                continue
+            if _normalize(str(candidate.get("notes", ""))) != BASE_NOTES:
+                problems.append(f"non-selected candidate #{candidate['id']} was modified")
+        if not str(attachment.get("filemime", "")).startswith("image/"):
+            problems.append("selected attachment is not an image")
+        _farmos_ok = not problems
+        check(
+            "1. FarmOS visual source and preserved notes",
+            5,
+            _farmos_ok,
+            f"log #{_source_log_id}, method={_source_method}, "
+            f"attachment={attachment.get('filename', '')}"
+            if _farmos_ok else "; ".join(problems),
+        )
+    except Exception as exc:
+        check("1. FarmOS visual source and preserved notes", 5, False, f"exception: {exc}")
+
+
+def check_2_grocy_exact_trace_product() -> None:
+    global _grocy_ok, _grocy_product_id
+    if not _farmos_ok:
+        check("2. Grocy exact trace product", 5, False,
+              "gated: image-selected FarmOS source is invalid")
+        return
+    try:
+        safe_name = EXPECTED_PRODUCT_NAME.replace("'", "''")
+        safe_batch = EXPECTED_BATCH.replace("'", "''")
+        rows = grocy_sql_json(
+            "SELECT id, name, COALESCE(description, '') AS description FROM products "
+            f"WHERE name = '{safe_name}' "
+            f"OR description LIKE '%{safe_batch}%' ORDER BY id"
+        )
+        problems = []
+        if len(rows) != 1:
+            problems.append(f"expected one exact/associated product, found {len(rows)}")
+        else:
+            row = rows[0]
+            if row.get("name") != EXPECTED_PRODUCT_NAME:
+                problems.append(f"wrong product name: {row.get('name')!r}")
+            if _text_lines(str(row.get("description", ""))) != list(EXPECTED_GROCY_LINES):
+                problems.append("description is not the exact three-field traceability record")
+            if not problems:
+                _grocy_product_id = str(row["id"])
+        _grocy_ok = not problems
+        check(
+            "2. Grocy exact trace product",
+            5,
+            _grocy_ok,
+            f"product id={_grocy_product_id}" if _grocy_ok else "; ".join(problems),
+        )
+    except Exception as exc:
+        check("2. Grocy exact trace product", 5, False, f"exception: {exc}")
+
+
+def check_3_elabel_exact_trace_record() -> None:
+    global _elabel_ok, _elabel_product_id
+    if not _farmos_ok or not _grocy_ok:
+        check("3. e-label exact trace record", 10, False,
+              "gated: FarmOS-to-Grocy traceability chain is invalid")
+        return
+    try:
+        safe_info = (
+            "REPLACE(REPLACE(ISNULL(FBOAdditionalInfo,''), CHAR(13), ' '), CHAR(10), ' ')"
+        )
+        safe_name = EXPECTED_PRODUCT_NAME.replace("'", "''")
+        safe_batch = EXPECTED_BATCH.replace("'", "''")
+        rows = elabel_rows(
+            "SELECT CAST(Id AS NVARCHAR(36)), Name, ISNULL(Sku,''), ISNULL(Brand,''), "
+            "CAST(WineVintage AS NVARCHAR(10)), " + safe_info + " FROM Product "
+            f"WHERE Name = N'{safe_name}' OR Sku = '{safe_batch}' ORDER BY CreatedOn"
+        )
+        problems = []
+        if len(rows) != 1 or len(rows[0]) < 6:
+            problems.append(f"expected one exact/associated wine row, found {len(rows)}")
+        else:
+            row = rows[0]
+            values = {
+                "id": row[0], "name": row[1], "sku": row[2], "brand": row[3],
+                "vintage": row[4], "info": _normalize(row[5]),
+            }
+            expected = {
+                "name": EXPECTED_PRODUCT_NAME,
+                "sku": EXPECTED_BATCH,
+                "brand": EXPECTED_BRAND,
+                "vintage": EXPECTED_VINTAGE,
+                "info": EXPECTED_ELABEL_INFO,
+            }
+            mismatches = [
+                f"{key}={values[key]!r}" for key in expected if values[key] != expected[key]
+            ]
+            problems.extend(mismatches)
+            if not problems:
+                _elabel_product_id = values["id"]
+        _elabel_ok = not problems
+        check(
+            "3. e-label exact trace record",
+            10,
+            _elabel_ok,
+            f"wine id={_elabel_product_id}" if _elabel_ok else "; ".join(problems),
+        )
+    except Exception as exc:
+        check("3. e-label exact trace record", 10, False, f"exception: {exc}")
+
+
+def main() -> None:
+    check_1_farmos_visual_source_and_notes()
+    check_2_grocy_exact_trace_product()
+    check_3_elabel_exact_trace_record()
+
+    total = sum(weight for _, weight, _, _ in _checks)
+    earned = sum(weight for _, weight, passed, _ in _checks if passed)
+    all_pass = bool(_checks) and all(passed for _, _, passed, _ in _checks)
+    score = earned / total if total else 0.0
+    print(f"SCORE: {score:.3f}  PASS: {all_pass}  ({earned}/{total})", file=sys.stderr)
     sys.exit(0 if all_pass else 1)
 
 
