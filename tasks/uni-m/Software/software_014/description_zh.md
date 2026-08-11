@@ -1,0 +1,18 @@
+**任务要求：**
+
+在 todo-api 和 blog-engine 项目中清点并治理 feature flags。在 code-server 中，打开全局 Search panel（Ctrl+Shift+F），启用 regex mode，并将搜索范围中的 'files to include' 设为 "todo-api/**,blog-engine/**"，使用 regex pattern FEATURE_FLAG_([A-Z0-9_]+)\s*=。记录每个 hit 的 project、file path、line number，以及捕获到的 flag name。创建一个名为 "Feature Flag Governance" 的 Baserow 数据库，并包含一个名为 "Feature Flags" 的表（字段：Flag Name [primary text], Project [single-select: todo-api/blog-engine], File Path [text], Line Number [number], Default State [single-select: Enabled/Disabled], Owner [text], Target Removal Date [date], Status [single-select: Active/Sunset/Removed]）。按 Project 字母顺序、再按 File Path、再按 Line Number 升序，为每个发现的 flag 插入一行；根据 {"NEW_CHECKOUT": {"default_state": "Enabled", "owner": "alice@example.com", "target_removal_date": "2026-05-15"}, "DARK_MODE": {"default_state": "Enabled", "owner": "bob@example.com", "target_removal_date": "2026-08-30"}, "LEGACY_AUTH": {"default_state": "Disabled", "owner": "carol@example.com", "target_removal_date": "2026-04-10"}, "BETA_COMMENTS": {"default_state": "Disabled", "owner": "dave@example.com", "target_removal_date": "2026-12-01"}, "EXPERIMENTAL_SEARCH": {"default_state": "Enabled", "owner": "eve@example.com", "target_removal_date": "2026-06-20"}}（一个按 flag name 键控的 JSON mapping，字段为 default_state、owner、target_removal_date）填充 Default State、Owner 和 Target Removal Date；当 Target Removal Date 在 2026-07-01 当天或之前时将 Status 设为 Sunset，否则设为 Active。在 "Feature Flags" 表上创建一个按 Status 分组的 Kanban view。在 Metabase 中，前往 Admin → Databases，并为 Baserow Postgres database 手动同步 schema，使新的 Feature Flags 表可见。然后创建一个名为 "Feature Flag Governance Q2 2026" 的 collection，并针对 Baserow Postgres database 保存两个 questions：(1) "Flags by Project and State" — 一个条形图，按 Project 分组并按 Default State 拆分，显示 flag 数量；(2) "Sunset Flag Schedule" — 一个 table，列出每一行 Status=Sunset 的 Flag Name, Project, Target Removal Date，并按 Target Removal Date 升序排序。创建一个名为 "Feature Flag Sunset Dashboard" 的 Metabase dashboard，位于该 collection 中，并将两个 questions 作为 cards 添加进去。在 OpenProject 项目 "demo-project" 中，为每个 Sunset flag 创建 exactly one Task work package，subject 为 "Remove feature flag: <Flag Name>"，assignee 为 Baserow row 中的 Owner，due date 为 Target Removal Date，priority 为 Normal。
+
+**步骤：**
+
+1. 在 code-server 中，运行一个针对两个项目文件夹的 regex search，使用 pattern FEATURE_FLAG_([A-Z0-9_]+)\s*=，并收集每个匹配项的 project、file path、line number 和 flag name
+2. 创建 Baserow database "Feature Flag Governance" 和表 "Feature Flags"，使用指定字段；按照提供的 {"NEW_CHECKOUT": {"default_state": "Enabled", "owner": "alice@example.com", "target_removal_date": "2026-05-15"}, "DARK_MODE": {"default_state": "Enabled", "owner": "bob@example.com", "target_removal_date": "2026-08-30"}, "LEGACY_AUTH": {"default_state": "Disabled", "owner": "carol@example.com", "target_removal_date": "2026-04-10"}, "BETA_COMMENTS": {"default_state": "Disabled", "owner": "dave@example.com", "target_removal_date": "2026-12-01"}, "EXPERIMENTAL_SEARCH": {"default_state": "Enabled", "owner": "eve@example.com", "target_removal_date": "2026-06-20"}} JSON mapping 插入一行，并根据 2026-07-01 应用 Status 规则
+3. 为 Feature Flags 表添加一个按 Status 单选字段分组的 Kanban view
+4. 在 Metabase 中，打开 Admin → Databases，并为 Baserow Postgres database 手动同步 schema，使 Feature Flags 表出现；然后创建 collection "Feature Flag Governance Q2 2026"，保存两个指定 questions，并将它们组合进 dashboard "Feature Flag Sunset Dashboard"
+5. 在 OpenProject 项目 "demo-project" 中，为每个 Sunset flag 创建一个 Task work package，使用精确的 subject、assignee、due date 和 priority
+
+**登录凭据：**
+
+- code-server: (no username) / 8a128206e2177bce1e48e565
+- baserow: admin@example.com / Admin1234
+- metabase: admin@metabase.local / mw-admin-123
+- openproject: admin / AdminPass123!
