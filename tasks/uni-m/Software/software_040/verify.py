@@ -58,7 +58,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -360,7 +360,7 @@ def check_10_components_md_exists() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "test", "-f", "/home/coder/tabler/docs/COMPONENTS.md",
+            "test", "-f", "/home/coder/workspace/tabler/docs/COMPONENTS.md",
         )
         check("10. COMPONENTS.md exists", 1, rc == 0,
               "file found" if rc == 0 else "file not found")
@@ -373,7 +373,7 @@ def check_11_components_md_header() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "head", "-n", "2", "/home/coder/tabler/docs/COMPONENTS.md",
+            "head", "-n", "2", "/home/coder/workspace/tabler/docs/COMPONENTS.md",
         )
         if rc != 0:
             check("11. COMPONENTS.md header lines correct", 2, False, "cannot read file")
@@ -394,7 +394,7 @@ def check_12_components_md_counts() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "head", "-n", "4", "/home/coder/tabler/docs/COMPONENTS.md",
+            "head", "-n", "4", "/home/coder/workspace/tabler/docs/COMPONENTS.md",
         )
         if rc != 0:
             check("12. COMPONENTS.md count lines correct", 2, False, "cannot read file")
@@ -415,7 +415,7 @@ def check_13_components_md_entries_format() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "cat", "/home/coder/tabler/docs/COMPONENTS.md",
+            "cat", "/home/coder/workspace/tabler/docs/COMPONENTS.md",
             timeout=15,
         )
         if rc != 0:
@@ -446,7 +446,7 @@ def check_14_git_commit_message() -> None:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
             "bash", "-c",
-            "cd /home/coder/tabler && git log --oneline --all --grep='docs: add component inventory 2026-03-20' --format='%s'",
+            "cd /home/coder/workspace/tabler && git log --oneline --all --grep='docs: add component inventory 2026-03-20' --format='%s'",
             timeout=15,
         )
         commits = [l.strip() for l in out.strip().split('\n') if l.strip()]

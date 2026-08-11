@@ -60,7 +60,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -199,6 +199,9 @@ def check_1_pretix_event():
             f"FROM pretixbase_event WHERE id={eid}"
         )
         parts = row.split("|")
+        if len(parts) < 4:
+            check("1. Pretix event basics", 2, False, f"unexpected row format: {row!r}")
+            return
         name, date_from, currency, live = parts[0], parts[1], parts[2], parts[3]
         ok = (
             "AI Horizons 2026" in name

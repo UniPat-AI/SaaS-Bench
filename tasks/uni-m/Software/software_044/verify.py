@@ -68,7 +68,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -77,7 +77,7 @@ def op_psql(query: str, timeout: int = 15) -> str:
     """Run a psql query against OpenProject's embedded Postgres."""
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject",
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
         "-t", "-A", "-c", query,
         timeout=timeout,
     )
@@ -125,7 +125,7 @@ def check_1_default_formatter() -> None:
         found = False
         for settings_path in [
             "/home/coder/.local/share/code-server/User/settings.json",
-            "/home/coder/project/.vscode/settings.json",
+            "/home/coder/workspace/.vscode/settings.json",
             "/home/coder/.vscode/settings.json",
             "/root/.local/share/code-server/User/settings.json",
         ]:
@@ -171,7 +171,7 @@ def check_2_format_on_save() -> None:
         found = False
         for settings_path in [
             "/home/coder/.local/share/code-server/User/settings.json",
-            "/home/coder/project/.vscode/settings.json",
+            "/home/coder/workspace/.vscode/settings.json",
             "/home/coder/.vscode/settings.json",
             "/root/.local/share/code-server/User/settings.json",
         ]:

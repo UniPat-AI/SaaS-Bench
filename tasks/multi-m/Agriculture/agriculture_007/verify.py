@@ -63,7 +63,7 @@ def docker_exec(container: str, *args: str, timeout: int = 30) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -89,7 +89,7 @@ def recipya_query(sql: str) -> list[dict]:
         result = subprocess.run(
             ["docker", "cp", f"{RECIPYA_CONTAINER}:{RECIPYA_DB}", _recipya_db_copy],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=30,
         )
         if result.returncode != 0:
@@ -135,7 +135,7 @@ def container_started_epoch(container: str) -> tuple[str, int]:
     result = subprocess.run(
         ["docker", "inspect", "--format", "{{.State.StartedAt}}", container],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=10,
     )
     if result.returncode != 0:

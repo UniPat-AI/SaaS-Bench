@@ -71,7 +71,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -87,7 +87,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
             "-D", "booklore",
             "-N", "-B", "-e", query,
         ],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     if r.returncode != 0:
         r2 = subprocess.run(
@@ -99,7 +99,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
                 "-D", "booklore",
                 "-N", "-B", "-e", query,
             ],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, errors="replace", timeout=timeout,
         )
         return r2.stdout.strip()
     return r.stdout.strip()

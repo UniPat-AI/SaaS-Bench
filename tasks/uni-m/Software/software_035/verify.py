@@ -110,7 +110,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -122,7 +122,7 @@ def op_sql(query: str) -> str:
          OPENPROJECT_CONTAINER,
          "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
          "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         raise RuntimeError(f"psql error: {r.stderr.strip()}")

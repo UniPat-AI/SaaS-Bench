@@ -57,7 +57,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -385,11 +385,11 @@ def check_9_journal_entry() -> None:
     try:
         result = bigcapital_sql(
             "SELECT e.CREDIT, e.DEBIT, a.NAME "
-            "FROM MANUAL_JOURNAL_ENTRIES e "
+            "FROM MANUAL_JOURNALS_ENTRIES e "
             "JOIN MANUAL_JOURNALS j ON j.ID = e.MANUAL_JOURNAL_ID "
             "JOIN ACCOUNTS a ON a.ID = e.ACCOUNT_ID "
             "WHERE j.DATE = '2025-12-31' "
-            "AND j.STATUS = 'published' "
+            "AND j.PUBLISHED_AT IS NOT NULL "
             "AND a.NAME IN ('Performance Bonus Expense', 'Accrued Performance Bonus Payable') "
             "ORDER BY a.NAME;"
         )

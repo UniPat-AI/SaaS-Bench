@@ -72,7 +72,7 @@ def docker_exec(container: str, *args: str, timeout: int = 15,
     for k, v in (env_vars or {}).items():
         cmd += ["-e", f"{k}={v}"]
     cmd += [container, *args]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 

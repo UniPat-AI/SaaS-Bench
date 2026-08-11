@@ -15,4 +15,5 @@ Conduct a technical asset inventory and stale-dependency audit across the blog-e
 - code-server: (no username) / 8a128206e2177bce1e48e565
 - baserow: admin@example.com / Admin1234
 - metabase: admin@metabase.local / mw-admin-123
+- baserow postgres (for the Metabase data source): host `host.docker.internal`, port = Baserow web port + 15, database `baserow`, username `baserow`, password `kdpzkuyhsgb22onku8y7rxkx3czej88nxpngaz4mlmgad67vpc`
 - openproject: admin / AdminPass123!

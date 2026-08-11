@@ -94,7 +94,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -131,7 +131,7 @@ def check_1_files_exist() -> None:
     """Verify all 5 RFC markdown files exist in code-server."""
     try:
         rc, out, _ = docker_exec(
-            CODE_SERVER_CONTAINER, "ls", f"/home/coder/project/{RFC_DIR}/"
+            CODE_SERVER_CONTAINER, "ls", f"/home/coder/workspace/{RFC_DIR}/"
         )
         if rc != 0:
             check("1. RFC files exist", 1, False, f"directory not found: {RFC_DIR}")
@@ -153,7 +153,7 @@ def check_2_headings() -> None:
             num = f"{i+1:03d}"
             expected_heading = f"# RFC-{num}: {title}"
             content = read_file_in_container(
-                CODE_SERVER_CONTAINER, f"/home/coder/project/{RFC_DIR}/{fname}"
+                CODE_SERVER_CONTAINER, f"/home/coder/workspace/{RFC_DIR}/{fname}"
             )
             if content is None:
                 issues.append(f"{fname}: file not found")
@@ -175,7 +175,7 @@ def check_3_metadata_lines() -> None:
         for i, fname in enumerate(RFC_FILENAMES):
             num = f"{i+1:03d}"
             content = read_file_in_container(
-                CODE_SERVER_CONTAINER, f"/home/coder/project/{RFC_DIR}/{fname}"
+                CODE_SERVER_CONTAINER, f"/home/coder/workspace/{RFC_DIR}/{fname}"
             )
             if content is None:
                 issues.append(f"{fname}: file not found")
@@ -207,7 +207,7 @@ def check_4_decisions() -> None:
         issues = []
         for i, (fname, decision) in enumerate(zip(RFC_FILENAMES, RFC_DECISIONS)):
             content = read_file_in_container(
-                CODE_SERVER_CONTAINER, f"/home/coder/project/{RFC_DIR}/{fname}"
+                CODE_SERVER_CONTAINER, f"/home/coder/workspace/{RFC_DIR}/{fname}"
             )
             if content is None:
                 issues.append(f"{fname}: file not found")
@@ -233,7 +233,7 @@ def check_5_status_lines() -> None:
             idx = i + 1  # 1-indexed
             expected_status = "Status: Approved" if idx in APPROVED_INDICES else "Status: Draft"
             content = read_file_in_container(
-                CODE_SERVER_CONTAINER, f"/home/coder/project/{RFC_DIR}/{fname}"
+                CODE_SERVER_CONTAINER, f"/home/coder/workspace/{RFC_DIR}/{fname}"
             )
             if content is None:
                 issues.append(f"{fname}: file not found")

@@ -69,7 +69,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -90,7 +90,7 @@ def mm_db(sql: str) -> str:
         ["docker", "exec", "-e", "PGPASSWORD=mmuser_password",
          MM_DB_CONTAINER, "psql", "-U", "mmuser", "-d", "mattermost",
          "-t", "-A", "-c", sql],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     return r.stdout.strip()
 

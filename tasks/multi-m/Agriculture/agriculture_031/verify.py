@@ -71,7 +71,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -87,7 +87,7 @@ def sqlite_copy_query(container: str, db_path: str, sql: str) -> list[dict]:
         result = subprocess.run(
             ["docker", "cp", f"{container}:{db_path}", local_db],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=30,
         )
         if result.returncode != 0:
@@ -96,7 +96,7 @@ def sqlite_copy_query(container: str, db_path: str, sql: str) -> list[dict]:
             subprocess.run(
                 ["docker", "cp", f"{container}:{db_path}{suffix}", local_db + suffix],
                 capture_output=True,
-                text=True,
+                text=True, errors="replace",
                 timeout=30,
             )
         _db_copies[key] = local_db

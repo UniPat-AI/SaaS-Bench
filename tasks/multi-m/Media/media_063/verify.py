@@ -43,7 +43,7 @@ def _get_siyuan_token() -> str:
         r = subprocess.run(
             ["docker", "exec", SIYUAN_CONTAINER, "cat",
              "/siyuan/workspace/conf/conf.json"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, errors="replace", timeout=10,
         )
         if r.returncode == 0 and r.stdout.strip():
             conf = json.loads(r.stdout)
@@ -77,7 +77,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
             "-D", "booklore",
             "-N", "-B", "-e", query,
         ],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     if r.returncode != 0:
         r2 = subprocess.run(
@@ -89,7 +89,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
                 "-D", "booklore",
                 "-N", "-B", "-e", query,
             ],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, errors="replace", timeout=timeout,
         )
         return r2.stdout.strip()
     return r.stdout.strip()

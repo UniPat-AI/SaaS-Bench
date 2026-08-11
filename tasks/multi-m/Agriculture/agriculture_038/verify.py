@@ -75,7 +75,7 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr

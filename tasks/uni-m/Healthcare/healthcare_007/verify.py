@@ -53,7 +53,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -92,7 +92,8 @@ def get_patient_pid() -> int | None:
         return _patient_pid
     row = openemr_sql(
         "SELECT pid FROM patient_data "
-        "WHERE fname LIKE '%Adrianne%' AND lname LIKE '%Simonis%' LIMIT 1;"
+        "WHERE fname LIKE '%Adrianne%' AND lname LIKE '%Simonis%' "
+        "ORDER BY (DOB = '1964-11-15') DESC, pid ASC LIMIT 1;"
     )
     if row:
         _patient_pid = int(row.split("\t")[0].strip())

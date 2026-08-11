@@ -80,7 +80,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -111,7 +111,7 @@ def op_db_query(sql: str) -> str:
     """Query OpenProject embedded postgres."""
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject",
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
         "-t", "-A", "-c", sql,
         timeout=15,
     )
@@ -124,7 +124,7 @@ def check_1_no_old_runner() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "grep", "-c", OLD_RUNNER, f"/home/coder/{CI_WORKFLOW_PATH}",
+            "grep", "-c", OLD_RUNNER, f"/home/coder/workspace/{CI_WORKFLOW_PATH}",
         )
         # grep -c returns 0 if matches found, 1 if no matches
         has_old = (rc == 0 and out.strip() != "0")
@@ -140,7 +140,7 @@ def check_2_has_new_runner() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "grep", "-c", NEW_RUNNER, f"/home/coder/{CI_WORKFLOW_PATH}",
+            "grep", "-c", NEW_RUNNER, f"/home/coder/workspace/{CI_WORKFLOW_PATH}",
         )
         count = int(out.strip()) if rc == 0 else 0
         check("2. deploy.yml has new runner", 1, count > 0,
@@ -156,7 +156,7 @@ def check_3_commit_message() -> None:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
             "bash", "-c",
-            f"cd /home/coder/devops-configs && git log --oneline --all --format='%s'",
+            f"cd /home/coder/workspace/devops-configs && git log --oneline --all --format='%s'",
         )
         messages = [m.strip() for m in out.strip().split("\n") if m.strip()]
         found = COMMIT_MSG in messages

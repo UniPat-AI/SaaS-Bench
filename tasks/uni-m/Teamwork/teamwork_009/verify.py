@@ -65,7 +65,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -238,6 +238,7 @@ def _oo_auth_session() -> requests.Session | None:
         if not token:
             return None
         session.headers.update({"Authorization": f"Bearer {token}"})
+        session.cookies.set("asc_auth_key", token)
         session.base_url = base_url  # type: ignore[attr-defined]
         return session
     except Exception:
@@ -366,9 +367,15 @@ def check_12_oo_document_content() -> None:
 
         # Download file content and inspect
         dl_resp = session.get(
-            f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
-            allow_redirects=True,
+            f"{base_url}/products/files/httphandlers/filehandler.ashx",
+            params={"action": "download", "fileid": str(doc_id)},
+            timeout=30, allow_redirects=True,
         )
+        if not (dl_resp.status_code == 200 and len(dl_resp.content) > 100):
+            dl_resp = session.get(
+                f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
+                allow_redirects=True,
+            )
 
         if dl_resp.status_code != 200:
             # Fallback: try to find and inspect the file on the filesystem
@@ -443,9 +450,15 @@ def check_13_oo_track_changes() -> None:
 
         # Download file and check for trackRevisions in settings XML
         dl_resp = session.get(
-            f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
-            allow_redirects=True,
+            f"{base_url}/products/files/httphandlers/filehandler.ashx",
+            params={"action": "download", "fileid": str(doc_id)},
+            timeout=30, allow_redirects=True,
         )
+        if not (dl_resp.status_code == 200 and len(dl_resp.content) > 100):
+            dl_resp = session.get(
+                f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
+                allow_redirects=True,
+            )
 
         if dl_resp.status_code != 200:
             check("13. Track changes enabled", 1, False,

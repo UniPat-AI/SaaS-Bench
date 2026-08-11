@@ -1,8 +1,11 @@
 """
 Verifier for Software-012-I1: Publish todo-api Endpoint Registry and Deprecation Tracker
 
-Checks: 13 weighted checks across code-server, baserow, openproject.
-Strategy: docker exec (filesystem for code-server, Postgres for baserow & openproject)
+Checks: 12 weighted checks — ground truth is extracted at runtime by grepping
+the todo-api source inside the code-server container, then every Baserow row's
+Method / Path / Source File / Line Number / Version / Status / Deprecation Date
+is compared against it in the deterministic (source file, line) order.
+Strategy: docker exec (filesystem for code-server, Postgres for baserow)
 
 Required env vars:
   SERVER_HOSTNAME,
@@ -46,7 +49,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -70,7 +73,7 @@ def openproject_sql(query: str) -> str:
         ["docker", "exec", "-i", OPENPROJECT_CONTAINER,
          "bash", "-c",
          "PGPASSWORD=openproject psql -U openproject -d openproject -h 127.0.0.1 -t -A"],
-        input=query, capture_output=True, text=True, timeout=15,
+        input=query, capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         raise RuntimeError(f"psql error: {r.stderr.strip()}")
@@ -263,12 +266,185 @@ def check_6_endpoint_ids() -> None:
         check("6. Sequential Endpoint IDs", 2, False, f"exception: {e}")
 
 
+# ── Ground truth: Flask routes greped from the code-server container ─────────
+import re
+
+_VERSION_MAP = [("/api/v1/", "v1"), ("/api/v2/", "v2"), ("/api/v3/", "v3"), ("/health", "v1")]
+_ROUTE_RE = re.compile(
+    r"""@[A-Za-z_][A-Za-z0-9_]*\.route\(\s*["']([^"']+)["'](?:.*?methods\s*=\s*\[([^\]]*)\])?""",
+)
+_gt_routes: list[dict] | None = None
+
+
+def _ground_truth_routes() -> list[dict]:
+    """Extract route registrations from todo-api source, sorted by (source file, line)."""
+    global _gt_routes
+    if _gt_routes is not None:
+        return _gt_routes
+    routes = []
+    for base in ("/home/coder/workspace/todo-api", "/home/coder/todo-api",
+                 "/home/coder/project/todo-api"):
+        rc, out, _ = docker_exec(
+            CODE_SERVER_CONTAINER,
+            "grep", "-rn", "-E", r"@[A-Za-z_]*\.route\(", base, "--include=*.py",
+        )
+        if rc != 0 or not out.strip():
+            continue
+        for line in out.strip().split("\n"):
+            parts = line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            fpath, lineno, content = parts[0], parts[1], parts[2]
+            m = _ROUTE_RE.search(content)
+            if not m:
+                continue
+            path = m.group(1)
+            methods_raw = m.group(2) or ""
+            methods = [t.strip().strip("\"'") for t in methods_raw.split(",") if t.strip()]
+            rel = fpath.split("todo-api/", 1)[1] if "todo-api/" in fpath else fpath
+            routes.append({
+                "file": rel,
+                "line": int(lineno),
+                "path": path,
+                "method": methods[0] if methods else "GET",
+            })
+        break
+    routes.sort(key=lambda r: (r["file"], r["line"]))
+    _gt_routes = routes
+    return routes
+
+
+def _rows_in_ep_order() -> list[dict]:
+    return sorted(_get_all_rows(), key=lambda r: r.get("Endpoint ID", ""))
+
+
+def _norm_file(value: str) -> str:
+    value = value.strip()
+    return value.split("todo-api/", 1)[1] if "todo-api/" in value else value.lstrip("/")
+
+
+def _norm_line(value: str) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def check_1_ground_truth() -> None:
+    """Route registrations are discoverable in the code-server todo-api project."""
+    try:
+        gt = _ground_truth_routes()
+        check("1. todo-api routes discoverable", 1, len(gt) > 0,
+              f"{len(gt)} route registrations found")
+    except Exception as e:
+        check("1. todo-api routes discoverable", 1, False, f"exception: {e}")
+
+
+def check_2_row_count() -> None:
+    """Exactly one Baserow row per discovered route."""
+    try:
+        gt, rows = _ground_truth_routes(), _get_all_rows()
+        check("2. One row per route", 2, len(gt) > 0 and len(rows) == len(gt),
+              f"routes={len(gt)} rows={len(rows)}")
+    except Exception as e:
+        check("2. One row per route", 2, False, f"exception: {e}")
+
+
+def _ordered_compare(label: str, weight: int, extract) -> None:
+    """Compare the k-th row (by Endpoint ID) against the k-th ground-truth route."""
+    try:
+        gt, rows = _ground_truth_routes(), _rows_in_ep_order()
+        if not gt or len(rows) != len(gt):
+            check(label, weight, False, f"routes={len(gt)} rows={len(rows)}")
+            return
+        bad = []
+        for i, (g, r) in enumerate(zip(gt, rows)):
+            ok, detail = extract(g, r)
+            if not ok:
+                bad.append(f"row{i+1}({detail})")
+        check(label, weight, not bad, "; ".join(bad[:4]) if bad else "")
+    except Exception as e:
+        check(label, weight, False, f"exception: {e}")
+
+
+def check_7_methods() -> None:
+    _ordered_compare("7. Methods match source", 2, lambda g, r: (
+        r.get("Method", "").strip().upper() == g["method"].upper(),
+        f"{r.get('Method')}!={g['method']}"))
+
+
+def check_8_paths() -> None:
+    def cmp(g, r):
+        rp = r.get("Path", "").strip()
+        # Accept the literal route string or a url_prefix-qualified full path.
+        ok = rp == g["path"] or (rp.startswith("/") and rp.endswith(g["path"]))
+        return ok, f"{rp}!={g['path']}"
+    _ordered_compare("8. Paths match source", 2, cmp)
+
+
+def check_9_file_line() -> None:
+    _ordered_compare("9. Source file and line match", 2, lambda g, r: (
+        _norm_file(r.get("Source File", "")) == g["file"]
+        and _norm_line(r.get("Line Number", "")) == g["line"],
+        f"{r.get('Source File')}:{r.get('Line Number')}!={g['file']}:{g['line']}"))
+
+
+def check_10_versions() -> None:
+    """Version follows the path-prefix mapping (rows whose path maps to no rule are skipped)."""
+    try:
+        rows = _rows_in_ep_order()
+        if not rows:
+            check("10. Version assignment", 1, False, "no rows")
+            return
+        bad, unmapped = [], 0
+        for r in rows:
+            rp = r.get("Path", "").strip()
+            expected = next((v for prefix, v in _VERSION_MAP if rp.startswith(prefix)), None)
+            if expected is None:
+                unmapped += 1
+                continue
+            if r.get("Version", "").strip() != expected:
+                bad.append(f"{rp}:{r.get('Version')}!={expected}")
+        check("10. Version assignment", 1, not bad,
+              "; ".join(bad[:4]) if bad else f"{unmapped} paths outside mapping skipped")
+    except Exception as e:
+        check("10. Version assignment", 1, False, f"exception: {e}")
+
+
+def check_11_status() -> None:
+    try:
+        rows = _get_all_rows()
+        bad = [r.get("Endpoint ID", "?") for r in rows if r.get("Status", "").strip() != "Active"]
+        check("11. Status=Active on all rows", 1, bool(rows) and not bad,
+              f"non-Active: {bad[:5]}" if bad else "")
+    except Exception as e:
+        check("11. Status=Active on all rows", 1, False, f"exception: {e}")
+
+
+def check_12_deprecation_null() -> None:
+    try:
+        rows = _get_all_rows()
+        bad = [r.get("Endpoint ID", "?") for r in rows if r.get("Deprecation Date", "").strip()]
+        check("12. Deprecation Date empty on all rows", 1, bool(rows) and not bad,
+              f"non-empty: {bad[:5]}" if bad else "")
+    except Exception as e:
+        check("12. Deprecation Date empty on all rows", 1, False, f"exception: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
+    check_1_ground_truth()
+    check_2_row_count()
     check_3_baserow_database()
     check_4_baserow_table()
     check_5_baserow_fields()
     check_6_endpoint_ids()
+    check_7_methods()
+    check_8_paths()
+    check_9_file_line()
+    check_10_versions()
+    check_11_status()
+    check_12_deprecation_null()
 
     total = sum(w for _, w, _, _ in _checks)
     earned = sum(w for _, w, p, _ in _checks if p)

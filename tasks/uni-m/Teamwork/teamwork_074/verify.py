@@ -60,7 +60,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -71,7 +71,7 @@ def docker_exec_env(container: str, env: dict, *args: str, timeout: int = 15) ->
         cmd += ["-e", f"{k}={v}"]
     cmd.append(container)
     cmd.extend(args)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 

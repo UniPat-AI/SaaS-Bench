@@ -92,7 +92,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -132,7 +132,7 @@ def op_db_query(sql: str) -> str:
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
-ADR_DIR = "/home/coder/project/devops-configs/docs/adr"
+ADR_DIR = "/home/coder/workspace/devops-configs/docs/adr"
 
 
 def check_1_adr_directory_exists() -> None:

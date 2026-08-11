@@ -79,7 +79,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -100,7 +100,7 @@ def watcharr_sql(query: str) -> str:
             r = subprocess.run(
                 ["docker", "cp", f"{WATCHARR_CONTAINER}:{WATCHARR_DB}{suffix}",
                  f"{local_db}{suffix}"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, errors="replace", timeout=30,
             )
             if suffix == "" and r.returncode != 0:
                 raise RuntimeError(

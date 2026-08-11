@@ -76,7 +76,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -95,9 +95,9 @@ def openproject_sql(query: str, timeout: int = 15) -> str:
     """Run a psql query against the OpenProject DB (embedded) and return stdout."""
     r = subprocess.run(
         ["docker", "exec", "-e", "PGPASSWORD=openproject", OPENPROJECT_CONTAINER,
-         "psql", "-U", "openproject", "-d", "openproject", "-h", "127.0.0.1",
+         "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject", "-h", "127.0.0.1",
          "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.stdout.strip()
 
@@ -219,7 +219,7 @@ def check_4_baserow_database_exists() -> None:
     """Verify Baserow database 'Branch Strategy Governance Hub' exists."""
     try:
         result = baserow_sql(
-            f"SELECT id FROM database_application da "
+            f"SELECT id FROM database_database da "
             f"JOIN core_application ca ON ca.id = da.application_ptr_id "
             f"WHERE ca.name = '{BASEROW_DB_NAME}';"
         )

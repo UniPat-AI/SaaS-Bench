@@ -57,7 +57,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -90,7 +90,7 @@ def op_db_query(sql: str) -> str:
     """Query OpenProject embedded postgres."""
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject",
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
         "-t", "-A", "-c", sql,
         timeout=15,
     )
@@ -416,14 +416,14 @@ def check_10_audit_file_exists() -> list[str]:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER, "cat",
-            "/home/coder/project/devops-configs/docs/complexity-audit-2025-05-15.md",
+            "/home/coder/workspace/devops-configs/docs/complexity-audit-2025-05-15.md",
             timeout=10,
         )
         if rc != 0:
             # Try alternate path
             rc, out, err = docker_exec(
                 CODE_SERVER_CONTAINER, "cat",
-                "/home/coder/devops-configs/docs/complexity-audit-2025-05-15.md",
+                "/home/coder/workspace/devops-configs/docs/complexity-audit-2025-05-15.md",
                 timeout=10,
             )
         lines = out.strip().split("\n") if rc == 0 and out.strip() else []

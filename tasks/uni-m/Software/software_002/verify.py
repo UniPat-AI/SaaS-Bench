@@ -56,7 +56,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -92,7 +92,7 @@ def op_sql(query: str) -> str:
          OPENPROJECT_CONTAINER,
          "psql", "-h", "localhost", "-U", "openproject", "-d", "openproject",
          "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         raise RuntimeError(f"psql error: {r.stderr.strip()}")
@@ -147,8 +147,8 @@ def _init_baserow():
 def check_1_projects_exist():
     """Verify data-analyzer and todo-api project dirs exist in code-server."""
     try:
-        rc1, out1, _ = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", "/home/coder/data-analyzer")
-        rc2, out2, _ = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", "/home/coder/todo-api")
+        rc1, out1, _ = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", "/home/coder/workspace/data-analyzer")
+        rc2, out2, _ = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", "/home/coder/workspace/todo-api")
         both = (rc1 == 0 and rc2 == 0)
         detail = ""
         if rc1 != 0:

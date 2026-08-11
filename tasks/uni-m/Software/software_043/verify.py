@@ -92,7 +92,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -129,7 +129,7 @@ def check_1_audit_file_exists() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "test", "-f", "/home/coder/project/devops-configs/docs/alert-audit-2026-07-22.md",
+            "test", "-f", "/home/coder/workspace/devops-configs/docs/alert-audit-2026-07-22.md",
         )
         check("1. Audit markdown file exists in code-server", 1, rc == 0,
               "file not found" if rc != 0 else "")
@@ -142,7 +142,7 @@ def check_2_audit_file_content() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "cat", "/home/coder/project/devops-configs/docs/alert-audit-2026-07-22.md",
+            "cat", "/home/coder/workspace/devops-configs/docs/alert-audit-2026-07-22.md",
         )
         if rc != 0:
             check("2. Audit file has correct 3-line content", 2, False, "file not readable")

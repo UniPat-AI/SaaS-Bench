@@ -87,7 +87,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -103,7 +103,7 @@ def baserow_db_query(sql: str) -> str:
 def openproject_db_query(sql: str) -> str:
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject", "-t", "-A", "-c", sql,
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject", "-t", "-A", "-c", sql,
     )
     return out.strip()
 
@@ -183,8 +183,8 @@ def check_1_code_server_flag_files():
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER, "bash", "-c",
-            "grep -r -E 'FEATURE_FLAG_[A-Z0-9_]+\\s*=' /home/coder/project/todo-api/ "
-            "/home/coder/project/blog-engine/ 2>/dev/null || true",
+            "grep -r -E 'FEATURE_FLAG_[A-Z0-9_]+\\s*=' /home/coder/workspace/todo-api/ "
+            "/home/coder/workspace/blog-engine/ 2>/dev/null || true",
             timeout=20,
         )
         lines = [l for l in out.strip().split("\n") if l.strip()]

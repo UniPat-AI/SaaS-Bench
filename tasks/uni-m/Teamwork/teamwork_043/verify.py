@@ -58,7 +58,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -120,7 +120,7 @@ def check_1_retired_folder() -> None:
             "WHERE path LIKE '%/ppt/Retired\\_2025Q3' "
             "OR path = 'files/ppt/Retired_2025Q3'"
         )
-        found = int(result) > 0
+        found = bool(result.strip()) and int(result) > 0
         check("1. ownCloud: Retired_2025Q3 folder in ppt", 1, found,
               "found" if found else "not found")
     except Exception as e:

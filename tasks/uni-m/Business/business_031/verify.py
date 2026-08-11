@@ -58,7 +58,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -238,7 +238,6 @@ def check_5_bigcapital_vendor() -> None:
             "SELECT DISPLAY_NAME, EMAIL "
             "FROM CONTACTS "
             "WHERE DISPLAY_NAME LIKE '%Ananya Reddy%Ex Employee%' "
-            "OR CONTACT_NORMAL_NAME = 'ananya reddy - ex employee' "
             "LIMIT 1;"
         )
         if not row:
@@ -266,7 +265,7 @@ def check_6_journal_entry() -> None:
     """Journal entry dated 2026-06-30 with correct memo and 3 line items."""
     try:
         journal_row = bigcapital_sql(
-            "SELECT ID, DATE, DESCRIPTION, PUBLISHED FROM MANUAL_JOURNALS "
+            "SELECT ID, DATE, DESCRIPTION, PUBLISHED_AT FROM MANUAL_JOURNALS "
             "WHERE DESCRIPTION LIKE '%Final settlement%Ananya Reddy%2026-06-30%' "
             "AND DATE = '2026-06-30' LIMIT 1;"
         )

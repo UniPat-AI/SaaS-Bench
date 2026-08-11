@@ -62,30 +62,43 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
 
 # -- BigCapital API helpers --
 _bc_token: str | None = None
+_bc_org_id: str = ""
 
 
 def bc_login() -> str:
-    global _bc_token
+    global _bc_token, _bc_org_id
     if _bc_token:
         return _bc_token
     if not HAS_REQUESTS:
         raise RuntimeError("requests module not available")
+    # signin is the endpoint the running BigCapital build exposes; it also
+    # returns the organization id required as a tenant-routing header on
+    # every subsequent API call (without it, tenant-scoped endpoints such
+    # as transactions-locking return nothing).
     r = requests.post(
-        f"{BC_BASE}/api/auth/login",
+        f"{BC_BASE}/api/auth/signin",
         json={"email": "admin@bigcapital.local", "password": "admin123"},
         timeout=15,
     )
+    if r.status_code == 404:
+        r = requests.post(
+            f"{BC_BASE}/api/auth/login",
+            json={"email": "admin@bigcapital.local", "password": "admin123"},
+            timeout=15,
+        )
     r.raise_for_status()
     data = r.json()
-    # BigCapital may return token at top-level or nested under "data"
-    _bc_token = data.get("token") or data.get("data", {}).get("token", "")
+    _bc_token = (data.get("access_token") or data.get("token")
+                 or data.get("data", {}).get("token", ""))
+    _bc_org_id = str(data.get("organization_id")
+                     or data.get("tenant", {}).get("organization_id", "") or "")
     if not _bc_token:
         raise RuntimeError(f"no token in login response: {json.dumps(data)[:200]}")
     return _bc_token
@@ -96,7 +109,8 @@ def bc_get(path: str, params: dict | None = None) -> requests.Response:
     return requests.get(
         f"{BC_BASE}/api/{path}",
         params=params,
-        headers={"Authorization": f"Bearer {token}", "x-access-token": token},
+        headers={"Authorization": f"Bearer {token}", "x-access-token": token,
+                 "organization-id": _bc_org_id},
         timeout=15,
     )
 
@@ -304,40 +318,41 @@ def check_1_transaction_lock() -> None:
             )
             if result:
                 found = True
-        check("1. Transaction lock", 2, found,
+        check("1. Transaction lock", 4, found,
               "lock date found" if found else "no lock date found in API or DB")
     except Exception as e:
-        check("1. Transaction lock", 2, False, f"exception: {e}")
+        check("1. Transaction lock", 4, False, f"exception: {e}")
 
 
 def check_2_bank_balance() -> None:
     """BigCapital: Bank Account GL closing balance = -$215,382.44."""
     try:
         found_balance = None
-        # Strategy A: DB — compute from accounts_transactions
-        # First find the account id for Bank Account
+        # Strategy A: DB — compute from ACCOUNTS_TRANSACTIONS. BigCapital's
+        # MariaDB uses ALL-CAPS identifiers and has no `account_normal` column;
+        # the debit/credit-normal side is derived from ACCOUNT_TYPE instead.
         acct_row = bc_db(
-            "SELECT `id`, `account_normal` FROM `accounts` "
-            "WHERE `name`='Bank Account' LIMIT 1"
+            "SELECT ID, ACCOUNT_TYPE FROM ACCOUNTS "
+            "WHERE NAME='Bank Account' LIMIT 1"
         )
         if acct_row:
             parts = acct_row.split("\t")
             acct_id = parts[0].strip()
-            acct_normal = parts[1].strip() if len(parts) > 1 else "debit"
+            acct_type = (parts[1].strip() if len(parts) > 1 else "").lower()
+            # Asset & expense accounts are debit-normal; others credit-normal.
+            debit_normal = any(k in acct_type for k in (
+                "asset", "bank", "cash", "receivable", "expense", "cost", "fixed"))
             # Sum transactions up to 2026-12-31
             sums = bc_db(
-                f"SELECT COALESCE(SUM(`debit`),0), COALESCE(SUM(`credit`),0) "
-                f"FROM `accounts_transactions` "
-                f"WHERE `account_id`={acct_id} AND `date` <= '2026-12-31'"
+                f"SELECT COALESCE(SUM(DEBIT),0), COALESCE(SUM(CREDIT),0) "
+                f"FROM ACCOUNTS_TRANSACTIONS "
+                f"WHERE ACCOUNT_ID={acct_id} AND DATE <= '2026-12-31'"
             )
             if sums:
                 vals = sums.split("\t")
                 total_debit = float(vals[0]) if vals[0] else 0.0
                 total_credit = float(vals[1]) if len(vals) > 1 and vals[1] else 0.0
-                if "debit" in acct_normal.lower():
-                    found_balance = total_debit - total_credit
-                else:
-                    found_balance = total_credit - total_debit
+                found_balance = (total_debit - total_credit) if debit_normal else (total_credit - total_debit)
         # Strategy B: API — try general ledger
         if found_balance is None and HAS_REQUESTS:
             try:
@@ -353,12 +368,12 @@ def check_2_bank_balance() -> None:
         if found_balance is not None:
             expected = -215382.44
             ok = abs(found_balance - expected) < 0.50
-            check("2. Bank Account GL balance", 2, ok,
+            check("2. Bank Account GL balance", 4, ok,
                   f"expected={expected}, got={found_balance:.2f}")
         else:
-            check("2. Bank Account GL balance", 2, False, "could not retrieve balance")
+            check("2. Bank Account GL balance", 4, False, "could not retrieve balance")
     except Exception as e:
-        check("2. Bank Account GL balance", 2, False, f"exception: {e}")
+        check("2. Bank Account GL balance", 4, False, f"exception: {e}")
 
 
 def check_3_hrms_employees() -> None:
@@ -369,9 +384,9 @@ def check_3_hrms_employees() -> None:
             "WHERE `company`='TechVista Solutions Pvt. Ltd.' AND `status`='Active'"
         )
         count = int(result.strip()) if result.strip().isdigit() else 0
-        check("3. HRMS active employees", 1, count > 0, f"count={count}")
+        check("3. HRMS active employees", 2, count > 0, f"count={count}")
     except Exception as e:
-        check("3. HRMS active employees", 1, False, f"exception: {e}")
+        check("3. HRMS active employees", 2, False, f"exception: {e}")
 
 
 def check_4_note_exists() -> None:
@@ -392,10 +407,10 @@ def check_5_trial_balance() -> None:
         has_credits = _body_has(r"credit")
         has_amounts = _body_has_amount_near(r"trial\s*balance")
         ok = has_section and has_debits and has_credits and has_amounts
-        check("5. Note: Trial Balance data", 2, ok,
+        check("5. Note: Trial Balance data", 1, ok,
               f"section={has_section}, debits={has_debits}, credits={has_credits}, amounts={has_amounts}")
     except Exception as e:
-        check("5. Note: Trial Balance data", 2, False, f"exception: {e}")
+        check("5. Note: Trial Balance data", 1, False, f"exception: {e}")
 
 
 def check_6_balance_sheet() -> None:
@@ -407,10 +422,10 @@ def check_6_balance_sheet() -> None:
         has_equity = _body_has(r"equity")
         has_amounts = _body_has_amount_near(r"balance\s*sheet")
         ok = has_section and has_assets and has_liab and has_equity and has_amounts
-        check("6. Note: Balance Sheet data", 2, ok,
+        check("6. Note: Balance Sheet data", 1, ok,
               f"section={has_section}, assets={has_assets}, liab={has_liab}, equity={has_equity}")
     except Exception as e:
-        check("6. Note: Balance Sheet data", 2, False, f"exception: {e}")
+        check("6. Note: Balance Sheet data", 1, False, f"exception: {e}")
 
 
 def check_7_pnl() -> None:
@@ -422,10 +437,10 @@ def check_7_pnl() -> None:
         has_net = _body_has(r"net\s*(income|profit|loss)")
         has_amounts = _body_has_amount_near(r"(p\s*[&/]\s*l|profit|revenue)")
         ok = has_section and has_revenue and has_expenses and has_net and has_amounts
-        check("7. Note: P&L data", 2, ok,
+        check("7. Note: P&L data", 1, ok,
               f"section={has_section}, revenue={has_revenue}, expenses={has_expenses}, net={has_net}")
     except Exception as e:
-        check("7. Note: P&L data", 2, False, f"exception: {e}")
+        check("7. Note: P&L data", 1, False, f"exception: {e}")
 
 
 def check_8_cash_flow() -> None:
@@ -477,10 +492,10 @@ def check_11_hr_payroll() -> None:
         has_deductions = _body_has(r"deduction")
         has_net_pay = _body_has(r"net\s*pay")
         ok = has_employees and has_gross and has_deductions and has_net_pay
-        check("11. Note: HR payroll data", 2, ok,
+        check("11. Note: HR payroll data", 1, ok,
               f"employees={has_employees}, gross={has_gross}, deduct={has_deductions}, net={has_net_pay}")
     except Exception as e:
-        check("11. Note: HR payroll data", 2, False, f"exception: {e}")
+        check("11. Note: HR payroll data", 1, False, f"exception: {e}")
 
 
 def check_12_tax_pf() -> None:
@@ -515,10 +530,10 @@ def check_14_won_deals() -> None:
         has_revenue_section = _body_has(r"(crm\s*revenue|won\s*deal)")
         has_amounts = _body_has_amount_near(r"(won|crm\s*revenue)")
         ok = has_won and has_deals and has_revenue_section and has_amounts
-        check("14. Note: Won deals data", 2, ok,
+        check("14. Note: Won deals data", 1, ok,
               f"won={has_won}, deals={has_deals}, section={has_revenue_section}, amounts={has_amounts}")
     except Exception as e:
-        check("14. Note: Won deals data", 2, False, f"exception: {e}")
+        check("14. Note: Won deals data", 1, False, f"exception: {e}")
 
 
 def check_15_task() -> None:

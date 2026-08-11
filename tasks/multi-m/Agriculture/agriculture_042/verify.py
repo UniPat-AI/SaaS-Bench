@@ -88,7 +88,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -217,7 +217,7 @@ def _attachment_sha256(uri: str) -> str:
         result = subprocess.run(
             ["docker", "cp", f"{FARMOS_CONTAINER}:{source_path}", local_path],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=30,
         )
         if result.returncode != 0:

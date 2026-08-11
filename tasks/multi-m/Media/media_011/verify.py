@@ -68,7 +68,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -117,12 +117,12 @@ def watcharr_sql(sql: str, timeout: int = 15) -> tuple[int, str, str]:
     try:
         local_db = os.path.join(tmpdir, os.path.basename(db))
         r = subprocess.run(["docker", "cp", f"{WATCHARR_CONTAINER}:{db}", local_db],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
         if r.returncode != 0:
             return r.returncode, "", r.stderr
         for suffix in ("-wal", "-shm"):
             subprocess.run(["docker", "cp", f"{WATCHARR_CONTAINER}:{db}{suffix}", tmpdir],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
         con = sqlite3.connect(local_db)
         try:
             rows = con.execute(sql).fetchall()
@@ -147,7 +147,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
             "-D", "booklore",
             "-N", "-B", "-e", query,
         ],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     if r.returncode != 0:
         r2 = subprocess.run(
@@ -159,7 +159,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
                 "-D", "booklore",
                 "-N", "-B", "-e", query,
             ],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, errors="replace", timeout=timeout,
         )
         return r2.stdout.strip()
     return r.stdout.strip()

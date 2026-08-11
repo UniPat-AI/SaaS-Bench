@@ -62,7 +62,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -135,7 +135,7 @@ MANAGER_NAME = "Michael Delacroix, MBA, CPXP"
 def _get_form_row() -> dict | None:
     """Fetch the form row from OpnForm DB by title."""
     try:
-        sql = f"SELECT id, properties, visibility, custom_code FROM forms WHERE title = '{FORM_TITLE}' LIMIT 1"
+        sql = f"SELECT id, properties, visibility, custom_css FROM forms WHERE title = '{FORM_TITLE}' LIMIT 1"
         raw = opnform_db_query_psql(sql)
         if not raw:
             return None
@@ -146,13 +146,13 @@ def _get_form_row() -> dict | None:
             "id": parts[0].strip(),
             "properties": parts[1].strip(),
             "visibility": parts[2].strip(),
-            "custom_code": parts[3].strip(),
+            "custom_css": parts[3].strip(),
         }
     except Exception:
         # Fallback: try artisan tinker
         try:
             raw = opnform_db_query(
-                f"SELECT id, properties, visibility, custom_code FROM forms WHERE title = \\'{FORM_TITLE}\\' LIMIT 1"
+                f"SELECT id, properties, visibility, custom_css FROM forms WHERE title = \\'{FORM_TITLE}\\' LIMIT 1"
             )
             rows = json.loads(raw) if raw else []
             if rows:
@@ -161,7 +161,7 @@ def _get_form_row() -> dict | None:
                     "id": str(getattr(row, "id", row.get("id", "")) if isinstance(row, dict) else row.get("id", "")),
                     "properties": json.dumps(row.get("properties", row)) if isinstance(row, dict) else str(row),
                     "visibility": str(row.get("visibility", "")) if isinstance(row, dict) else "",
-                    "custom_code": str(row.get("custom_code", "")) if isinstance(row, dict) else "",
+                    "custom_css": str(row.get("custom_css", "")) if isinstance(row, dict) else "",
                 }
         except Exception:
             pass
@@ -212,7 +212,7 @@ def check_2_form_settings() -> None:
     """Check form theme, visibility, custom CSS, and progress bar."""
     try:
         sql = (
-            f"SELECT theme, visibility, custom_code, show_progress_bar, "
+            f"SELECT theme, visibility, custom_css, show_progress_bar, "
             f"size, submit_button_text, dark_mode "
             f"FROM forms WHERE title = '{FORM_TITLE}' LIMIT 1"
         )
@@ -229,7 +229,7 @@ def check_2_form_settings() -> None:
         # visibility
         if len(parts) > 1 and parts[1] != "public":
             issues.append(f"visibility={parts[1]} expected=public")
-        # custom_code / custom CSS
+        # custom_css / custom CSS
         if len(parts) > 2:
             css_val = parts[2]
             if CUSTOM_CSS not in css_val and "#004b8d" not in css_val:
@@ -562,10 +562,18 @@ def _get_oo_doc_content_full() -> str:
                         # Construct download URL
                         dl_url = f"{base}/api/2.0/files/{file_id}/download"
                     try:
+                        token = headers.get("Authorization", "")
                         dresp = requests.get(
-                            f"{base}/api/2.0/files/{file_id}/download",
-                            headers=headers, timeout=30, allow_redirects=True,
+                            f"{base}/products/files/httphandlers/filehandler.ashx",
+                            params={"action": "download", "fileid": str(file_id)},
+                            headers=headers, cookies={"asc_auth_key": token},
+                            timeout=30, allow_redirects=True,
                         )
+                        if not (dresp.status_code == 200 and len(dresp.content) > 100):
+                            dresp = requests.get(
+                                f"{base}/api/2.0/files/{file_id}/download",
+                                headers=headers, timeout=30, allow_redirects=True,
+                            )
                         if dresp.status_code == 200:
                             content = dresp.content
                             # Try to extract text from docx (ZIP of XML)

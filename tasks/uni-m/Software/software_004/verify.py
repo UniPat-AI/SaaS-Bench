@@ -71,7 +71,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -83,7 +83,7 @@ def op_sql(query: str) -> str:
          OPENPROJECT_CONTAINER,
          "psql", "-U", "openproject", "-h", "127.0.0.1", "-d", "openproject",
          "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         raise RuntimeError(f"op_sql failed (rc={r.returncode}): {r.stderr.strip()}")
@@ -258,7 +258,7 @@ def check_7_code_server_comment() -> None:
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "head", "-n", "5", "/home/coder/project/todo-api/app.py",
+            "head", "-n", "5", "/home/coder/workspace/todo-api/app.py",
             timeout=10,
         )
         if rc != 0:

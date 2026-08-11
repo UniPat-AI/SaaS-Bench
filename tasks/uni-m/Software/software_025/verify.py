@@ -61,7 +61,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -135,7 +135,7 @@ def baserow_api_get(path: str):
     base = f"http://{HOST}:{BASEROW_PORT}"
     token = get_baserow_token()
     r = requests.get(
-        f"{base}{path}", headers={"Authorization": f"Token {token}"}, timeout=15,
+        f"{base}{path}", headers={"Authorization": f"JWT {token}"}, timeout=15,
     )
     r.raise_for_status()
     return r.json()
