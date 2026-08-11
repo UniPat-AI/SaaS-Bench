@@ -63,6 +63,7 @@ services:
       - -c
       - |
         sed -i 's/^host=localhost/host=$prefix-db/' /etc/pretix/pretix.cfg
+        sed -i 's|^url=.*|url=http://$hostname:$port|' /etc/pretix/pretix.cfg
         sed -i 's|^location=redis://localhost:6379|location=redis://$prefix-redis:6379|' /etc/pretix/pretix.cfg
         sed -i 's|^backend=redis://localhost:6379|backend=redis://$prefix-redis:6379|' /etc/pretix/pretix.cfg
         sed -i 's|^broker=redis://localhost:6379|broker=redis://$prefix-redis:6379|' /etc/pretix/pretix.cfg

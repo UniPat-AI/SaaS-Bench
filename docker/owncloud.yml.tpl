@@ -3,6 +3,9 @@ version: "3.8"
 networks:
   $prefix-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: $subnet
 
 services:
   $prefix-mariadb:
@@ -46,6 +49,9 @@ services:
     environment:
       - OWNCLOUD_DOMAIN=$hostname:$port
       - OWNCLOUD_TRUSTED_DOMAINS=localhost,127.0.0.1,$hostname
+      - OWNCLOUD_OVERWRITE_HOST=$hostname:$port
+      - OWNCLOUD_OVERWRITE_PROTOCOL=http
+      - OWNCLOUD_OVERWRITE_CLI_URL=http://$hostname:$port/
       - OWNCLOUD_DB_TYPE=mysql
       - OWNCLOUD_DB_NAME=owncloud
       - OWNCLOUD_DB_USERNAME=owncloud

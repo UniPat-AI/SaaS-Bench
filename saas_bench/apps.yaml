@@ -1,7 +1,7 @@
 # Task-G Rollout App Registry
 #
 # Port formula (docker-run apps): BASE_PORT + slot_id * slot_offset + app_index
-# Default: 30000 + slot_id * 20 + app_index
+# Default: 30000 + slot_id * 40 + app_index
 #
 # Container naming: rollout_{slot_id}_{app_name}
 #
@@ -11,6 +11,10 @@
 #   container_port       : port the service listens on inside the container
 #   start                : docker run command; {container}, {port}, {hostname} substituted
 #   health_path          : URL path used by readiness probe; accepts 200/301/302/303/401/403
+#   extra_health_paths   : optional additional URL paths probed with the same status rules
+#   health_bad_markers   : optional response substrings that make an HTTP probe fail
+#   health_required_markers: optional response substrings that must appear in every probed body
+#   compose_health_services: optional compose service suffixes inspected for healthy/running state
 #   startup_wait         : MAX seconds to wait for readiness; raises if not ready in time
 #   start_type: compose  : uses compose_template_file instead of docker run
 #   compose_template_file: path to .yml.tpl; $prefix, $port, $hostname substituted
@@ -44,7 +48,7 @@ apps:
     app_index: 2
     fixed_port: 6100
     container_port: 80
-    start: "docker run -d --name {container} -p {port}:80 mw-metabase:latest"
+    start: "docker run -d --name {container} --add-host=host.docker.internal:host-gateway -p {port}:80 mw-metabase:latest"
     health_path: "/"
     startup_wait: 180
 
@@ -52,7 +56,7 @@ apps:
     app_index: 3
     fixed_port: 6009
     container_port: 6806
-    pg_port_offset: 15  # Expose internal Postgres: pg_port = port + 15 (must stay within slot_offset=20)
+    pg_port_offset: 27  # app_index 3 + 27 = reserved slot index 30 (web apps use 0-22)
     start: "docker run -d --name {container} -p {port}:6806 -p {pg_port}:5432 -e BASEROW_PUBLIC_URL=http://{hostname}:{port} mw-baserow:latest"
     health_path: "/login"
     startup_wait: 600
@@ -64,7 +68,7 @@ apps:
     fixed_port: 6039
     container_port: 3000
     start: "docker run -d --name {container} -p {port}:3000 -e SERVER_URL=http://{hostname}:{port} mw-twenty:latest"
-    health_path: "/"
+    health_path: "/healthz"
     startup_wait: 360
 
   bigcapital:
@@ -86,13 +90,20 @@ apps:
   pretix:
     app_index: 7
     fixed_port: 6089
-    start_type: compose
-    compose_template_file: docker/pretix.yml.tpl
-    compose_volumes:
-      - -data
-      - -db-data
-      - -redis-data
-    health_path: "/control/login/"
+    container_port: 80
+    start: >-
+      docker run -d --name {container} -p {port}:80
+      -e PRETIX_URL=http://{hostname}:{port}
+      --entrypoint /bin/bash
+      mw-pretix:latest
+      -lc "sed -i 's|^url=.*|url=http://{hostname}:{port}|' /etc/pretix/pretix.cfg && exec /entrypoint-mw.sh all"
+    health_path: "/control/login"
+    extra_health_paths:
+      - "/control/"
+    health_bad_markers:
+      - "Internal Server Error"
+      - "Unknown host"
+      - "no access to any events"
     startup_wait: 600
 
   # -- Healthcare Administration ---------------------------------------------
@@ -111,6 +122,10 @@ apps:
     container_port: 8080
     start: "docker run -d --name {container} -p {port}:8080 -e APP_URL=http://{hostname}:{port} mw-opnform:latest"
     health_path: "/"
+    health_bad_markers:
+      - "An error occurred while saving the form"
+      - "Page not found (404)"
+      - "Runtime Error"
     startup_wait: 120
 
   # -- Team Collaboration & Document Workflow --------------------------------
@@ -131,8 +146,21 @@ apps:
       - _ds_cache
       - _ds_files
       - _ds_fonts
-    health_path: "/"
-    startup_wait: 180
+    health_path: "/Auth.aspx"
+    extra_health_paths:
+      - "/Products/Files/Default.aspx"
+      - "/ds-vpath/healthcheck"
+    health_bad_markers:
+      - "Runtime Error"
+      - "Service Unavailable"
+      - "502 Bad Gateway"
+      - "503 Service Temporarily Unavailable"
+    compose_health_services:
+      - mysql
+      - elasticsearch
+      - documentserver
+      - community
+    startup_wait: 600
 
   mattermost:
     app_index: 11
@@ -157,15 +185,31 @@ apps:
     compose_template_file: docker/owncloud.yml.tpl
     compose_volumes: []
     health_path: "/status.php"
-    startup_wait: 180
+    extra_health_paths:
+      - "/index.php/login"
+      - "/ocs/v1.php/cloud/capabilities?format=json"
+    health_bad_markers:
+      - "Internal Server Error"
+      - "Service Unavailable"
+      - "502 Bad Gateway"
+      - "503 Service Temporarily Unavailable"
+    compose_health_services:
+      - mariadb
+      - redis
+      - "."
+    startup_wait: 360
 
   roundcubemail:
     app_index: 13
     fixed_port: 7101
     container_port: 80
-    start: "docker run -d --name {container} -p {port}:80 mw-roundcubemail:latest"
+    start: "docker run -d --name {container} -p {port}:80 --entrypoint /entrypoint-mw.sh mw-roundcubemail:latest"
     health_path: "/"
-    startup_wait: 120
+    health_required_markers:
+      - "Roundcube Webmail"
+    health_bad_markers:
+      - "Internal Server Error"
+    startup_wait: 180
 
   # -- Agriculture / Media New Apps --------------------------------------------------
 
@@ -197,9 +241,9 @@ apps:
     app_index: 17
     fixed_port: 6055
     container_port: 8080
-    start: "docker run -d --name {container} -p {port}:8080 mw-elabel:latest"
+    start: "docker run -d --ulimit nofile=65535:65535 --name {container} -p {port}:8080 mw-elabel:latest"
     health_path: "/"
-    startup_wait: 60
+    startup_wait: 600
 
   siyuan:
     app_index: 18
@@ -213,8 +257,10 @@ apps:
     app_index: 19
     fixed_port: 7043
     container_port: 3080
-    start: "docker run -d --name {container} -p {port}:3080 mw-watcharr:latest"
+    start: "docker run -d --name {container} -p {port}:3080 -e HTTP_PROXY -e HTTPS_PROXY -e ALL_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e all_proxy -e no_proxy mw-watcharr:latest"
     health_path: "/"
+    extra_health_paths:
+      - "/login"
     startup_wait: 60
 
   booklore:
