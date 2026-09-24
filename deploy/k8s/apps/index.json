@@ -1,0 +1,140 @@
+{
+  "baserow": {
+    "namespace": "saasbench-baserow",
+    "nodePort": 30103,
+    "healthPath": "/login",
+    "manifest": "deploy/k8s/apps/baserow.yaml"
+  },
+  "bigcapital": {
+    "namespace": "saasbench-bigcapital",
+    "nodePort": 30105,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/bigcapital.yaml"
+  },
+  "booklore": {
+    "namespace": "saasbench-booklore",
+    "nodePort": 30120,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/booklore.yaml"
+  },
+  "code-server": {
+    "namespace": "saasbench-code-server",
+    "nodePort": 30100,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/code-server.yaml"
+  },
+  "e-label": {
+    "namespace": "saasbench-e-label",
+    "nodePort": 30117,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/e-label.yaml"
+  },
+  "farmos": {
+    "namespace": "saasbench-farmos",
+    "nodePort": 30116,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/farmos.yaml"
+  },
+  "grocy": {
+    "namespace": "saasbench-grocy",
+    "nodePort": 30114,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/grocy.yaml"
+  },
+  "hrms": {
+    "namespace": "saasbench-hrms",
+    "nodePort": 30106,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/hrms.yaml"
+  },
+  "mattermost": {
+    "namespace": "saasbench-mattermost",
+    "nodePort": 30111,
+    "healthPath": "/api/v4/system/ping",
+    "manifest": "deploy/k8s/apps/mattermost.yaml"
+  },
+  "mediacms": {
+    "namespace": "saasbench-mediacms",
+    "nodePort": 30121,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/mediacms.yaml"
+  },
+  "metabase": {
+    "namespace": "saasbench-metabase",
+    "nodePort": 30102,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/metabase.yaml"
+  },
+  "onlyoffice": {
+    "namespace": "saasbench-onlyoffice",
+    "nodePort": 30110,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/onlyoffice.yaml"
+  },
+  "openemr": {
+    "namespace": "saasbench-openemr",
+    "nodePort": 30108,
+    "healthPath": "/interface/login/login.php?site=default",
+    "manifest": "deploy/k8s/apps/openemr.yaml"
+  },
+  "openproject": {
+    "namespace": "saasbench-openproject",
+    "nodePort": 30101,
+    "healthPath": "/health_checks/default",
+    "manifest": "deploy/k8s/apps/openproject.yaml"
+  },
+  "opnform": {
+    "namespace": "saasbench-opnform",
+    "nodePort": 30109,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/opnform.yaml"
+  },
+  "owncloud": {
+    "namespace": "saasbench-owncloud",
+    "nodePort": 30112,
+    "healthPath": "/status.php",
+    "manifest": "deploy/k8s/apps/owncloud.yaml"
+  },
+  "photoprism": {
+    "namespace": "saasbench-photoprism",
+    "nodePort": 30122,
+    "healthPath": "/api/v1/status",
+    "manifest": "deploy/k8s/apps/photoprism.yaml"
+  },
+  "pretix": {
+    "namespace": "saasbench-pretix",
+    "nodePort": 30107,
+    "healthPath": "/control/login/",
+    "manifest": "deploy/k8s/apps/pretix.yaml"
+  },
+  "recipya": {
+    "namespace": "saasbench-recipya",
+    "nodePort": 30115,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/recipya.yaml"
+  },
+  "roundcubemail": {
+    "namespace": "saasbench-roundcubemail",
+    "nodePort": 30113,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/roundcubemail.yaml"
+  },
+  "siyuan": {
+    "namespace": "saasbench-siyuan",
+    "nodePort": 30118,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/siyuan.yaml"
+  },
+  "twenty": {
+    "namespace": "saasbench-twenty",
+    "nodePort": 30104,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/twenty.yaml"
+  },
+  "watcharr": {
+    "namespace": "saasbench-watcharr",
+    "nodePort": 30119,
+    "healthPath": "/",
+    "manifest": "deploy/k8s/apps/watcharr.yaml"
+  }
+}

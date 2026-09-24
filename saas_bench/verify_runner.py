@@ -192,6 +192,69 @@ SITE_CONFIG: dict[str, dict] = {
 
 
 _SLOT_PREFIX = os.environ.get("SAAS_SLOT_PREFIX", "rollout")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_K8S_SHIM_DIR = os.path.join(_REPO_ROOT, "scripts", "k8s")
+_K8S_CONTAINER_NAMES = {
+    "mattermost": {"app": "mattermost", "db": "postgres"},
+    "owncloud": {"app": "owncloud", "db": "mariadb"},
+    "onlyoffice": {"app": "community", "db": "mysql"},
+    "pretix": {"app": "pretix", "db": "db"},
+}
+
+
+def _site_config(site: str) -> dict:
+    """Return the known app mapping, or derive a generic one for smoke fixtures.
+
+    Real benchmark apps stay explicit in SITE_CONFIG. Generic apps are useful for
+    Kubernetes smoke tests and future app fixtures: "fake-site" exposes
+    FAKE_SITE_PORT / FAKE_SITE_CONTAINER without adding production app entries.
+    """
+    cfg = SITE_CONFIG.get(site)
+    if cfg is not None:
+        return cfg
+
+    env_prefix = re.sub(r"[^0-9A-Za-z]+", "_", site).strip("_").upper()
+    return {
+        "port_var":         f"{env_prefix}_PORT",
+        "container_var":    f"{env_prefix}_CONTAINER",
+        "container_suffix": "",
+        "db_var":           None,
+        "db_suffix":        None,
+    }
+
+
+def _k8s_container_name(site: str, is_db: bool = False) -> str:
+    names = _K8S_CONTAINER_NAMES.get(site)
+    if names:
+        return names["db" if is_db else "app"]
+    return site
+
+
+def _build_k8s_exec_map(sites: list[str], slot_id: int) -> dict[str, dict]:
+    mapping: dict[str, dict] = {}
+    namespace_prefix = os.environ.get("SAAS_K8S_NAMESPACE_PREFIX", "saasbench")
+    for site in sites:
+        cfg = _site_config(site)
+        prefix = f"{_SLOT_PREFIX}_{slot_id}_{site}"
+        namespace = f"{namespace_prefix}-{site}"
+        selector = f"app={site}"
+
+        app_container = prefix + cfg["container_suffix"]
+        mapping[app_container] = {
+            "namespace": namespace,
+            "selector": selector,
+            "container": _k8s_container_name(site),
+        }
+
+        if cfg["db_var"] is not None:
+            db_container = prefix + cfg["db_suffix"]
+            mapping[db_container] = {
+                "namespace": namespace,
+                "selector": selector,
+                "container": _k8s_container_name(site, is_db=True),
+            }
+
+    return mapping
 
 
 def build_verify_env(
@@ -212,10 +275,12 @@ def build_verify_env(
 
     sites: list[str] = task.get("meta", {}).get("meta_data", {}).get("sites", [])
 
+    if env.get("SAAS_BACKEND") == "k8s":
+        env["PYTHONPATH"] = _K8S_SHIM_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        env["SAAS_K8S_EXEC_MAP"] = json.dumps(_build_k8s_exec_map(sites, slot_id))
+
     for site in sites:
-        cfg = SITE_CONFIG.get(site)
-        if cfg is None:
-            continue  # unknown app, skip
+        cfg = _site_config(site)
 
         prefix = f"{_SLOT_PREFIX}_{slot_id}_{site}"
 

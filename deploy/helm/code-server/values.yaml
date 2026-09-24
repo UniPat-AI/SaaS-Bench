@@ -1,0 +1,13 @@
+image:
+  repository: code-server-bundle
+  tag: latest
+  pullPolicy: Never
+
+containerPort: 8080
+service:
+  type: NodePort
+  port: 80
+  nodePort: 30080
+password: 8a128206e2177bce1e48e565
+runAsRoot: true
+resources: {}

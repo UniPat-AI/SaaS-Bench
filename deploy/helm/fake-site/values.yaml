@@ -1,0 +1,19 @@
+replicaCount: 1
+
+image:
+  repository: python
+  tag: "3.12-alpine"
+  pullPolicy: IfNotPresent
+
+containerPort: 8080
+
+service:
+  type: ClusterIP
+  port: 80
+
+result:
+  defaultTaskId: smoke_fake_site
+  defaultPassed: false
+  defaultScore: 0.0
+
+resources: {}

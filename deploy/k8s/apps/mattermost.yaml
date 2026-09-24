@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-mattermost
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mattermost
+  namespace: saasbench-mattermost
+  labels: &id001
+    app: mattermost
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: postgres
+        image: mw-mattermost-postgres:latest
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: mmuser
+        - name: POSTGRES_PASSWORD
+          value: mmuser_password
+        - name: POSTGRES_DB
+          value: mattermost
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: md5
+      - name: mattermost
+        image: mw-mattermost:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 8065
+        env:
+        - name: MM_SQLSETTINGS_DRIVERNAME
+          value: postgres
+        - name: MM_SQLSETTINGS_DATASOURCE
+          value: postgres://mmuser:mmuser_password@127.0.0.1:5432/mattermost?sslmode=disable&connect_timeout=10
+        - name: MM_BLEVESETTINGS_INDEXDIR
+          value: /mattermost/bleve-indexes
+        - name: MM_SERVICESETTINGS_SITEURL
+          value: http://localhost
+        - name: MM_SERVICESETTINGS_LISTENADDRESS
+          value: :8065
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mattermost
+  namespace: saasbench-mattermost
+  labels: &id001
+    app: mattermost
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30111

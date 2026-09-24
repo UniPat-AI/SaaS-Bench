@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-owncloud
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: owncloud
+  namespace: saasbench-owncloud
+  labels: &id001
+    app: owncloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: mariadb
+        image: mw-owncloud-mariadb:latest
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: owncloud
+        - name: MYSQL_USER
+          value: owncloud
+        - name: MYSQL_PASSWORD
+          value: owncloud
+        - name: MYSQL_DATABASE
+          value: owncloud
+        args:
+        - --max-allowed-packet=128M
+        - --innodb-log-file-size=64M
+      - name: redis
+        image: redis:6
+        imagePullPolicy: Never
+        ports:
+        - name: redis
+          containerPort: 6379
+      - name: owncloud
+        image: mw-owncloud-server:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 8080
+        env:
+        - name: OWNCLOUD_DOMAIN
+          value: localhost
+        - name: OWNCLOUD_TRUSTED_DOMAINS
+          value: localhost,127.0.0.1,s0-owncloud.saasbench.localhost
+        - name: OWNCLOUD_DB_TYPE
+          value: mysql
+        - name: OWNCLOUD_DB_NAME
+          value: owncloud
+        - name: OWNCLOUD_DB_USERNAME
+          value: owncloud
+        - name: OWNCLOUD_DB_PASSWORD
+          value: owncloud
+        - name: OWNCLOUD_DB_HOST
+          value: 127.0.0.1
+        - name: OWNCLOUD_ADMIN_USERNAME
+          value: admin
+        - name: OWNCLOUD_ADMIN_PASSWORD
+          value: admin
+        - name: OWNCLOUD_MYSQL_UTF8MB4
+          value: 'true'
+        - name: OWNCLOUD_REDIS_ENABLED
+          value: 'true'
+        - name: OWNCLOUD_REDIS_HOST
+          value: 127.0.0.1
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: owncloud
+  namespace: saasbench-owncloud
+  labels: &id001
+    app: owncloud
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30112

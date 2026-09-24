@@ -1,0 +1,10 @@
+{
+  "task_id": "code_server_smoke",
+  "category_id": "Smoke",
+  "meta_data": {
+    "sites": [
+      "code-server"
+    ],
+    "require_login": false
+  }
+}

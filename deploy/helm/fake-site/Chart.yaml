@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fake-site
+description: Controlled fake website for SaaS-Bench Kubernetes smoke evaluation
+type: application
+version: 0.1.0
+appVersion: "1.0"

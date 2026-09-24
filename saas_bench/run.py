@@ -21,10 +21,10 @@ from pathlib import Path
 
 import yaml
 
-from saas_bench.agent import run_task
 from saas_bench.loader import build_prompt, load_tasks
 from saas_bench.reporting import generate_outputs
 from saas_bench.slot import SlotManager
+from saas_bench.k8s_slot import K8sSlotManager
 from saas_bench.verify_runner import run_verify
 
 
@@ -91,6 +91,20 @@ def _log_error(result_dir: str, slot_id: int, task_id: str, phase: str, exc: Exc
         f.write(entry)
 
 
+def _make_slot_manager(backend: str, apps_config: dict, slot_id: int):
+    if backend == "k8s":
+        return K8sSlotManager(apps_config, slot_id)
+    return SlotManager(apps_config, slot_id)
+
+
+def _get_runner(backend: str):
+    if backend == "k8s":
+        from saas_bench.codex_cli_runner import run_task
+    else:
+        from saas_bench.agent import run_task
+    return run_task
+
+
 def _run_one(
     task: dict,
     slot_id: int,
@@ -100,6 +114,7 @@ def _run_one(
     max_steps: int,
     hostname: str,
     use_isolation: bool,
+    backend: str = "docker",
     run_idx: int = 0,
     tasks_dir: str = "",
 ) -> dict:
@@ -108,11 +123,12 @@ def _run_one(
 
     run_suffix = f"_r{run_idx}"
     sites: list[str] = task.get("meta", {}).get("meta_data", {}).get("sites", [])
-    slot = SlotManager(apps_config, slot_id) if use_isolation else None
+    provision_apps = backend == "k8s" or use_isolation
+    slot = _make_slot_manager(backend, apps_config, slot_id) if provision_apps else None
     port_map: dict[str, int] = {}
     known: list[str] = []
 
-    if use_isolation and slot and sites:
+    if provision_apps and slot and sites:
         known = [a for a in sites if a in apps_config]
         unknown = [a for a in sites if a not in apps_config]
         if unknown:
@@ -135,16 +151,17 @@ def _run_one(
 
     try:
         prompt, todo_md, input_files = build_prompt(task, port_map, hostname, tasks_root=tasks_dir)
+        runner = _get_runner(backend)
 
         agent_result = asyncio.run(
-            run_task(
+            runner(
                 task, model, prompt, result_dir,
                 max_steps=max_steps, slot_id=slot_id, todo_md=todo_md,
                 run_idx=run_idx, input_files=input_files,
             )
         )
 
-        if use_isolation and task.get("verify_py_path"):
+        if slot and task.get("verify_py_path"):
             verify_result = run_verify(task, slot_id, port_map, hostname, result_dir,
                                        run_suffix=run_suffix)
         else:
@@ -166,7 +183,7 @@ def _run_one(
             flush=True,
         )
     finally:
-        if use_isolation and slot and known:
+        if slot and known:
             slot.stop_apps(known)
 
     return {
@@ -186,6 +203,7 @@ def _run_task_all_runs(
     max_steps: int,
     hostname: str,
     use_isolation: bool,
+    backend: str = "docker",
     run_start: int = 0,
     runs: int = 1,
     tasks_dir: str = "",
@@ -195,7 +213,7 @@ def _run_task_all_runs(
     for run_idx in range(run_start, run_start + runs):
         result = _run_one(
             task, slot_id, apps_config, model, result_dir,
-            max_steps, hostname, use_isolation, run_idx, tasks_dir,
+            max_steps, hostname, use_isolation, backend, run_idx, tasks_dir,
         )
         results.append(result)
     return results
@@ -211,10 +229,12 @@ def main(
     task_ids: list[str] | None,
     apps_yaml: str,
     use_isolation: bool,
+    backend: str = "docker",
     runs: int = 1,
     run_start: int = 0,
     write_report: bool = True,
 ) -> None:
+    os.environ["SAAS_BACKEND"] = backend
     _global_cleanup()
     started_at = datetime.now()
     t0 = time.perf_counter()
@@ -233,7 +253,7 @@ def main(
     total_jobs = len(tasks) * runs
     print(
         f"Loaded {len(tasks)} tasks × runs={runs} (r{run_start}..r{run_start+runs-1}) = {total_jobs} jobs | "
-        f"workers={workers} | model={model} | isolation={use_isolation}",
+        f"workers={workers} | model={model} | backend={backend} | isolation={use_isolation}",
         flush=True,
     )
 
@@ -248,7 +268,7 @@ def main(
                 _run_task_all_runs, task,
                 i % workers,
                 apps_config, model,
-                result_dir, max_steps, hostname, use_isolation,
+                result_dir, max_steps, hostname, use_isolation, backend,
                 run_start, runs, tasks_dir,
             ): task
             for i, task in enumerate(tasks)
@@ -314,6 +334,7 @@ def main(
         "model":      model,
         "workers":    workers,
         "hostname":   hostname,
+        "backend":    backend,
         "isolation":  use_isolation,
         "runs":       runs,
         "started_at": started_at.isoformat(timespec="seconds"),
@@ -348,6 +369,8 @@ def parse_args() -> argparse.Namespace:
                    help="Hostname the agent uses to access apps")
     p.add_argument("--task-ids", nargs="*", help="Run only the specified subset of task ids")
     p.add_argument("--apps-yaml", default="saas_bench/apps.yaml")
+    p.add_argument("--backend", choices=["docker", "k8s"], default=os.environ.get("SAAS_BACKEND", "docker"),
+                   help="Execution backend: docker (default) or k8s")
     p.add_argument("--no-isolation", action="store_true",
                    help="Do not start Docker container isolation (share already-running apps)")
     p.add_argument("--runs", type=int, default=1,
@@ -371,6 +394,7 @@ if __name__ == "__main__":
         task_ids     = args.task_ids,
         apps_yaml    = args.apps_yaml,
         use_isolation= not args.no_isolation,
+        backend      = args.backend,
         runs         = args.runs,
         run_start    = args.run_start,
         write_report = not args.no_report,

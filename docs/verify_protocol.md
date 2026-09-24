@@ -30,8 +30,13 @@ exports a stable set of variables before exec:
 | `<APP>_DB_CONTAINER`      | app has a DB       | Name of the app's database container     |
 
 `<APP>` is the upper-case app key from `apps.yaml`, e.g. `MATTERMOST_PORT`,
-`OWNCLOUD_DB_CONTAINER`. The full mapping is defined in
+`OWNCLOUD_DB_CONTAINER`. The production mapping is defined in
 `saas_bench/verify_runner.py:SITE_CONFIG`.
+
+Smoke fixtures and future non-production apps do not need a `SITE_CONFIG`
+entry. For any unknown site name, the harness derives the prefix by replacing
+non-alphanumeric characters with `_` and upper-casing it. For example,
+`fake-site` exports `FAKE_SITE_PORT` and `FAKE_SITE_CONTAINER`.
 
 For compose-based apps the `_CONTAINER` env vars include the per-template
 suffix (e.g. `mattermost` → `rollout_<slot>_mattermost`, while

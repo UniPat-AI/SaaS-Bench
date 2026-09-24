@@ -1,4 +1,4 @@
-from saas_bench.verify_runner import _parse_verify_output
+from saas_bench.verify_runner import build_verify_env, _parse_verify_output
 
 
 def test_parse_verify_output_preserves_multiline_detail():
@@ -35,3 +35,24 @@ SCORE: 0.333  PASS: False  (1/3)
     ]
     assert parsed["checks"][1]["detail"] == "missing value"
     assert parsed["score"] == 0.333
+
+
+def test_build_verify_env_derives_generic_site_contract():
+    task = {
+        "meta": {
+            "meta_data": {
+                "sites": ["fake-site"],
+            },
+        },
+    }
+
+    env = build_verify_env(
+        task,
+        slot_id=3,
+        port_map={"fake-site": 32123},
+        hostname="127.0.0.1",
+    )
+
+    assert env["SERVER_HOSTNAME"] == "127.0.0.1"
+    assert env["FAKE_SITE_PORT"] == "32123"
+    assert env["FAKE_SITE_CONTAINER"].endswith("_3_fake-site")

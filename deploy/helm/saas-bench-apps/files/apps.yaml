@@ -1,0 +1,1476 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-baserow
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: baserow
+  namespace: saasbench-baserow
+  labels: &id001
+    app: baserow
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: baserow
+        image: mw-baserow:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 6806
+        env:
+        - name: BASEROW_PUBLIC_URL
+          value: http://localhost
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: baserow
+  namespace: saasbench-baserow
+  labels: &id001
+    app: baserow
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30103
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-bigcapital
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bigcapital
+  namespace: saasbench-bigcapital
+  labels: &id001
+    app: bigcapital
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: bigcapital
+        image: mw-bigcapital:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bigcapital
+  namespace: saasbench-bigcapital
+  labels: &id001
+    app: bigcapital
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30105
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-booklore
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booklore
+  namespace: saasbench-booklore
+  labels: &id001
+    app: booklore
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: booklore
+        image: mw-booklore:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: booklore
+  namespace: saasbench-booklore
+  labels: &id001
+    app: booklore
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30120
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-code-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: code-server
+  namespace: saasbench-code-server
+  labels: &id001
+    app: code-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: code-server
+        image: code-server-bundle:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+        - name: PASSWORD
+          value: 8a128206e2177bce1e48e565
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+        securityContext:
+          runAsUser: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: code-server
+  namespace: saasbench-code-server
+  labels: &id001
+    app: code-server
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30100
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-e-label
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e-label
+  namespace: saasbench-e-label
+  labels: &id001
+    app: e-label
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: e-label
+        image: mw-elabel:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: e-label
+  namespace: saasbench-e-label
+  labels: &id001
+    app: e-label
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30117
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-farmos
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: farmos
+  namespace: saasbench-farmos
+  labels: &id001
+    app: farmos
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: farmos
+        image: mw-farmos:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: farmos
+  namespace: saasbench-farmos
+  labels: &id001
+    app: farmos
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30116
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-grocy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grocy
+  namespace: saasbench-grocy
+  labels: &id001
+    app: grocy
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: grocy
+        image: mw-grocy:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grocy
+  namespace: saasbench-grocy
+  labels: &id001
+    app: grocy
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30114
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-hrms
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hrms
+  namespace: saasbench-hrms
+  labels: &id001
+    app: hrms
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: hrms
+        image: mw-hrms:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8000
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hrms
+  namespace: saasbench-hrms
+  labels: &id001
+    app: hrms
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30106
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-mattermost
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mattermost
+  namespace: saasbench-mattermost
+  labels: &id001
+    app: mattermost
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: postgres
+        image: mw-mattermost-postgres:latest
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: mmuser
+        - name: POSTGRES_PASSWORD
+          value: mmuser_password
+        - name: POSTGRES_DB
+          value: mattermost
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: md5
+      - name: mattermost
+        image: mw-mattermost:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 8065
+        env:
+        - name: MM_SQLSETTINGS_DRIVERNAME
+          value: postgres
+        - name: MM_SQLSETTINGS_DATASOURCE
+          value: postgres://mmuser:mmuser_password@127.0.0.1:5432/mattermost?sslmode=disable&connect_timeout=10
+        - name: MM_BLEVESETTINGS_INDEXDIR
+          value: /mattermost/bleve-indexes
+        - name: MM_SERVICESETTINGS_SITEURL
+          value: http://localhost
+        - name: MM_SERVICESETTINGS_LISTENADDRESS
+          value: :8065
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mattermost
+  namespace: saasbench-mattermost
+  labels: &id001
+    app: mattermost
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30111
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-mediacms
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediacms
+  namespace: saasbench-mediacms
+  labels: &id001
+    app: mediacms
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: mediacms
+        image: mw-mediacms:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediacms
+  namespace: saasbench-mediacms
+  labels: &id001
+    app: mediacms
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30121
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-metabase
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metabase
+  namespace: saasbench-metabase
+  labels: &id001
+    app: metabase
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: metabase
+        image: mw-metabase:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metabase
+  namespace: saasbench-metabase
+  labels: &id001
+    app: metabase
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30102
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-onlyoffice
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: onlyoffice
+  namespace: saasbench-onlyoffice
+  labels: &id001
+    app: onlyoffice
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: mysql
+        image: oo-bundle-mysql:latest
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: my-secret-pw
+        - name: MYSQL_DATABASE
+          value: onlyoffice
+        - name: MYSQL_USER
+          value: onlyoffice_user
+        - name: MYSQL_PASSWORD
+          value: onlyoffice_pass
+        args:
+        - --sql_mode=
+        - --character-set-server=utf8mb4
+        - --collation-server=utf8mb4_general_ci
+      - name: elasticsearch
+        image: oo-bundle-es:latest
+        imagePullPolicy: Never
+        ports:
+        - name: es
+          containerPort: 9200
+        env:
+        - name: discovery.type
+          value: single-node
+        - name: bootstrap.memory_lock
+          value: 'true'
+        - name: ES_JAVA_OPTS
+          value: -Xms512m -Xmx512m
+        - name: xpack.security.enabled
+          value: 'false'
+      - name: documentserver
+        image: oo-bundle-ds:latest
+        imagePullPolicy: Never
+        ports:
+        - name: ds
+          containerPort: 8000
+        env:
+        - name: JWT_ENABLED
+          value: 'false'
+        - name: ALLOW_PRIVATE_IP_ADDRESS
+          value: 'true'
+      - name: community
+        image: oo-bundle-community2:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 80
+        env:
+        - name: MYSQL_SERVER_HOST
+          value: 127.0.0.1
+        - name: MYSQL_SERVER_PORT
+          value: '3306'
+        - name: MYSQL_SERVER_DB_NAME
+          value: onlyoffice
+        - name: MYSQL_SERVER_USER
+          value: onlyoffice_user
+        - name: MYSQL_SERVER_PASS
+          value: onlyoffice_pass
+        - name: ELASTICSEARCH_SERVER_HOST
+          value: 127.0.0.1
+        - name: ELASTICSEARCH_SERVER_HTTPPORT
+          value: '9200'
+        - name: DOCUMENT_SERVER_ENABLED
+          value: 'true'
+        - name: DOCUMENT_SERVER_HOST
+          value: 127.0.0.1
+        - name: DOCUMENT_SERVER_PROTOCOL
+          value: http
+        - name: DOCUMENT_SERVER_API_URL
+          value: /ds-vpath
+        - name: DOCUMENT_SERVER_JWT_ENABLED
+          value: 'false'
+        securityContext:
+          privileged: true
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: onlyoffice
+  namespace: saasbench-onlyoffice
+  labels: &id001
+    app: onlyoffice
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30110
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-openemr
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openemr
+  namespace: saasbench-openemr
+  labels: &id001
+    app: openemr
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: openemr
+        image: mw-openemr:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openemr
+  namespace: saasbench-openemr
+  labels: &id001
+    app: openemr
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30108
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-openproject
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openproject
+  namespace: saasbench-openproject
+  labels: &id001
+    app: openproject
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: openproject
+        image: mw-openproject:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        env:
+        - name: OPENPROJECT_HOST__NAME
+          value: s0-openproject.saasbench.localhost
+        - name: OPENPROJECT_ADDITIONAL_HOSTS
+          value: localhost,127.0.0.1,s0-openproject.saasbench.localhost
+        - name: OPENPROJECT_HTTPS
+          value: 'false'
+        - name: SECRET_KEY_BASE
+          value: secret
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openproject
+  namespace: saasbench-openproject
+  labels: &id001
+    app: openproject
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30101
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-opnform
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opnform
+  namespace: saasbench-opnform
+  labels: &id001
+    app: opnform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: opnform
+        image: mw-opnform:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+        - name: APP_URL
+          value: http://localhost
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opnform
+  namespace: saasbench-opnform
+  labels: &id001
+    app: opnform
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30109
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-owncloud
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: owncloud
+  namespace: saasbench-owncloud
+  labels: &id001
+    app: owncloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: mariadb
+        image: mw-owncloud-mariadb:latest
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: owncloud
+        - name: MYSQL_USER
+          value: owncloud
+        - name: MYSQL_PASSWORD
+          value: owncloud
+        - name: MYSQL_DATABASE
+          value: owncloud
+        args:
+        - --max-allowed-packet=128M
+        - --innodb-log-file-size=64M
+      - name: redis
+        image: redis:6
+        imagePullPolicy: Never
+        ports:
+        - name: redis
+          containerPort: 6379
+      - name: owncloud
+        image: mw-owncloud-server:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 8080
+        env:
+        - name: OWNCLOUD_DOMAIN
+          value: localhost
+        - name: OWNCLOUD_TRUSTED_DOMAINS
+          value: localhost,127.0.0.1,s0-owncloud.saasbench.localhost
+        - name: OWNCLOUD_DB_TYPE
+          value: mysql
+        - name: OWNCLOUD_DB_NAME
+          value: owncloud
+        - name: OWNCLOUD_DB_USERNAME
+          value: owncloud
+        - name: OWNCLOUD_DB_PASSWORD
+          value: owncloud
+        - name: OWNCLOUD_DB_HOST
+          value: 127.0.0.1
+        - name: OWNCLOUD_ADMIN_USERNAME
+          value: admin
+        - name: OWNCLOUD_ADMIN_PASSWORD
+          value: admin
+        - name: OWNCLOUD_MYSQL_UTF8MB4
+          value: 'true'
+        - name: OWNCLOUD_REDIS_ENABLED
+          value: 'true'
+        - name: OWNCLOUD_REDIS_HOST
+          value: 127.0.0.1
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: owncloud
+  namespace: saasbench-owncloud
+  labels: &id001
+    app: owncloud
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30112
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-photoprism
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: photoprism
+  namespace: saasbench-photoprism
+  labels: &id001
+    app: photoprism
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: photoprism
+        image: mw-photoprism:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 2342
+        env:
+        - name: PHOTOPRISM_SITE_URL
+          value: http://localhost/
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: photoprism
+  namespace: saasbench-photoprism
+  labels: &id001
+    app: photoprism
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30122
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-pretix
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pretix
+  namespace: saasbench-pretix
+  labels: &id001
+    app: pretix
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: db
+        image: pgvector/pgvector:pg18-trixie
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: pretix
+        - name: POSTGRES_USER
+          value: pretix
+        - name: POSTGRES_PASSWORD
+          value: pretix_pass
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: md5
+      - name: redis
+        image: redis:6
+        imagePullPolicy: Never
+        ports:
+        - name: redis
+          containerPort: 6379
+      - name: pretix
+        image: mw-pretix:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 80
+        env:
+        - name: TZ
+          value: Asia/Shanghai
+        - name: PRETIX_URL
+          value: http://s0-pretix.saasbench.localhost:30090
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+        command:
+        - sh
+        - -c
+        - until python -c "import socket; socket.create_connection(('127.0.0.1', 5432),
+          timeout=1).close()" 2>/dev/null; do sleep 2; done; exec /entrypoint-mw.sh
+          all
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pretix
+  namespace: saasbench-pretix
+  labels: &id001
+    app: pretix
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30107
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-recipya
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recipya
+  namespace: saasbench-recipya
+  labels: &id001
+    app: recipya
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: recipya
+        image: mw-recipya:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8078
+        env:
+        - name: RECIPYA_SERVER_URL
+          value: http://localhost
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recipya
+  namespace: saasbench-recipya
+  labels: &id001
+    app: recipya
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30115
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-roundcubemail
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: roundcubemail
+  namespace: saasbench-roundcubemail
+  labels: &id001
+    app: roundcubemail
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: roundcubemail
+        image: mw-roundcubemail:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 80
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: roundcubemail
+  namespace: saasbench-roundcubemail
+  labels: &id001
+    app: roundcubemail
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30113
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-siyuan
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siyuan
+  namespace: saasbench-siyuan
+  labels: &id001
+    app: siyuan
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: siyuan
+        image: mw-siyuan:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 6806
+        env:
+        - name: SIYUAN_ACCESS_AUTH_CODE
+          value: siyuan6037
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siyuan
+  namespace: saasbench-siyuan
+  labels: &id001
+    app: siyuan
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30118
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-twenty
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: twenty
+  namespace: saasbench-twenty
+  labels: &id001
+    app: twenty
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: twenty
+        image: mw-twenty:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 3000
+        env:
+        - name: SERVER_URL
+          value: http://localhost
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: twenty
+  namespace: saasbench-twenty
+  labels: &id001
+    app: twenty
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30104
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-watcharr
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watcharr
+  namespace: saasbench-watcharr
+  labels: &id001
+    app: watcharr
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: watcharr
+        image: mw-watcharr:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 3080
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: watcharr
+  namespace: saasbench-watcharr
+  labels: &id001
+    app: watcharr
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30119

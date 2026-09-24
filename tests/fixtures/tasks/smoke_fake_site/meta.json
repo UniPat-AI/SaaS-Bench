@@ -1,0 +1,10 @@
+{
+  "task_id": "smoke_fake_site",
+  "category_id": "Smoke",
+  "meta_data": {
+    "sites": [
+      "fake-site"
+    ],
+    "require_login": false
+  }
+}

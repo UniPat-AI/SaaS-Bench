@@ -16,6 +16,12 @@ dependencies = [
     "browser-use",
     "playwright>=1.40",
     "pyyaml>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
 ]
 
 [project.scripts]
@@ -26,3 +32,8 @@ include = ["saas_bench*"]
 
 [tool.setuptools.package-data]
 saas_bench = ["apps.yaml"]
+
+[tool.pytest.ini_options]
+markers = [
+    "k8s: requires a reachable Kubernetes cluster and kubectl",
+]

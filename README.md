@@ -130,6 +130,21 @@ When in doubt, you can purge stale containers from a previous (crashed) run:
 bash scripts/stop_all.sh
 ```
 
+## Kubernetes smoke evaluation
+
+For a Docker Desktop Kubernetes smoke run, deploy the controlled fake website
+into the cluster and evaluate it from an external pytest client:
+
+```bash
+python -m pip install -e ".[test]"
+bash scripts/smoke_k8s.sh
+```
+
+The fake website is installed from a Helm chart into a per-run Kubernetes
+namespace and exposes result/reset endpoints. The evaluation client runs
+outside the cluster and reaches the Service through `kubectl port-forward`.
+See [docs/k8s_smoke_testing.md](docs/k8s_smoke_testing.md) for details.
+
 ## Bring your own agent
 
 The harness invokes a single async function `run_task(task, model_name,

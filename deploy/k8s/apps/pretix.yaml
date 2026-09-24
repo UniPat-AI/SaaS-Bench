@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-pretix
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pretix
+  namespace: saasbench-pretix
+  labels: &id001
+    app: pretix
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: db
+        image: pgvector/pgvector:pg18-trixie
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: pretix
+        - name: POSTGRES_USER
+          value: pretix
+        - name: POSTGRES_PASSWORD
+          value: pretix_pass
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: md5
+      - name: redis
+        image: redis:6
+        imagePullPolicy: Never
+        ports:
+        - name: redis
+          containerPort: 6379
+      - name: pretix
+        image: mw-pretix:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 80
+        env:
+        - name: TZ
+          value: Asia/Shanghai
+        - name: PRETIX_URL
+          value: http://s0-pretix.saasbench.localhost:30090
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+        command:
+        - sh
+        - -c
+        - until python -c "import socket; socket.create_connection(('127.0.0.1', 5432),
+          timeout=1).close()" 2>/dev/null; do sleep 2; done; exec /entrypoint-mw.sh
+          all
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pretix
+  namespace: saasbench-pretix
+  labels: &id001
+    app: pretix
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30107

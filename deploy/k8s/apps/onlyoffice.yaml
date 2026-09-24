@@ -1,0 +1,127 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-onlyoffice
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: onlyoffice
+  namespace: saasbench-onlyoffice
+  labels: &id001
+    app: onlyoffice
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: mysql
+        image: oo-bundle-mysql:latest
+        imagePullPolicy: Never
+        ports:
+        - name: db
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: my-secret-pw
+        - name: MYSQL_DATABASE
+          value: onlyoffice
+        - name: MYSQL_USER
+          value: onlyoffice_user
+        - name: MYSQL_PASSWORD
+          value: onlyoffice_pass
+        args:
+        - --sql_mode=
+        - --character-set-server=utf8mb4
+        - --collation-server=utf8mb4_general_ci
+      - name: elasticsearch
+        image: oo-bundle-es:latest
+        imagePullPolicy: Never
+        ports:
+        - name: es
+          containerPort: 9200
+        env:
+        - name: discovery.type
+          value: single-node
+        - name: bootstrap.memory_lock
+          value: 'true'
+        - name: ES_JAVA_OPTS
+          value: -Xms512m -Xmx512m
+        - name: xpack.security.enabled
+          value: 'false'
+      - name: documentserver
+        image: oo-bundle-ds:latest
+        imagePullPolicy: Never
+        ports:
+        - name: ds
+          containerPort: 8000
+        env:
+        - name: JWT_ENABLED
+          value: 'false'
+        - name: ALLOW_PRIVATE_IP_ADDRESS
+          value: 'true'
+      - name: community
+        image: oo-bundle-community2:latest
+        imagePullPolicy: Never
+        ports:
+        - name: main
+          containerPort: 80
+        env:
+        - name: MYSQL_SERVER_HOST
+          value: 127.0.0.1
+        - name: MYSQL_SERVER_PORT
+          value: '3306'
+        - name: MYSQL_SERVER_DB_NAME
+          value: onlyoffice
+        - name: MYSQL_SERVER_USER
+          value: onlyoffice_user
+        - name: MYSQL_SERVER_PASS
+          value: onlyoffice_pass
+        - name: ELASTICSEARCH_SERVER_HOST
+          value: 127.0.0.1
+        - name: ELASTICSEARCH_SERVER_HTTPPORT
+          value: '9200'
+        - name: DOCUMENT_SERVER_ENABLED
+          value: 'true'
+        - name: DOCUMENT_SERVER_HOST
+          value: 127.0.0.1
+        - name: DOCUMENT_SERVER_PROTOCOL
+          value: http
+        - name: DOCUMENT_SERVER_API_URL
+          value: /ds-vpath
+        - name: DOCUMENT_SERVER_JWT_ENABLED
+          value: 'false'
+        securityContext:
+          privileged: true
+        readinessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: main
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: onlyoffice
+  namespace: saasbench-onlyoffice
+  labels: &id001
+    app: onlyoffice
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: main
+    nodePort: 30110

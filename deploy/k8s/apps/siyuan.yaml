@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: saasbench-siyuan
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siyuan
+  namespace: saasbench-siyuan
+  labels: &id001
+    app: siyuan
+spec:
+  replicas: 1
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: siyuan
+        image: mw-siyuan:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 6806
+        env:
+        - name: SIYUAN_ACCESS_AUTH_CODE
+          value: siyuan6037
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siyuan
+  namespace: saasbench-siyuan
+  labels: &id001
+    app: siyuan
+spec:
+  type: NodePort
+  selector: *id001
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    nodePort: 30118
