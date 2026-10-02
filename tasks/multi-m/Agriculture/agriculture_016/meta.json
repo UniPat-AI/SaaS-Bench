@@ -3,7 +3,8 @@
   "category_id": "Agriculture",
   "meta_data": {
     "sites": [
-      "farmos"
+      "farmos",
+      "grocy"
     ],
     "require_login": true
   }

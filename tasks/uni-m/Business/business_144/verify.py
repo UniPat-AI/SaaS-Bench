@@ -1,8 +1,9 @@
 """
 Verifier for Business-144-I5: Shift Scheduling, Overtime Accounting, and CRM Task Management
 
-Checks: 16 weighted checks across hrms, bigcapital, twenty.
-Strategy: docker exec MariaDB for hrms; REST API for bigcapital; docker exec Postgres for twenty.
+Checks: 16 weighted checks across hrms, bigcapital, twenty (total weight 26).
+Strategy: docker exec MariaDB for hrms; REST API + docker exec MySQL (tenant DB)
+for bigcapital; docker exec Postgres for twenty.
 
 Required env vars:
   SERVER_HOSTNAME, HRMS_PORT, HRMS_CONTAINER, HRMS_DB_CONTAINER,
@@ -12,8 +13,10 @@ Required env vars:
 
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime, timedelta
 
 import requests
 
@@ -63,6 +66,56 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
         capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
+
+
+def _norm_text(s: str) -> str:
+    """Normalize text for comparison: em/en dashes -> '--', unescape '&amp;',
+    flatten escaped newlines, collapse whitespace runs."""
+    s = (s or "").replace("—", "--").replace("–", "--")
+    s = s.replace("&amp;", "&").replace("\\n", " ")
+    return " ".join(s.split())
+
+
+def _local_utc_offset() -> timedelta:
+    """UTC offset of the verifier host's local timezone (no hardcoded city)."""
+    off = datetime.now().astimezone().utcoffset()
+    return off if off is not None else timedelta(0)
+
+
+_TS_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?"
+    r"(?:([+-])(\d{2})(?::?(\d{2}))?)?$"
+)
+
+
+def date_matches_tz(stored: str, expected: str) -> bool:
+    """True if the stored date/timestamp denotes calendar date `expected`.
+
+    Semantics: stored::date == D  OR  (stored + local_utc_offset)::date == D.
+    Pure dates (exactly 10 chars) use equality; timestamps are parsed and
+    compared in UTC and in the verifier host's local timezone. No bare
+    substring matching.
+    """
+    s = (stored or "").strip()
+    if not s or s.upper() == "NULL":
+        return False
+    if len(s) == 10:
+        return s == expected
+    m = _TS_RE.match(s)
+    if not m:
+        return False
+    y, mo, d, hh, mi, ss = (int(m.group(i)) for i in range(1, 7))
+    dt = datetime(y, mo, d, hh, mi, ss)
+    # Normalize to UTC using any explicit offset suffix (psql prints '+00').
+    if m.group(7):
+        suffix = timedelta(hours=int(m.group(8)), minutes=int(m.group(9) or 0))
+        if m.group(7) == "+":
+            dt = dt - suffix
+        else:
+            dt = dt + suffix
+    if str(dt.date()) == expected:
+        return True
+    return str((dt + _local_utc_offset()).date()) == expected
 
 
 def _discover_hrms_db() -> str:
@@ -143,13 +196,58 @@ def bc_api_get(path: str, params: dict | None = None) -> dict:
     return r.json()
 
 
+_bc_db_name: str | None = None
+
+
+def _find_bigcapital_db() -> str:
+    """Find the BigCapital tenant database name in the MySQL container."""
+    global _bc_db_name
+    if _bc_db_name:
+        return _bc_db_name
+    rc, out, err = docker_exec(
+        BIGCAPITAL_DB_CONTAINER,
+        "mysql", "-u", "bigcapital", "-pbigcapital123", "-N", "-B", "-e",
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA "
+        "WHERE SCHEMA_NAME LIKE 'bigcapital_tenant_%' OR SCHEMA_NAME = 'bigcapital'",
+    )
+    if rc != 0:
+        raise RuntimeError(f"Cannot list BigCapital databases: {err.strip()}")
+    candidates = [l.strip() for l in out.strip().splitlines() if l.strip()]
+    for c in candidates:
+        if c.startswith("bigcapital_tenant_"):
+            _bc_db_name = c
+            return c
+    if candidates:
+        _bc_db_name = candidates[0]
+        return _bc_db_name
+    raise RuntimeError("No BigCapital database found")
+
+
+def bigcapital_sql(query: str) -> str:
+    """Run a MySQL query against the BigCapital tenant database."""
+    db = _find_bigcapital_db()
+    rc, out, err = docker_exec(
+        BIGCAPITAL_DB_CONTAINER,
+        "mysql", "-u", "bigcapital", "-pbigcapital123",
+        "--default-character-set=utf8mb4", "-D", db, "-N", "-B", "-e", query,
+    )
+    if rc != 0:
+        raise RuntimeError(f"BigCapital SQL error: {err.strip()}")
+    return out.strip()
+
+
 def _discover_twenty_workspace() -> str:
     """Discover the Twenty workspace schema name."""
     rc, out, err = docker_exec(
         TWENTY_DB_CONTAINER,
         "psql", "-U", "postgres", "-d", "default", "-t", "-A", "-c",
-        "SELECT schema_name FROM information_schema.schemata "
-        "WHERE schema_name LIKE 'workspace_%' LIMIT 1",
+        # The image seeds TWO workspaces (Apple/apple, YCombinator/yc). The app serves yc on the
+        # benchmark's subdomain-less localhost URL, so that is where the agent's writes land; an
+        # unordered LIMIT 1 only happened to agree, and ORDER BY schema_name picks Apple and
+        # silently finds nothing. core."dataSource" carries the authoritative schema mapping.
+        'SELECT ds.schema FROM core."dataSource" ds '
+        'JOIN core.workspace w ON w.id = ds."workspaceId" '
+        "WHERE w.subdomain = 'yc';",
     )
     if rc != 0:
         raise RuntimeError(f"Cannot discover Twenty workspace: {err.strip()}")
@@ -178,6 +276,19 @@ def twenty_sql(query: str) -> str:
     lines = out.strip().split("\n")
     result_lines = [l for l in lines if l.strip() != "SET"]
     return "\n".join(result_lines).strip()
+
+
+def _twenty_flat_body(table: str, title: str) -> str:
+    """Fetch the newline-flattened markdown body of a task/note by exact title."""
+    return twenty_sql(
+        "SELECT regexp_replace("
+        "COALESCE(\"bodyV2Markdown\", \"bodyV2Blocknote\"::text, ''), "
+        "E'[\\n\\r]+', ' ', 'g') "
+        f"FROM {table} "
+        "WHERE \"deletedAt\" IS NULL "
+        f"AND title = '{title}' "
+        "LIMIT 1"
+    )
 
 
 # ── HRMS checks ──────────────────────────────────────────────────────────────
@@ -252,40 +363,56 @@ def check_3_theta_shift() -> None:
 
 
 def check_4_gamma_bulk_assignment() -> None:
-    """Gamma Shift bulk assignment for dept Finance & Accounting - TVS, 2026-09-01 to 2026-09-30."""
+    """Gamma Shift bulk assignment covers the ENTIRE 'Finance & Accounting - TVS'
+    active roster (derived independently from tabEmployee), 2026-09-01 to
+    2026-09-30, submitted and Active."""
+    label = "4. Gamma Shift bulk assignment (Finance & Accounting - TVS)"
     try:
-        count = hrms_sql(
-            "SELECT COUNT(*) FROM `tabShift Assignment` "
-            "WHERE shift_type='Gamma Shift' "
-            "AND department='Finance & Accounting - TVS' "
-            "AND start_date<='2026-09-01' AND end_date>='2026-09-30' "
-            "AND docstatus=1"
+        roster = hrms_sql(
+            "SELECT COUNT(*) FROM `tabEmployee` "
+            "WHERE department='Finance & Accounting - TVS' AND status='Active'"
         )
-        n = int(count) if count else 0
-        check("4. Gamma Shift bulk assignment (Finance & Accounting - TVS)", 2, n >= 1,
-              f"found {n} active assignments")
+        n_roster = int(roster or 0)
+        uncovered = hrms_sql(
+            "SELECT e.name FROM `tabEmployee` e "
+            "WHERE e.department='Finance & Accounting - TVS' AND e.status='Active' "
+            "AND NOT EXISTS (SELECT 1 FROM `tabShift Assignment` sa "
+            "WHERE sa.employee=e.name AND sa.shift_type='Gamma Shift' "
+            "AND sa.docstatus=1 AND sa.status='Active' "
+            "AND sa.start_date='2026-09-01' AND sa.end_date='2026-09-30')"
+        )
+        missing = [l.strip() for l in uncovered.split("\n") if l.strip()] if uncovered else []
+        ok = n_roster >= 1 and not missing
+        check(label, 2, ok,
+              f"dept roster={n_roster} active employees, "
+              f"uncovered={missing if missing else 'none'}")
     except Exception as e:
-        check("4. Gamma Shift bulk assignment (Finance & Accounting - TVS)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_5_sigma_individual_assignments() -> None:
-    """Sigma Shift assignments for Kavitha Iyer, Arjun Nair, Ananya Reddy."""
+    """Sigma Shift assignments for Kavitha Iyer, Arjun Nair, Ananya Reddy
+    (matched by employee ID, exact date range, submitted, Active)."""
     try:
-        employees = ["Kavitha Iyer", "Arjun Nair", "Ananya Reddy"]
+        employees = [
+            ("HR-EMP-00012", "Kavitha Iyer"),
+            ("HR-EMP-00011", "Arjun Nair"),
+            ("HR-EMP-00007", "Ananya Reddy"),
+        ]
         found = []
         missing = []
-        for emp in employees:
+        for emp_id, emp_name in employees:
             row = hrms_sql(
                 f"SELECT COUNT(*) FROM `tabShift Assignment` "
                 f"WHERE shift_type='Sigma Shift' "
-                f"AND employee_name='{emp}' "
-                f"AND start_date<='2026-09-01' AND end_date>='2026-09-30' "
-                f"AND docstatus=1"
+                f"AND employee='{emp_id}' "
+                f"AND docstatus=1 AND status='Active' "
+                f"AND start_date='2026-09-01' AND end_date='2026-09-30'"
             )
             if int(row or 0) > 0:
-                found.append(emp)
+                found.append(emp_name)
             else:
-                missing.append(emp)
+                missing.append(f"{emp_name} ({emp_id})")
         ok = len(missing) == 0
         check("5. Sigma Shift individual assignments (3 employees)", 2, ok,
               f"found={found}, missing={missing}" if missing else "all 3 found")
@@ -294,23 +421,27 @@ def check_5_sigma_individual_assignments() -> None:
 
 
 def check_6_theta_individual_assignments() -> None:
-    """Theta Shift assignments for Mohammed Farooq, Sanjay Krishnan."""
+    """Theta Shift assignments for Mohammed Farooq, Sanjay Krishnan
+    (matched by employee ID, exact date range, submitted, Active)."""
     try:
-        employees = ["Mohammed Farooq", "Sanjay Krishnan"]
+        employees = [
+            ("HR-EMP-00015", "Mohammed Farooq"),
+            ("HR-EMP-00014", "Sanjay Krishnan"),
+        ]
         found = []
         missing = []
-        for emp in employees:
+        for emp_id, emp_name in employees:
             row = hrms_sql(
                 f"SELECT COUNT(*) FROM `tabShift Assignment` "
                 f"WHERE shift_type='Theta Shift' "
-                f"AND employee_name='{emp}' "
-                f"AND start_date<='2026-09-01' AND end_date>='2026-09-30' "
-                f"AND docstatus=1"
+                f"AND employee='{emp_id}' "
+                f"AND docstatus=1 AND status='Active' "
+                f"AND start_date='2026-09-01' AND end_date='2026-09-30'"
             )
             if int(row or 0) > 0:
-                found.append(emp)
+                found.append(emp_name)
             else:
-                missing.append(emp)
+                missing.append(f"{emp_name} ({emp_id})")
         ok = len(missing) == 0
         check("6. Theta Shift individual assignments (2 employees)", 2, ok,
               f"found={found}, missing={missing}" if missing else "all 2 found")
@@ -319,16 +450,19 @@ def check_6_theta_individual_assignments() -> None:
 
 
 def check_7_shift_request_approved() -> None:
-    """Shift Request for Deepika Joshi (HR-EMP-00010) from Gamma to Sigma on 2026-09-12, Approved."""
+    """Shift Request for Deepika Joshi (HR-EMP-00010) to Sigma Shift on
+    2026-09-12 (from_date AND to_date), submitted and Approved."""
     try:
         row = hrms_sql(
             "SELECT status, shift_type "
             "FROM `tabShift Request` "
-            "WHERE employee='HR-EMP-00010' AND from_date='2026-09-12' "
+            "WHERE employee='HR-EMP-00010' "
+            "AND from_date='2026-09-12' AND to_date='2026-09-12' "
             "AND docstatus=1 LIMIT 1"
         )
         if not row:
-            check("7. Shift Request Deepika Joshi approved", 2, False, "not found")
+            check("7. Shift Request Deepika Joshi approved", 2, False,
+                  "not found (employee=HR-EMP-00010, from_date=to_date=2026-09-12, submitted)")
             return
         parts = row.split("\t")
         status = parts[0] if len(parts) > 0 else ""
@@ -371,60 +505,66 @@ def check_8_overtime_type() -> None:
 
 
 def check_9_ot_slip_suresh() -> None:
-    """Overtime Slip for Suresh Menon (HR-EMP-00009), 6h, 2026-09-06, submitted."""
+    """Overtime Slip for Suresh Menon (HR-EMP-00009), submitted, with a detail
+    row: date 2026-09-06, type 'Night Differential Overtime', 6 hours
+    (parent+child same-row join)."""
+    label = "9. OT Slip Suresh Menon (6h, 2026-09-06, Night Differential Overtime)"
     try:
         row = hrms_sql(
-            "SELECT employee_name, total_overtime_duration, posting_date "
-            "FROM `tabOvertime Slip` "
-            "WHERE employee='HR-EMP-00009' AND docstatus=1 LIMIT 1"
+            "SELECT s.name, d.date, d.overtime_type, d.overtime_duration "
+            "FROM `tabOvertime Slip` s "
+            "JOIN `tabOvertime Details` d "
+            "ON d.parent=s.name AND d.parenttype='Overtime Slip' "
+            "WHERE s.employee='HR-EMP-00009' AND s.docstatus=1 "
+            "AND d.date='2026-09-06' "
+            "AND d.overtime_type='Night Differential Overtime' "
+            "AND ABS(d.overtime_duration-6)<0.01 "
+            "LIMIT 1"
         )
         if not row:
-            row = hrms_sql(
-                "SELECT employee_name, total_overtime_duration, posting_date "
-                "FROM `tabOvertime Slip` "
-                "WHERE employee_name LIKE '%Suresh%' AND docstatus=1 LIMIT 1"
-            )
-        if not row:
-            check("9. OT Slip Suresh Menon (6h)", 2, False, "not found")
+            check(label, 2, False,
+                  "no submitted slip for HR-EMP-00009 with a matching detail row")
             return
         parts = row.split("\t")
-        hours = float(parts[1]) if len(parts) > 1 else 0
-        date_val = parts[2] if len(parts) > 2 else ""
-        ok = abs(hours - 6.0) < 0.01 and "2026-09-06" in date_val
-        check("9. OT Slip Suresh Menon (6h)", 2, ok,
-              f"total_overtime_duration={hours}, posting_date={date_val}")
+        check(label, 2, True,
+              f"slip={parts[0]}, date={parts[1] if len(parts) > 1 else ''}, "
+              f"type={parts[2] if len(parts) > 2 else ''}, "
+              f"duration={parts[3] if len(parts) > 3 else ''}")
     except Exception as e:
-        check("9. OT Slip Suresh Menon (6h)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_10_ot_slip_rahul() -> None:
-    """Overtime Slip for Rahul Verma (HR-EMP-00013), 4h, 2026-09-13, submitted."""
+    """Overtime Slip for Rahul Verma (HR-EMP-00013), submitted, with a detail
+    row: date 2026-09-13, type 'Night Differential Overtime', 4 hours
+    (parent+child same-row join)."""
+    label = "10. OT Slip Rahul Verma (4h, 2026-09-13, Night Differential Overtime)"
     try:
         row = hrms_sql(
-            "SELECT employee_name, total_overtime_duration, posting_date "
-            "FROM `tabOvertime Slip` "
-            "WHERE employee='HR-EMP-00013' AND docstatus=1 LIMIT 1"
+            "SELECT s.name, d.date, d.overtime_type, d.overtime_duration "
+            "FROM `tabOvertime Slip` s "
+            "JOIN `tabOvertime Details` d "
+            "ON d.parent=s.name AND d.parenttype='Overtime Slip' "
+            "WHERE s.employee='HR-EMP-00013' AND s.docstatus=1 "
+            "AND d.date='2026-09-13' "
+            "AND d.overtime_type='Night Differential Overtime' "
+            "AND ABS(d.overtime_duration-4)<0.01 "
+            "LIMIT 1"
         )
         if not row:
-            row = hrms_sql(
-                "SELECT employee_name, total_overtime_duration, posting_date "
-                "FROM `tabOvertime Slip` "
-                "WHERE employee_name LIKE '%Rahul%' AND docstatus=1 LIMIT 1"
-            )
-        if not row:
-            check("10. OT Slip Rahul Verma (4h)", 2, False, "not found")
+            check(label, 2, False,
+                  "no submitted slip for HR-EMP-00013 with a matching detail row")
             return
         parts = row.split("\t")
-        hours = float(parts[1]) if len(parts) > 1 else 0
-        date_val = parts[2] if len(parts) > 2 else ""
-        ok = abs(hours - 4.0) < 0.01 and "2026-09-13" in date_val
-        check("10. OT Slip Rahul Verma (4h)", 2, ok,
-              f"total_overtime_duration={hours}, posting_date={date_val}")
+        check(label, 2, True,
+              f"slip={parts[0]}, date={parts[1] if len(parts) > 1 else ''}, "
+              f"type={parts[2] if len(parts) > 2 else ''}, "
+              f"duration={parts[3] if len(parts) > 3 else ''}")
     except Exception as e:
-        check("10. OT Slip Rahul Verma (4h)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-# ── BigCapital checks (REST API) ─────────────────────────────────────────────
+# ── BigCapital checks ────────────────────────────────────────────────────────
 
 def check_11_expense_account() -> None:
     """Overtime Shift Differential Expense account exists as expense type."""
@@ -444,106 +584,178 @@ def check_11_expense_account() -> None:
 
 
 def check_12_ap_account() -> None:
-    """Accounts Payable (A/P) exists as liability type."""
+    """[precondition, 0pt] Accounts Payable (A/P) exists as liability type.
+
+    Seed-provided account ('verify or create' in the task): pristine
+    environments already pass, so this carries no score weight and exists
+    only for diagnostics (check 13 depends on it)."""
+    label = "12. Accounts Payable (A/P) account [precondition]"
     try:
         data = bc_api_get("/api/accounts")
         accounts = data.get("accounts", [])
         match = [a for a in accounts if a.get("name") == "Accounts Payable (A/P)"]
         if not match:
-            check("12. Accounts Payable (A/P) account", 1, False, "not found")
+            check(label, 0, False,
+                  "FATAL: seed account 'Accounts Payable (A/P)' missing -- "
+                  "journal check 13 cannot pass")
             return
         atype = match[0].get("account_type", "")
         ok = "liabilit" in atype.lower() or "payable" in atype.lower() or "current_liability" in atype.lower()
-        check("12. Accounts Payable (A/P) account", 1, ok, f"account_type={atype}")
+        check(label, 0, ok,
+              f"account_type={atype}" if ok
+              else f"FATAL: unexpected account_type={atype}")
     except Exception as e:
-        check("12. Accounts Payable (A/P) account", 1, False, f"exception: {e}")
+        check(label, 0, False, f"FATAL: exception: {e}")
+
+
+JOURNAL_MEMO = ("Overtime accrual -- Suresh Menon (6h) + Rahul Verma (4h) "
+                "-- rate 50 x 1.25 multiplier")
 
 
 def check_13_journal_entry() -> None:
-    """Manual journal entry dated 2026-09-30: debit Overtime Shift Differential Expense 625.00, credit AP 625.00."""
+    """A SINGLE published manual journal dated 2026-09-30 with exactly 2 entries:
+    debit 'Overtime Shift Differential Expense' 625.00, credit
+    'Accounts Payable (A/P)' 625.00, and the exact memo (dash-normalized).
+    All conditions scoped to the same journal (DB query)."""
+    label = "13. Journal entry (single journal: 625.00 debit/credit, memo, 2026-09-30)"
     try:
-        data = bc_api_get("/api/manual-journals", params={"page_size": 200})
-        journals = data.get("manual_journals", [])
-        debit_ok = False
-        credit_ok = False
-        for j in journals:
-            j_date = (j.get("date") or "")[:10]
-            if j_date != "2026-09-30":
-                continue
-            status = j.get("status", "")
-            if status != "published":
-                continue
-            for entry in j.get("entries", []):
-                acct_name = entry.get("account", {}).get("name", "")
-                debit = float(entry.get("debit") or 0)
-                credit = float(entry.get("credit") or 0)
-                if "Overtime Shift Differential Expense" in acct_name and abs(debit - 625.0) < 0.01:
-                    debit_ok = True
-                if "Accounts Payable" in acct_name and abs(credit - 625.0) < 0.01:
-                    credit_ok = True
-        ok = debit_ok and credit_ok
-        check("13. Journal entry (625.00 debit/credit on 2026-09-30)", 3, ok,
-              f"debit_ok={debit_ok}, credit_ok={credit_ok}")
+        out = bigcapital_sql(
+            "SELECT j.ID, j.DESCRIPTION FROM MANUAL_JOURNALS j "
+            "WHERE DATE(j.DATE)='2026-09-30' AND j.PUBLISHED_AT IS NOT NULL "
+            "AND (SELECT COUNT(*) FROM MANUAL_JOURNALS_ENTRIES e "
+            "     WHERE e.MANUAL_JOURNAL_ID=j.ID)=2 "
+            "AND EXISTS (SELECT 1 FROM MANUAL_JOURNALS_ENTRIES e "
+            "            JOIN ACCOUNTS a ON a.ID=e.ACCOUNT_ID "
+            "            WHERE e.MANUAL_JOURNAL_ID=j.ID "
+            "            AND a.NAME='Overtime Shift Differential Expense' "
+            "            AND ABS(e.DEBIT-625)<0.01 AND COALESCE(e.CREDIT,0)=0) "
+            "AND EXISTS (SELECT 1 FROM MANUAL_JOURNALS_ENTRIES e "
+            "            JOIN ACCOUNTS a ON a.ID=e.ACCOUNT_ID "
+            "            WHERE e.MANUAL_JOURNAL_ID=j.ID "
+            "            AND a.NAME='Accounts Payable (A/P)' "
+            "            AND ABS(e.CREDIT-625)<0.01 AND COALESCE(e.DEBIT,0)=0)"
+        )
+        rows = [r for r in out.split("\n") if r.strip()] if out else []
+        if not rows:
+            check(label, 3, False,
+                  "no published journal on 2026-09-30 with exactly 2 entries, "
+                  "debit(Overtime Shift Differential Expense)=625.00 and "
+                  "credit(Accounts Payable (A/P))=625.00")
+            return
+        expected_memo = _norm_text(JOURNAL_MEMO)
+        ok = False
+        details = []
+        for line in rows:
+            parts = line.split("\t", 1)
+            jid = parts[0].strip()
+            memo = parts[1].strip() if len(parts) > 1 else ""
+            details.append(f"id={jid}, memo={memo[:100]}")
+            if _norm_text(memo) == expected_memo:
+                ok = True
+        check(label, 3, ok,
+              "; ".join(details)[:220] if ok
+              else "amounts/date/entries matched but memo mismatch: " + "; ".join(details)[:180])
     except Exception as e:
-        check("13. Journal entry (625.00 debit/credit on 2026-09-30)", 3, False, f"exception: {e}")
+        check(label, 3, False, f"exception: {e}")
 
 
 # ── Twenty checks (DB) ──────────────────────────────────────────────────────
 
 def check_14_review_task() -> None:
-    """Task 'Review shift schedule compliance -- 2026-09-01 to 2026-09-30' with due 2026-10-07."""
+    """Task 'Review shift schedule compliance -- 2026-09-01 to 2026-09-30' with
+    due 2026-10-07 (timezone-aware) and body covering the shift deployment."""
+    label = "14. Twenty task: Review shift schedule compliance"
+    title = "Review shift schedule compliance -- 2026-09-01 to 2026-09-30"
     try:
-        row = twenty_sql(
-            "SELECT title, \"dueAt\" FROM task "
+        due = twenty_sql(
+            "SELECT COALESCE(\"dueAt\"::text, 'NULL') FROM task "
             "WHERE \"deletedAt\" IS NULL "
-            "AND title = 'Review shift schedule compliance -- 2026-09-01 to 2026-09-30' "
+            f"AND title = '{title}' "
             "LIMIT 1"
-        )
-        if not row:
-            check("14. Twenty task: Review shift schedule compliance", 2, False, "not found")
+        ).strip()
+        if not due:
+            check(label, 2, False, "task not found (exact title)")
             return
-        parts = row.split("|")
-        due = parts[1].strip() if len(parts) > 1 else ""
-        ok = "2026-10-07" in due
-        check("14. Twenty task: Review shift schedule compliance", 2, ok, f"dueAt={due}")
+        due_ok = date_matches_tz(due, "2026-10-07")
+        body = _norm_text(_twenty_flat_body("task", title))
+        keywords = [
+            "Gamma Shift", "Sigma Shift", "Theta Shift",
+            "Finance & Accounting - TVS", "Deepika Joshi", "2026-09-12",
+        ]
+        missing = [k for k in keywords if k not in body]
+        ok = due_ok and not missing
+        check(label, 2, ok,
+              f"dueAt={due} (match={due_ok}), "
+              f"body missing={missing if missing else 'none'}")
     except Exception as e:
-        check("14. Twenty task: Review shift schedule compliance", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_15_payments_task() -> None:
-    """Task 'Process overtime payments -- 2026-09-30' with due 2026-10-14."""
+    """Task 'Process overtime payments -- 2026-09-30' with due 2026-10-14
+    (timezone-aware) and body covering the overtime cost breakdown."""
+    label = "15. Twenty task: Process overtime payments"
+    title = "Process overtime payments -- 2026-09-30"
     try:
-        row = twenty_sql(
-            "SELECT title, \"dueAt\" FROM task "
+        due = twenty_sql(
+            "SELECT COALESCE(\"dueAt\"::text, 'NULL') FROM task "
             "WHERE \"deletedAt\" IS NULL "
-            "AND title = 'Process overtime payments -- 2026-09-30' "
+            f"AND title = '{title}' "
             "LIMIT 1"
-        )
-        if not row:
-            check("15. Twenty task: Process overtime payments", 2, False, "not found")
+        ).strip()
+        if not due:
+            check(label, 2, False, "task not found (exact title)")
             return
-        parts = row.split("|")
-        due = parts[1].strip() if len(parts) > 1 else ""
-        ok = "2026-10-14" in due
-        check("15. Twenty task: Process overtime payments", 2, ok, f"dueAt={due}")
+        due_ok = date_matches_tz(due, "2026-10-14")
+        body = _norm_text(_twenty_flat_body("task", title))
+        keywords = [
+            "Suresh Menon", "6 hours", "2026-09-06", "375.00",
+            "Rahul Verma", "4 hours", "2026-09-13", "250.00",
+            "625.00", "2026-09-30",
+        ]
+        missing = [k for k in keywords if k not in body]
+        ok = due_ok and not missing
+        check(label, 2, ok,
+              f"dueAt={due} (match={due_ok}), "
+              f"body missing={missing if missing else 'none'}")
     except Exception as e:
-        check("15. Twenty task: Process overtime payments", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_16_summary_note() -> None:
-    """Note 'Shift & Overtime Summary -- 2026-09-01 to 2026-09-30' exists."""
+    """Note 'Shift & Overtime Summary -- 2026-09-01 to 2026-09-30' exists with a
+    body covering all three sections (shift config, assignments, overtime)."""
+    label = "16. Twenty note: Shift & Overtime Summary"
+    title = "Shift & Overtime Summary -- 2026-09-01 to 2026-09-30"
     try:
         row = twenty_sql(
-            "SELECT title FROM note "
+            "SELECT id FROM note "
             "WHERE \"deletedAt\" IS NULL "
-            "AND title = 'Shift & Overtime Summary -- 2026-09-01 to 2026-09-30' "
+            f"AND title = '{title}' "
             "LIMIT 1"
         )
-        ok = bool(row)
-        check("16. Twenty note: Shift & Overtime Summary", 1, ok,
-              "found" if ok else "not found")
+        if not row:
+            check(label, 2, False, "note not found (exact title)")
+            return
+        body = _norm_text(_twenty_flat_body("note", title))
+        keywords = [
+            # SHIFT CONFIGURATION section
+            "06:30", "14:30", "22:30", "grace 8 min",
+            # ASSIGNMENTS section
+            "Kavitha Iyer", "Arjun Nair", "Ananya Reddy",
+            "Mohammed Farooq", "Sanjay Krishnan",
+            "Deepika Joshi", "Sigma Shift", "2026-09-12",
+            # OVERTIME section
+            "375.00", "250.00", "625.00",
+            "Overtime Shift Differential Expense", "Accounts Payable (A/P)",
+        ]
+        missing = [k for k in keywords if k not in body]
+        ok = not missing
+        check(label, 2, ok,
+              "all body keywords present" if ok
+              else f"body missing={missing}")
     except Exception as e:
-        check("16. Twenty note: Shift & Overtime Summary", 1, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

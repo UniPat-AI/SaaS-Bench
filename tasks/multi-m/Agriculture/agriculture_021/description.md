@@ -1,25 +1,28 @@
 **Task Requirements:**
-The receiving office kept a delivery manifest: for each Grocy product below, the manifest records a batch number, which is supposed to be the exact name of the FarmOS harvest log the delivery came from. Audit this manifest against FarmOS.
+The receiving office kept a delivery manifest whose batch number should be the exact name of a FarmOS **Harvest** log. Reconcile all eight rows against FarmOS and flag only the unmatched Grocy products.
 
-For each product in the manifest, check in FarmOS (Logs → Harvest) whether a harvest log exists whose name is **exactly** the batch number from the manifest (character-for-character). If no harvest log with that exact name exists, edit the Grocy product and append `AUDIT FLAG: Missing FarmOS harvest log` to its description — keep the existing description text intact and add the flag after it. Do not modify products whose batch number matches an existing FarmOS harvest log. Product names refer to the Grocy product with that exact name.
+A batch is matched only when FarmOS contains a log with both `Type = Harvest` and a name that is character-for-character identical to the manifest batch number. A same-named Activity, Observation, Seeding, Transplanting, or Input log does not count.
 
-**Delivery manifest (Grocy product → batch number):**
+The listed Grocy seed products have empty descriptions. For every unmatched row, set the product description to exactly `AUDIT FLAG: Missing FarmOS harvest log | batch=<batch number>`, replacing `<batch number>` with that row's full manifest value. Leave every matched product unchanged and preserve all eight manifest names and barcodes. Do not place this audit marker on any product outside the manifest.
 
-| Grocy product | Batch number |
-|---|---|
-| Sliced Beets | 2024 Beet Harvest — North Field Center Bed |
-| Strawberries | 2024 Strawberry Harvest — Peak Week June 15 |
-| Whole Kernel Corn | 2024 Sweet Corn Harvest — South Field 1 |
-| Cherry Tomatoes By Sainsburys | 2024 Cherry Tomato Harvest — North Field West Bed 1 |
-| Organic Peas & Shoestring Carrots | 2024 Carrot Harvest — North Field Center Bed 1 |
-| Organic Green Beans | 2024 Green Bean Harvest — North Field East Bed 1 |
-| Chestnut Mushrooms | 2024 Chestnut Mushroom Harvest — West Greenhouse 1 |
-| Shreds Iceberg | 2024 Iceberg Lettuce Harvest — North Field East Bed 2 |
+**Delivery manifest:**
+
+| Grocy product (exact name) | Barcode | Batch number |
+|---|---|---|
+| Green Leaf Lettuce | 0000651041025 | Crop Scouting Report |
+| Whole Kernel Corn | 00016056 | Fall Harvest - Corn |
+| Spring onion | 00001373 | Soybean Planting Activity |
+| Spring onions | 00008761 | Corn Field Inspection - East Plot |
+| Peach | 00002523 | Spring Plowing Complete |
+| Large flat mushrooms | 00019170 | Wheat Harvest Report |
+| British Cox Apples | 00035309 | Water Quality Sampling |
+| Iceberg Lettuce | 00040617 | Fall Harvest - Soybeans |
 
 **Steps:**
-1. For each manifest entry, look up the Grocy product and search the FarmOS harvest logs for the exact batch number.
-2. Mark the entry as matched (a harvest log with that exact name exists) or unmatched.
-3. For every unmatched product, edit it in Grocy and append `AUDIT FLAG: Missing FarmOS harvest log` to its description.
+1. Open FarmOS Logs and filter to the Harvest type.
+2. Compare every batch number against the Harvest log names using exact matching.
+3. In Grocy, identify each product by both its exact name and barcode.
+4. Set the exact batch-specific audit description only on unmatched products; leave matched products unchanged and do not flag unrelated products.
 
 **Login Credentials:**
 

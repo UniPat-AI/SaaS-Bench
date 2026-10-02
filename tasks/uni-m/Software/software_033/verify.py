@@ -2,8 +2,15 @@
 Verifier for Software-033-I3: Audit devops-configs CI workflow and track missing stages
 
 Checks: 12 weighted checks across code-server, baserow, openproject.
-Strategy: docker exec (filesystem + DB) for code-server and openproject;
-          Baserow REST API for baserow (dynamic table schema).
+Strategy: verifier recomputes ground truth itself by parsing deploy.yml —
+          the STRUCTURE truth (job names / needs / stage categories / missing
+          stages) is read from the code-server container's own PRISTINE image
+          via a throwaway `docker run` (immune to agent edits of the live
+          workspace); per-job runs-on VALUES are read from the live file
+          because upgrading the runner is an agent deliverable. Agent-filled
+          data is never trusted as a truth source. Git state is verified with a
+          three-stage check (exact subject -> file list -> commit blob
+          content). Baserow via REST API; OpenProject via embedded psql.
 
 Required env vars:
   SERVER_HOSTNAME,
@@ -19,6 +26,7 @@ import subprocess
 import sys
 
 import requests
+import yaml
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
 HOST = os.getenv("SERVER_HOSTNAME", "localhost")
@@ -50,6 +58,9 @@ OPENPROJECT_URL = f"http://{HOST}:{OPENPROJECT_PORT}"
 
 # Slot values
 CI_WORKFLOW_PATH = "devops-configs/.github/workflows/deploy.yml"
+REPO_PATH = "/home/coder/workspace/devops-configs"
+DEPLOY_YML_ABS = f"/home/coder/workspace/{CI_WORKFLOW_PATH}"
+DEPLOY_YML_REL = ".github/workflows/deploy.yml"
 OLD_RUNNER = "ubuntu-18.04"
 NEW_RUNNER = "ubuntu-22.04"
 BASEROW_DB_NAME = "CI Workflow Remediation Tracker"
@@ -62,14 +73,34 @@ STAGE_MAP = {
     "notify": "Other",
 }
 REQUIRED_STAGES = ["Build", "Test", "Lint", "Deploy"]
+STAGE_OPTIONS = {"Build", "Test", "Lint", "Deploy", "Other"}
 OP_PROJECT = "devops-automation"
 CI_OWNER = "Paul Harris"
+
+# BAKED expected structure of the *committed* deploy.yml (check 3c).
+# Why a baked constant is REQUIRED here: in the pristine code-server image the
+# whole `.github/` directory is UNTRACKED (`git status` shows `?? .github/`),
+# so the agent's commit is an add-file commit and there is no ancestor blob in
+# git history to diff against. Without this constant a malicious agent could
+# rewrite the jobs (e.g. add a `prettier` job to eliminate MISSING stages)
+# before committing, and the "live file parse" truth would be poisoned.
+# NOTE: if the image's seeded deploy.yml ever changes, this constant MUST be
+# updated in sync with the image.
+EXPECTED_COMMIT_JOBS = [
+    # (job name, runs-on, needs — None means no `needs:` key)
+    ("docker-build", NEW_RUNNER, None),
+    ("npm-build", NEW_RUNNER, None),
+    ("jest", NEW_RUNNER, ["npm-build"]),
+    ("e2e", NEW_RUNNER, ["docker-build", "npm-build"]),
+    ("notify", NEW_RUNNER, ["jest", "e2e"]),
+]
 
 # ── Result accumulator ────────────────────────────────────────────────────────
 _checks: list[tuple[str, int, bool, str]] = []
 
 
 def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
+    detail = " ".join(str(detail).split())  # no newlines in detail
     _checks.append((label, weight, passed, detail))
     status = "PASS" if passed else "FAIL"
     tail = f"  ({detail})" if detail else ""
@@ -83,6 +114,36 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
         capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
+
+
+_pristine_image_cache: str | None = None
+
+
+def _pristine_image() -> str:
+    """The code-server container's own image ref — truth reads go here, immune to agent edits."""
+    global _pristine_image_cache
+    if _pristine_image_cache is None:
+        r = subprocess.run(["docker", "inspect", CODE_SERVER_CONTAINER, "--format", "{{.Image}}"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not r.stdout.strip():
+            raise RuntimeError(f"docker inspect failed: {r.stderr.strip()[:200]}")
+        _pristine_image_cache = r.stdout.strip()
+    return _pristine_image_cache
+
+
+def image_exec(*args: str, timeout: int = 60) -> tuple[int, str, str]:
+    """Run a command in a throwaway container from the PRISTINE image (not the live one)."""
+    r = subprocess.run(["docker", "run", "--rm", "--entrypoint", args[0], _pristine_image(), *args[1:]],
+                       capture_output=True, text=True, errors="replace", timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
+
+
+def git_devops(*args: str) -> tuple[int, str, str]:
+    """Run a git command inside the devops-configs repo (with safe.directory)."""
+    return docker_exec(
+        CODE_SERVER_CONTAINER,
+        "git", "-c", f"safe.directory={REPO_PATH}", "-C", REPO_PATH, *args,
+    )
 
 
 def baserow_auth() -> str:
@@ -118,15 +179,95 @@ def op_db_query(sql: str) -> str:
     return out.strip()
 
 
+# ── Ground truth: parse the live deploy.yml ──────────────────────────────────
+_TRUTH_CACHE: list = []  # [truth_or_None] once computed
+
+
+def parse_deploy_yml():
+    """Recompute ground truth for deploy.yml.
+
+    STRUCTURE truth (job names, needs flags, stage categories, missing
+    stages) is parsed from the PRISTINE image's deploy.yml via a throwaway
+    `docker run` — the agent cannot poison it by rewriting jobs in the live
+    workspace. The per-job runs-on VALUES are read from the LIVE file,
+    because upgrading the runner to ubuntu-22.04 is an agent deliverable
+    (asserted by checks 2 and 7).
+
+    Returns dict {jobs: [(name, live_runs_on, has_needs)], cats: [...],
+    missing: [...], raw: str} or None if either read/parse failed. All
+    downstream expectations derive from this parse — NEVER from agent-filled
+    rows.
+    """
+    if _TRUTH_CACHE:
+        return _TRUTH_CACHE[0]
+    truth = None
+    try:
+        # Pristine-image read: structural truth, immune to agent edits.
+        rc_p, out_p, err_p = image_exec("cat", DEPLOY_YML_ABS, timeout=60)
+        # Live read: runs-on values only (agent deliverable state).
+        rc_l, out_l, err_l = docker_exec(CODE_SERVER_CONTAINER, "cat", DEPLOY_YML_ABS)
+        if rc_p == 0 and out_p.strip() and rc_l == 0 and out_l.strip():
+            data = yaml.safe_load(out_p)
+            live_data = yaml.safe_load(out_l)
+            # NOTE: yaml.safe_load parses the top-level `on:` key as boolean
+            # True — irrelevant here, we only read `jobs` (dict order == file
+            # order on Python 3.7+).
+            live_runs: dict = {}
+            live_jobs_map = live_data.get("jobs") if isinstance(live_data, dict) else None
+            if isinstance(live_jobs_map, dict):
+                for name, spec in live_jobs_map.items():
+                    spec = spec if isinstance(spec, dict) else {}
+                    live_runs[str(name)] = spec.get("runs-on")
+            jobs_map = data.get("jobs") if isinstance(data, dict) else None
+            if isinstance(jobs_map, dict) and jobs_map:
+                jobs = []
+                for name, spec in jobs_map.items():
+                    spec = spec if isinstance(spec, dict) else {}
+                    needs = spec.get("needs")
+                    if isinstance(needs, str):
+                        needs = [needs]
+                    # runs-on comes from the LIVE file, keyed by the pristine
+                    # job name (missing/renamed live jobs yield None -> FAIL
+                    # downstream, same as any wrong runner value).
+                    jobs.append((str(name), live_runs.get(str(name)), bool(needs)))
+                cats = [STAGE_MAP.get(n, "Other") for n, _, _ in jobs]
+                covered = set(cats)
+                missing = [s for s in REQUIRED_STAGES if s not in covered]
+                truth = {"jobs": jobs, "cats": cats, "missing": missing, "raw": out_l}
+    except Exception:
+        truth = None
+    _TRUTH_CACHE.append(truth)
+    return truth
+
+
+def _sel_value(v) -> str:
+    """Normalize a Baserow single-select cell to its option value string."""
+    if isinstance(v, dict):
+        return str(v.get("value") or "")
+    return "" if v is None else str(v)
+
+
+def _bool_value(v) -> bool:
+    if isinstance(v, dict):
+        v = v.get("value")
+    return bool(v)
+
+
 # ── Check 1: deploy.yml has no old runner ─────────────────────────────────────
 def check_1_no_old_runner() -> None:
     """Verify deploy.yml contains no 'ubuntu-18.04'."""
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "grep", "-c", OLD_RUNNER, f"/home/coder/workspace/{CI_WORKFLOW_PATH}",
+            "grep", "-c", OLD_RUNNER, DEPLOY_YML_ABS,
         )
-        # grep -c returns 0 if matches found, 1 if no matches
+        # grep -c: rc==0 → matches found; rc==1 with empty stderr → zero matches.
+        # Any other rc (or stderr output, e.g. missing file/container) is an
+        # infrastructure/truth failure and must FAIL, not pass as "no matches".
+        if rc not in (0, 1) or err.strip():
+            check("1. deploy.yml no old runner", 1, False,
+                  f"grep failed (rc={rc}): {err.strip()[:200]}")
+            return
         has_old = (rc == 0 and out.strip() != "0")
         check("1. deploy.yml no old runner", 1, not has_old,
               f"found {out.strip()} occurrences of '{OLD_RUNNER}'" if has_old else "")
@@ -134,34 +275,97 @@ def check_1_no_old_runner() -> None:
         check("1. deploy.yml no old runner", 1, False, f"exception: {e}")
 
 
-# ── Check 2: deploy.yml has new runner ────────────────────────────────────────
+# ── Check 2: deploy.yml has new runner on every job ──────────────────────────
 def check_2_has_new_runner() -> None:
-    """Verify deploy.yml contains 'ubuntu-22.04'."""
+    """Verify 'ubuntu-22.04' occurs exactly once per runs-on key (truth-derived count)."""
     try:
+        truth = parse_deploy_yml()
+        if truth is None:
+            check("2. deploy.yml has new runner", 1, False,
+                  "truth recompute failed: could not parse deploy.yml (pristine-image structure + live runs-on)")
+            return
+        expected_count = sum(1 for _, runs_on, _ in truth["jobs"] if runs_on is not None)
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER,
-            "grep", "-c", NEW_RUNNER, f"/home/coder/workspace/{CI_WORKFLOW_PATH}",
+            "grep", "-c", NEW_RUNNER, DEPLOY_YML_ABS,
         )
-        count = int(out.strip()) if rc == 0 else 0
-        check("2. deploy.yml has new runner", 1, count > 0,
-              f"{count} occurrences of '{NEW_RUNNER}'" if count > 0 else f"'{NEW_RUNNER}' not found")
+        count = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+        ok = expected_count > 0 and count == expected_count
+        check("2. deploy.yml has new runner", 1, ok,
+              f"{count} occurrences of '{NEW_RUNNER}', expected exactly {expected_count} (one per runs-on key)")
     except Exception as e:
         check("2. deploy.yml has new runner", 1, False, f"exception: {e}")
 
 
-# ── Check 3: Git commit message ───────────────────────────────────────────────
-def check_3_commit_message() -> None:
-    """Verify a git commit with exact message 'ci: upgrade runner to ubuntu-22.04' exists."""
+# ── Check 3: Git commit (subject + file list + committed content) ─────────────
+def check_3_commit() -> None:
+    """Three-stage git check: exact subject -> single-file commit -> blob content
+    matches the BAKED expected structure; working tree equals the commit blob."""
     try:
-        rc, out, err = docker_exec(
-            CODE_SERVER_CONTAINER,
-            "bash", "-c",
-            f"cd /home/coder/workspace/devops-configs && git log --oneline --all --format='%s'",
-        )
-        messages = [m.strip() for m in out.strip().split("\n") if m.strip()]
-        found = COMMIT_MSG in messages
-        check("3. Git commit message exact", 2, found,
-              "" if found else f"'{COMMIT_MSG}' not in git log ({len(messages)} commits found)")
+        problems = []
+
+        # (a) exact subject match
+        rc, out, err = git_devops("log", "--all", "--format=%H%x00%s")
+        if rc != 0:
+            check("3. Git commit message exact", 2, False, f"git log failed: {err.strip()[:120]}")
+            return
+        shas = []
+        for line in out.splitlines():
+            if "\x00" not in line:
+                continue
+            sha, subject = line.split("\x00", 1)
+            if subject == COMMIT_MSG:
+                shas.append(sha)
+        if len(shas) != 1:
+            check("3. Git commit message exact", 2, False,
+                  f"expected exactly 1 commit with subject '{COMMIT_MSG}', found {len(shas)}")
+            return
+        sha = shas[0]
+
+        # (b) commit touches exactly .github/workflows/deploy.yml
+        rc, out, err = git_devops("show", "--name-only", "--format=", sha)
+        files = [l.strip() for l in out.splitlines() if l.strip()]
+        if rc != 0 or files != [DEPLOY_YML_REL]:
+            problems.append(f"commit files == {files}, expected exactly ['{DEPLOY_YML_REL}']")
+
+        # (c) committed blob parses to the BAKED expected structure
+        rc, blob, err = git_devops("show", f"{sha}:{DEPLOY_YML_REL}")
+        if rc != 0 or not blob.strip():
+            problems.append("could not read committed blob")
+        else:
+            try:
+                data = yaml.safe_load(blob)
+                jobs_map = data.get("jobs") if isinstance(data, dict) else None
+                if not isinstance(jobs_map, dict):
+                    problems.append("committed yaml has no jobs mapping")
+                else:
+                    got_names = [str(n) for n in jobs_map.keys()]
+                    exp_names = [n for n, _, _ in EXPECTED_COMMIT_JOBS]
+                    if got_names != exp_names:
+                        problems.append(f"committed job order {got_names} != expected {exp_names}")
+                    else:
+                        for name, exp_runs, exp_needs in EXPECTED_COMMIT_JOBS:
+                            spec = jobs_map.get(name)
+                            spec = spec if isinstance(spec, dict) else {}
+                            runs_on = spec.get("runs-on")
+                            needs = spec.get("needs")
+                            if isinstance(needs, str):
+                                needs = [needs]
+                            needs = list(needs) if needs else None
+                            if runs_on != exp_runs:
+                                problems.append(f"committed {name}.runs-on == {runs_on!r}, expected {exp_runs!r}")
+                            if needs != exp_needs:
+                                problems.append(f"committed {name}.needs == {needs}, expected {exp_needs}")
+            except yaml.YAMLError as e:
+                problems.append(f"committed blob is not valid yaml: {e}")
+
+            # working tree file must equal the committed blob
+            rc2, wt, err2 = docker_exec(CODE_SERVER_CONTAINER, "cat", DEPLOY_YML_ABS)
+            if rc2 != 0 or wt.rstrip("\n") != blob.rstrip("\n"):
+                problems.append("working-tree deploy.yml differs from committed blob")
+
+        check("3. Git commit message exact", 2, not problems,
+              "; ".join(problems[:3]) if problems else f"commit {sha[:10]} verified (subject+files+content)")
     except Exception as e:
         check("3. Git commit message exact", 2, False, f"exception: {e}")
 
@@ -200,7 +404,8 @@ def _get_ci_jobs_table(token: str):
 
 
 def check_5_table_fields() -> None:
-    """Verify CI Jobs table has required fields with correct types."""
+    """Verify CI Jobs table has required fields with correct types, Job ID
+    primary, and the exact Stage Category option set."""
     try:
         token = baserow_auth()
         table_id, fields = _get_ci_jobs_table(token)
@@ -209,32 +414,35 @@ def check_5_table_fields() -> None:
             return
 
         expected_fields = {
+            "Job ID": "text",
             "Job Name": "text",
             "Runs On": "text",
             "Has Dependencies": "boolean",
             "Stage Category": "single_select",
             "Missing Stage": "boolean",
         }
-        missing = []
-        wrong_type = []
+        problems = []
         for fname, ftype in expected_fields.items():
             if fname not in fields:
-                missing.append(fname)
+                problems.append(f"missing field: {fname}")
             elif fields[fname]["type"] != ftype:
-                wrong_type.append(f"{fname}: expected {ftype}, got {fields[fname]['type']}")
+                problems.append(f"{fname}: expected type {ftype}, got {fields[fname]['type']}")
 
-        ok = not missing and not wrong_type
-        detail = ""
-        if missing:
-            detail += f"missing fields: {missing}"
-        if wrong_type:
-            detail += f"; wrong types: {wrong_type}" if detail else f"wrong types: {wrong_type}"
-        check("5. CI Jobs table + fields", 2, ok, detail)
+        if "Job ID" in fields and not fields["Job ID"].get("primary"):
+            problems.append("Job ID is not the primary field")
+
+        if "Stage Category" in fields and fields["Stage Category"]["type"] == "single_select":
+            options = {o.get("value") for o in fields["Stage Category"].get("select_options", [])}
+            if options != STAGE_OPTIONS:
+                problems.append(f"Stage Category options {sorted(options)} != expected {sorted(STAGE_OPTIONS)}")
+
+        check("5. CI Jobs table + fields", 2, not problems,
+              "; ".join(problems[:4]) if problems else "6 fields, Job ID primary, option set exact")
     except Exception as e:
         check("5. CI Jobs table + fields", 2, False, f"exception: {e}")
 
 
-# ── Check 6: Job rows with CJ-NN IDs ─────────────────────────────────────────
+# ── Row helpers ───────────────────────────────────────────────────────────────
 def _get_all_rows(token: str, table_id: int) -> list[dict]:
     """Fetch all rows from a Baserow table."""
     rows = []
@@ -252,129 +460,159 @@ def _get_all_rows(token: str, table_id: int) -> list[dict]:
     return rows
 
 
-def check_6_job_id_format() -> None:
-    """Verify rows have Job ID in CJ-NN format."""
+def _primary_field_name(fields: dict) -> str:
+    for f in fields.values():
+        if f.get("primary"):
+            return f["name"]
+    return "Job ID"
+
+
+def _real_rows(rows: list[dict], primary_field: str) -> list[dict]:
+    """Drop empty placeholder rows (blank Job ID AND blank Job Name)."""
+    real = []
+    for row in rows:
+        jid = str(row.get(primary_field) or "").strip()
+        jname = str(row.get("Job Name") or "").strip()
+        if not jid and not jname:
+            continue
+        real.append(row)
+    return real
+
+
+# ── Check 6: exactly one row per job + MISSING rows, CJ-01.. contiguous ──────
+def check_6_row_count_and_ids() -> None:
+    """Verify (placeholders excluded) row count == len(JOBS)+len(MISSING) and
+    Job ID sequence in row order is exactly CJ-01..CJ-NN."""
     try:
+        truth = parse_deploy_yml()
+        if truth is None:
+            check("6. Job rows with CJ-NN IDs", 2, False,
+                  "truth recompute failed: could not parse deploy.yml (pristine-image structure + live runs-on)")
+            return
+        expected_n = len(truth["jobs"]) + len(truth["missing"])
+
         token = baserow_auth()
         table_id, fields = _get_ci_jobs_table(token)
         if table_id is None:
             check("6. Job rows with CJ-NN IDs", 2, False, "table not found")
             return
 
-        rows = _get_all_rows(token, table_id)
-        if not rows:
-            check("6. Job rows with CJ-NN IDs", 2, False, "no rows found")
+        primary_field = _primary_field_name(fields)
+        rows = _real_rows(_get_all_rows(token, table_id), primary_field)
+        if len(rows) != expected_n:
+            check("6. Job rows with CJ-NN IDs", 2, False,
+                  f"{len(rows)} non-placeholder rows, expected exactly {expected_n}")
             return
 
-        # The primary field is "Job ID" — it's the first field (primary text)
-        # In user_field_names mode, the primary field name might be the actual field name
-        # Find the primary field name
-        primary_field = None
-        for f in fields.values():
-            if f.get("primary"):
-                primary_field = f["name"]
-                break
-        if primary_field is None:
-            # Fallback: check if "Job ID" key exists in rows
-            primary_field = "Job ID"
-
-        pattern = re.compile(r"^CJ-\d{2}$")
-        valid = 0
-        total = len(rows)
-        for row in rows:
-            val = str(row.get(primary_field, "")).strip()
-            if pattern.match(val):
-                valid += 1
-
-        check("6. Job rows with CJ-NN IDs", 2, valid == total,
-              f"{valid}/{total} rows have valid CJ-NN format")
+        got_ids = [str(r.get(primary_field) or "").strip() for r in rows]
+        exp_ids = [f"CJ-{i:02d}" for i in range(1, expected_n + 1)]
+        ok = got_ids == exp_ids
+        check("6. Job rows with CJ-NN IDs", 2, ok,
+              f"row-order IDs {got_ids} != expected {exp_ids}" if not ok
+              else f"{expected_n} rows, IDs CJ-01..CJ-{expected_n:02d} contiguous")
     except Exception as e:
         check("6. Job rows with CJ-NN IDs", 2, False, f"exception: {e}")
 
 
-# ── Check 7: Stage Category assignments ──────────────────────────────────────
-def check_7_stage_categories() -> None:
-    """Verify Stage Category is correctly assigned per the stage map."""
+# ── Check 7: job rows match parsed truth ─────────────────────────────────────
+def check_7_job_rows() -> None:
+    """Verify non-MISSING rows: Job Name order == parsed job order; per row
+    Stage Category == STAGE_MAP, Runs On == ubuntu-22.04, Has Dependencies ==
+    truth needs flag, Missing Stage == false."""
     try:
+        truth = parse_deploy_yml()
+        if truth is None:
+            check("7. Job rows match deploy.yml truth", 2, False,
+                  "truth recompute failed: could not parse deploy.yml (pristine-image structure + live runs-on)")
+            return
+
         token = baserow_auth()
         table_id, fields = _get_ci_jobs_table(token)
         if table_id is None:
-            check("7. Stage Category assignments", 2, False, "table not found")
+            check("7. Job rows match deploy.yml truth", 2, False, "table not found")
             return
 
-        rows = _get_all_rows(token, table_id)
-        non_missing = [r for r in rows if not str(r.get("Job Name", "")).startswith("MISSING:")]
-        if not non_missing:
-            check("7. Stage Category assignments", 2, False, "no non-MISSING rows found")
+        primary_field = _primary_field_name(fields)
+        rows = _real_rows(_get_all_rows(token, table_id), primary_field)
+        non_missing = [r for r in rows
+                       if not str(r.get("Job Name") or "").strip().startswith("MISSING:")]
+
+        exp_names = [n for n, _, _ in truth["jobs"]]
+        got_names = [str(r.get("Job Name") or "").strip() for r in non_missing]
+        if got_names != exp_names:
+            check("7. Job rows match deploy.yml truth", 2, False,
+                  f"job-row names {got_names} != parsed order {exp_names}")
             return
 
-        wrong = []
-        for row in non_missing:
-            job_name = str(row.get("Job Name", "")).strip()
-            stage_cat = row.get("Stage Category")
-            # Stage Category is a single_select field — value is dict with "value" key
-            if isinstance(stage_cat, dict):
-                stage_cat = stage_cat.get("value", "")
-            elif stage_cat is None:
-                stage_cat = ""
-            expected = STAGE_MAP.get(job_name, "Other")
-            if stage_cat != expected:
-                wrong.append(f"{job_name}: expected '{expected}', got '{stage_cat}'")
+        problems = []
+        for row, (name, runs_on, has_needs), cat in zip(non_missing, truth["jobs"], truth["cats"]):
+            got_cat = _sel_value(row.get("Stage Category"))
+            got_runs = str(row.get("Runs On") or "").strip()
+            got_deps = _bool_value(row.get("Has Dependencies"))
+            got_missing = _bool_value(row.get("Missing Stage"))
+            if got_cat != cat:
+                problems.append(f"{name}: Stage Category '{got_cat}' != '{cat}'")
+            if runs_on != NEW_RUNNER or got_runs != NEW_RUNNER:
+                problems.append(f"{name}: Runs On '{got_runs}' (file: '{runs_on}') != '{NEW_RUNNER}'")
+            if got_deps != has_needs:
+                problems.append(f"{name}: Has Dependencies {got_deps} != {has_needs}")
+            if got_missing:
+                problems.append(f"{name}: Missing Stage must be false")
 
-        check("7. Stage Category assignments", 2, len(wrong) == 0,
-              f"{len(wrong)} wrong: {'; '.join(wrong[:3])}" if wrong else f"{len(non_missing)} job rows checked")
+        check("7. Job rows match deploy.yml truth", 2, not problems,
+              "; ".join(problems[:3]) if problems else f"{len(non_missing)} job rows match parsed truth")
     except Exception as e:
-        check("7. Stage Category assignments", 2, False, f"exception: {e}")
+        check("7. Job rows match deploy.yml truth", 2, False, f"exception: {e}")
 
 
 # ── Check 8: MISSING stage rows ──────────────────────────────────────────────
 def check_8_missing_rows() -> None:
-    """Verify placeholder MISSING rows exist for uncovered required stages."""
+    """Verify MISSING rows are exactly one per truth-derived missing stage, in
+    required-stage order, each Missing Stage=true, Runs On empty, Has
+    Dependencies=false, Stage Category=<stage>."""
     try:
+        truth = parse_deploy_yml()
+        if truth is None:
+            check("8. MISSING stage placeholder rows", 2, False,
+                  "truth recompute failed: could not parse deploy.yml (pristine-image structure + live runs-on)")
+            return
+        exp_missing = truth["missing"]  # REQUIRED_STAGES order
+
         token = baserow_auth()
         table_id, fields = _get_ci_jobs_table(token)
         if table_id is None:
             check("8. MISSING stage placeholder rows", 2, False, "table not found")
             return
 
-        rows = _get_all_rows(token, table_id)
+        primary_field = _primary_field_name(fields)
+        rows = _real_rows(_get_all_rows(token, table_id), primary_field)
+        missing_rows = [r for r in rows
+                        if str(r.get("Job Name") or "").strip().startswith("MISSING:")]
 
-        # Determine which required stages ARE covered by non-MISSING rows
-        covered = set()
-        for row in rows:
-            job_name = str(row.get("Job Name", "")).strip()
-            if job_name.startswith("MISSING:"):
-                continue
-            stage_cat = row.get("Stage Category")
-            if isinstance(stage_cat, dict):
-                stage_cat = stage_cat.get("value", "")
-            if stage_cat in REQUIRED_STAGES:
-                covered.add(stage_cat)
+        exp_names = [f"MISSING:{s}" for s in exp_missing]
+        got_names = [str(r.get("Job Name") or "").strip() for r in missing_rows]
+        if got_names != exp_names:
+            check("8. MISSING stage placeholder rows", 2, False,
+                  f"MISSING rows {got_names} != expected {exp_names} (truth-derived, in required-stage order)")
+            return
 
-        expected_missing = set(REQUIRED_STAGES) - covered
+        problems = []
+        for row, stage in zip(missing_rows, exp_missing):
+            got_missing = _bool_value(row.get("Missing Stage"))
+            got_runs = str(row.get("Runs On") or "").strip()
+            got_deps = _bool_value(row.get("Has Dependencies"))
+            got_cat = _sel_value(row.get("Stage Category"))
+            if not got_missing:
+                problems.append(f"MISSING:{stage}: Missing Stage must be true")
+            if got_runs != "":
+                problems.append(f"MISSING:{stage}: Runs On '{got_runs}' must be empty")
+            if got_deps:
+                problems.append(f"MISSING:{stage}: Has Dependencies must be false")
+            if got_cat != stage:
+                problems.append(f"MISSING:{stage}: Stage Category '{got_cat}' != '{stage}'")
 
-        # Check that MISSING:<stage> rows exist for each expected missing stage
-        found_missing = set()
-        for row in rows:
-            job_name = str(row.get("Job Name", "")).strip()
-            if job_name.startswith("MISSING:"):
-                stage = job_name.replace("MISSING:", "").strip()
-                missing_flag = row.get("Missing Stage")
-                if isinstance(missing_flag, dict):
-                    missing_flag = missing_flag.get("value", False)
-                if missing_flag:
-                    found_missing.add(stage)
-
-        ok = found_missing == expected_missing
-        detail = ""
-        if not ok:
-            if expected_missing - found_missing:
-                detail += f"missing MISSING rows for: {expected_missing - found_missing}"
-            if found_missing - expected_missing:
-                detail += f"; unexpected MISSING rows for: {found_missing - expected_missing}"
-        else:
-            detail = f"MISSING rows found for {found_missing}" if found_missing else "no missing stages needed"
-        check("8. MISSING stage placeholder rows", 2, ok, detail)
+        check("8. MISSING stage placeholder rows", 2, not problems,
+              "; ".join(problems[:3]) if problems else f"MISSING rows exact: {exp_missing}")
     except Exception as e:
         check("8. MISSING stage placeholder rows", 2, False, f"exception: {e}")
 
@@ -434,10 +672,18 @@ def check_9_gaps_view() -> None:
         check("9. Gaps view exists", 2, False, f"exception: {e}")
 
 
-# ── Check 10: OpenProject work packages exist ────────────────────────────────
+# ── Check 10: OpenProject work packages exact set ────────────────────────────
 def check_10_op_work_packages() -> None:
-    """Verify Task work packages with subject 'Add CI stage: <Category>' exist in devops-automation."""
+    """Verify Task WPs 'Add CI stage: <Category>' exist as EXACTLY the
+    truth-derived missing-stage set (count anchored, no extras)."""
     try:
+        truth = parse_deploy_yml()
+        if truth is None:
+            check("10. OP work packages exist", 2, False,
+                  "truth recompute failed: could not parse deploy.yml (pristine-image structure + live runs-on)")
+            return
+        expected_subjects = sorted(f"Add CI stage: {s}" for s in truth["missing"])
+
         # Find project id
         project_id = op_db_query(
             f"SELECT id FROM projects WHERE identifier='{OP_PROJECT}'"
@@ -451,30 +697,31 @@ def check_10_op_work_packages() -> None:
         task_type_id = op_db_query(
             "SELECT id FROM types WHERE LOWER(name)='task' LIMIT 1"
         )
+        if not task_type_id:
+            check("10. OP work packages exist", 2, False, "Task type not found in OpenProject")
+            return
 
-        # Get work packages with subject matching pattern
+        # Get Task work packages with subject matching pattern (all of them —
+        # extras must FAIL the exact-set comparison)
         wps_raw = op_db_query(
             f"SELECT subject FROM work_packages "
             f"WHERE project_id={project_id} "
-            f"AND subject LIKE 'Add CI stage:%'"
-            + (f" AND type_id={task_type_id}" if task_type_id else "")
+            f"AND subject LIKE 'Add CI stage:%' "
+            f"AND type_id={task_type_id}"
         )
-        found_subjects = [s.strip() for s in wps_raw.split("\n") if s.strip()] if wps_raw else []
+        found_subjects = sorted(s.strip() for s in wps_raw.split("\n") if s.strip()) if wps_raw else []
 
-        # We need at least 1 WP per missing stage — we don't know exact count without
-        # re-deriving from the file, so just check that at least one exists and they
-        # match the expected pattern
-        ok = len(found_subjects) > 0
+        ok = found_subjects == expected_subjects and len(found_subjects) == len(truth["missing"])
         check("10. OP work packages exist", 2, ok,
-              f"found {len(found_subjects)} work packages: {found_subjects}" if found_subjects
-              else "no 'Add CI stage:' work packages found")
+              f"found {found_subjects}, expected exactly {expected_subjects} (count=={len(expected_subjects)})")
     except Exception as e:
         check("10. OP work packages exist", 2, False, f"exception: {e}")
 
 
 # ── Check 11: OP assignee and priority ────────────────────────────────────────
 def check_11_op_assignee_priority() -> None:
-    """Verify work packages are assigned to Paul Harris with High priority."""
+    """Verify work packages are assigned to Paul Harris with High priority.
+    (Total is anchored at the truth-derived count by check 10.)"""
     try:
         project_id = op_db_query(
             f"SELECT id FROM projects WHERE identifier='{OP_PROJECT}'"
@@ -485,7 +732,7 @@ def check_11_op_assignee_priority() -> None:
 
         # Get user id for Paul Harris
         paul_id = op_db_query(
-            "SELECT id FROM users WHERE CONCAT(firstname, ' ', lastname) = 'Paul Harris' LIMIT 1"
+            f"SELECT id FROM users WHERE CONCAT(firstname, ' ', lastname) = '{CI_OWNER}' LIMIT 1"
         )
 
         # Get priority id for High
@@ -523,10 +770,18 @@ def check_11_op_assignee_priority() -> None:
         check("11. OP assignee + priority", 2, False, f"exception: {e}")
 
 
-# ── Check 12: OP description format ──────────────────────────────────────────
+# ── Check 12: OP description exact (truth-assembled) ─────────────────────────
 def check_12_op_description() -> None:
-    """Verify work package descriptions match the expected format."""
+    """Verify each missing-stage WP description equals the truth-assembled
+    string exactly (backslash-stripped whole-string compare)."""
     try:
+        truth = parse_deploy_yml()
+        if truth is None:
+            check("12. OP description format", 2, False,
+                  "truth recompute failed: could not parse deploy.yml (pristine-image structure + live runs-on)")
+            return
+        current_jobs = ", ".join(sorted(n for n, _, _ in truth["jobs"]))
+
         project_id = op_db_query(
             f"SELECT id FROM projects WHERE identifier='{OP_PROJECT}'"
         )
@@ -534,39 +789,36 @@ def check_12_op_description() -> None:
             check("12. OP description format", 2, False, "project not found")
             return
 
-        # Fetch WPs with descriptions
-        raw = op_db_query(
-            f"SELECT subject || '|||' || COALESCE(description, '') "
-            f"FROM work_packages WHERE project_id={project_id} "
-            f"AND subject LIKE 'Add CI stage:%'"
-        )
-        if not raw:
-            check("12. OP description format", 2, False, "no work packages found")
+        problems = []
+        for stage in truth["missing"]:
+            subject = f"Add CI stage: {stage}"
+            expected = (
+                f"Add a job of category {stage} to "
+                f"devops-configs/.github/workflows/deploy.yml; "
+                f"current jobs: {current_jobs}"
+            )
+            n = int(op_db_query(
+                f"SELECT COUNT(*) FROM work_packages "
+                f"WHERE project_id={project_id} AND subject='{subject}'"
+            ) or "0")
+            if n != 1:
+                problems.append(f"'{subject}': {n} WPs, expected exactly 1")
+                continue
+            raw = op_db_query(
+                f"SELECT COALESCE(description, '') FROM work_packages "
+                f"WHERE project_id={project_id} AND subject='{subject}'"
+            )
+            # Strip CKEditor backslash escapes, then whole-string compare
+            desc = raw.replace("\\", "").replace("\r", "").strip()
+            if desc != expected:
+                problems.append(f"'{subject}': description '{desc[:120]}' != expected '{expected[:120]}'")
+
+        if not truth["missing"]:
+            check("12. OP description format", 2, True, "no missing stages — no WP descriptions required")
             return
-
-        lines = [l.strip() for l in raw.split("\n") if l.strip()]
-        correct = 0
-        total = len(lines)
-        for line in lines:
-            parts = line.split("|||", 1)
-            if len(parts) < 2:
-                continue
-            subject, desc = parts
-            # Extract category from subject
-            m = re.match(r"Add CI stage:\s*(\w+)", subject)
-            if not m:
-                continue
-            category = m.group(1)
-            # Description should contain: "Add a job of category <Cat>"
-            # and "devops-configs/.github/workflows/deploy.yml"
-            if (f"Add a job of category {category}" in desc
-                    and "devops-configs/.github/workflows/deploy.yml" in desc
-                    and "current jobs:" in desc):
-                correct += 1
-
-        ok = correct == total and total > 0
-        check("12. OP description format", 2, ok,
-              f"{correct}/{total} descriptions match expected format")
+        check("12. OP description format", 2, not problems,
+              "; ".join(problems[:2]) if problems else
+              f"{len(truth['missing'])} descriptions match truth-assembled string exactly")
     except Exception as e:
         check("12. OP description format", 2, False, f"exception: {e}")
 
@@ -575,11 +827,11 @@ def check_12_op_description() -> None:
 def main() -> None:
     check_1_no_old_runner()
     check_2_has_new_runner()
-    check_3_commit_message()
+    check_3_commit()
     check_4_baserow_db()
     check_5_table_fields()
-    check_6_job_id_format()
-    check_7_stage_categories()
+    check_6_row_count_and_ids()
+    check_7_job_rows()
     check_8_missing_rows()
     check_9_gaps_view()
     check_10_op_work_packages()

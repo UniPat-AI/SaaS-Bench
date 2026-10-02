@@ -1,0 +1,43 @@
+# Example overlay for a small, non-production deployment — copy this and replace every placeholder.
+# It is deliberately smaller than values.yaml's defaults: one gateway, a short janitor TTL, and the
+# LLM judge switched on (without it, the 23 judge-backed tasks cannot be scored).
+#
+#   helm upgrade --install saas-playground charts/saas-playground-platform \
+#       -n saas-playground -f charts/saas-playground-platform/values-staging.yaml
+#
+# Everything below assumes GKE, because the shipped chart pulls in Google-specific objects
+# (Gateway class, ExternalSecret, Workload Identity). See docs/kubernetes.md for what to replace on
+# other platforms.
+image:
+  tag: latest                            # pin to an immutable tag or digest for a real deployment
+
+serviceAccount:
+  gcpServiceAccount: saas-playground@your-gcp-project.iam.gserviceaccount.com
+
+gateway:
+  enabled: true
+  apiHost: api.saas-playground.example.com
+  wildcardHost: "*.saas-playground.example.com"
+  addressName: saas-playground-ip
+  certMap: ""                            # or a Certificate Manager map instead of tlsSecretName
+  tlsSecretName: saas-playground-tls     # kubectl-created from your own cert/key (never in git)
+
+externalSecret:
+  enabled: true
+  gcpProject: your-gcp-project
+  clusterLocation: us-central1
+  clusterName: your-cluster
+  remoteKey: saas-playground-api-key     # Secret Manager secret holding the API bearer
+
+verifierJudge:
+  enabled: true
+  remoteApiKey: saas-playground-judge-api-key   # Secret Manager secret holding the judge's key
+  baseUrl: https://api.openai.com/v1
+  # Must be served by the endpoint above and must accept images (some checks are vision checks).
+  # See values.yaml for why there is no default.
+  model: gpt-4o
+  reasoningEffort: high
+
+janitor:
+  enabled: true
+  ttlMinutes: 240          # 4h — longer than any single eval run (janitor can't see active runs)

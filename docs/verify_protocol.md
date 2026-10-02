@@ -48,11 +48,13 @@ debugging if needed). Two line types are recognised:
 [PASS] (Npt) <label>
 [PASS] (Npt) <label>  (<detail>)
 [FAIL] (Npt) <label>  (<detail>)
+[ERROR] (Npt) <label>  (<infrastructure or verifier error>)
 ```
 
 - `Npt`         — non-negative integer weight for this check
 - `<label>`     — short check description
 - `<detail>`    — optional, parenthesised, separated from label by **two or more spaces**
+- `ERROR`       — the check could not be evaluated; it must not be scored as an agent failure
 
 ### Score summary line (optional but recommended)
 
@@ -81,7 +83,7 @@ The harness writes `<task_id>_verify.json` to `--result-dir`:
   "total":   0,
   "all_pass": true,
   "checks": [
-    {"label": "...", "weight": 1, "passed": true, "detail": "..."}
+    {"label": "...", "weight": 1, "passed": true, "status": "PASS", "detail": "..."}
   ],
   "returncode": 0,
   "error": null
@@ -89,8 +91,11 @@ The harness writes `<task_id>_verify.json` to `--result-dir`:
 ```
 
 - `status` is `PASS` only if all checks passed.
-- `status = ERROR` is reserved for cases where verify itself crashed or
-  produced no parseable output.
+- `status = ERROR` is used when verify crashed, produced no parseable output, or any check
+  could not be evaluated. Legacy `[FAIL]` checks whose detail begins with `exception:` are
+  interpreted as errors during migration.
+- An `ERROR` result can still carry a useful partial score: successfully evaluated passing
+  checks retain their earned weight, while errored checks earn no weight.
 
 ## Minimal example
 

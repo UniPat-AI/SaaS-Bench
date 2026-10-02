@@ -3,9 +3,6 @@ version: "3.8"
 networks:
   $prefix-net:
     driver: bridge
-    ipam:
-      config:
-        - subnet: $subnet
 
 volumes:
   $prefix-config:
@@ -59,9 +56,7 @@ services:
     command: ["mattermost", "server"]
     security_opt:
       - no-new-privileges:true
-    pids_limit: 1024
-    healthcheck:
-      disable: true
+    pids_limit: 200
     tmpfs:
       - /tmp
     environment:

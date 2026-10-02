@@ -8,6 +8,7 @@ Compose project:  rollout_{slot_id}_{app_name}
 """
 
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -217,6 +218,25 @@ class SlotManager:
 
     # -- Internal helpers -----------------------------------------------------
 
+    @staticmethod
+    def _format_start(template: str, fmt: dict) -> str:
+        """``str.format`` the start command, treating unknown ``{...}`` as literal text.
+
+        Some apps embed JSON in their start command (recipya pre-writes a config.json
+        containing ``{\\"server\\":{...}}``). Plain ``.format()`` reads those braces as
+        placeholders and dies with ``KeyError: '\\"server\\"'``, so every task using that
+        app fails in prepare. Escape any brace group that is not one of ``fmt``'s keys,
+        then format normally — apps.yaml stays readable and future embedded JSON is safe.
+        """
+        # Escape EVERY brace first, then un-escape the known placeholders. Doing it the
+        # other way round (find literals, escape them) cannot handle nested JSON such as
+        # `{\"server\":{\"port\":8078}}`, where a regex without recursion only sees the
+        # inner object and leaves the outer `{` dangling.
+        escaped = template.replace("{", "{{").replace("}", "}}")
+        for key in fmt:
+            escaped = escaped.replace("{{" + key + "}}", "{" + key + "}")
+        return escaped.format(**fmt)
+
     def _start_one(self, app: str, hostname: str) -> None:
         cfg = self._get(app)
         port = self.get_port(app)
@@ -232,7 +252,7 @@ class SlotManager:
             pg_offset = cfg.get("pg_port_offset")
             if pg_offset is not None:
                 fmt["pg_port"] = port + int(pg_offset)
-            cmd = cfg["start"].format(**fmt)
+            cmd = self._format_start(cfg["start"], fmt)
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(f"[slot {self.slot_id}] failed to start {app}: {r.stderr.strip()}")

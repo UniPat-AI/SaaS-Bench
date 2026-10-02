@@ -16,6 +16,11 @@
 #   health_required_markers: optional response substrings that must appear in every probed body
 #   compose_health_services: optional compose service suffixes inspected for healthy/running state
 #   startup_wait         : MAX seconds to wait for readiness; raises if not ready in time
+#   cpu / memory         : (optional) per-app CPU/memory requests for the hosted playground.
+#   cpu_limit / memory_limit: optional limits; fall back to the corresponding request when omitted.
+#                          Heavy apps use larger requests and limits than the chart defaults. No
+#                          effect on the local docker-run path. The same request/limit convention
+#                          applies to ephemeral_storage and the sidecar_* fields.
 #   start_type: compose  : uses compose_template_file instead of docker run
 #   compose_template_file: path to .yml.tpl; $prefix, $port, $hostname substituted
 #   compose_volumes      : named volume suffixes to remove on stop
@@ -30,7 +35,7 @@ apps:
     container_port: 8080
     start: >-
       docker run -d --name {container}
-      -e PASSWORD=8a128206e2177bce1e48e565 -u 0
+      -e PASSWORD=8a128206e2177bce1e48e565
       -p {port}:8080
       code-server-bundle:latest
     health_path: "/"
@@ -40,9 +45,21 @@ apps:
     app_index: 1
     fixed_port: 6047
     container_port: 80
+    # HTTPS=false for the local path: agents browse plain http://{hostname}:{port} directly, and
+    # HTTPS=true makes OpenProject 301 every request to https:// on a port that serves plain HTTP
+    # (ERR_SSL_PROTOCOL_ERROR in the browser; the /health_checks probe is exempt, so readiness
+    # still passes and the breakage is invisible to slot.py). The k8s deployment must override
+    # this to true — its run router supplies X-Forwarded-Proto: https on every app request, and
+    # cookies/CSRF origin need to agree with the browser-facing https origin there.
     start: "docker run -d --name {container} -p {port}:80 -e OPENPROJECT_HOST__NAME={hostname}:{port} -e OPENPROJECT_HTTPS=false -e SECRET_KEY_BASE=secret mw-openproject:latest"
     health_path: "/health_checks/default"
-    startup_wait: 360
+    startup_wait: 900
+    # Rails + embedded Postgres: starves on the 250m default (didn't bind :80 in 16m on Autopilot);
+    # boots in ~3m with a dedicated 2 CPU. Measured 2026-06-16.
+    cpu: "4"
+    cpu_limit: "8"
+    memory: "8Gi"
+    memory_limit: "16Gi"
 
   metabase:
     app_index: 2
@@ -60,6 +77,12 @@ apps:
     start: "docker run -d --name {container} -p {port}:6806 -p {pg_port}:5432 -e BASEROW_PUBLIC_URL=http://{hostname}:{port} mw-baserow:latest"
     health_path: "/login"
     startup_wait: 600
+    # Embedded Postgres+Redis+Django: a near-miss on the 250m default (~10m, right at its budget).
+    # Dedicated CPU keeps it comfortably inside the window.
+    cpu: "4"
+    cpu_limit: "8"
+    memory: "8Gi"
+    memory_limit: "16Gi"
 
   # -- Business Operations & Finance ----------------------------------------
 
@@ -67,9 +90,27 @@ apps:
     app_index: 4
     fixed_port: 6039
     container_port: 3000
-    start: "docker run -d --name {container} -p {port}:3000 -e SERVER_URL=http://{hostname}:{port} mw-twenty:latest"
+    # The image ships Twenty's default opportunity pipeline (NEW/SCREENING/MEETING/PROPOSAL/
+    # CUSTOMER) but several Business tasks ask for stage 'Won'/'Lost', which is therefore
+    # unreachable in the UI and unsatisfiable for the verifier. The fixture that adds those two
+    # values — to both the per-workspace enum and the Select field's option JSON, idempotently —
+    # is BAKED INTO the image at /opt/saas-bench/, along with the script that applies it.
+    #
+    # The image's entrypoint applies it and then hands off to the app unchanged, so `start` is a
+    # plain `docker run` with nothing to quote. It used to arrive as a bind mount plus an inline
+    # `sh -c` apply loop, which was wrong in two ways: the Kubernetes run chart cannot mount host
+    # paths, so the fixture silently never applied there; and the loop had to survive YAML ->
+    # str.format -> host shell -> docker -> container sh, five layers of quoting that cost two
+    # silent failures. Applied on each start rather than baked into the image's Postgres because
+    # Twenty's boot metadata sync overwrites fieldMetadata.options.
+    start: >-
+      docker run -d --name {container} -p {port}:3000 -e SERVER_URL=http://{hostname}:{port}
+      mw-twenty:latest
     health_path: "/healthz"
-    startup_wait: 360
+    # 360s was enough standalone (60s cold start) but not under concurrency: a 6-worker rerun
+    # on 2026-09-14 lost three tasks to `twenty not ready in 360s` while the host sat at a
+    # 15-min load average above 2000. hrms already gets 2100 for the same reason.
+    startup_wait: 900
 
   bigcapital:
     app_index: 5
@@ -83,28 +124,39 @@ apps:
     app_index: 6
     fixed_port: 6077
     container_port: 8000
-    start: "docker run -d --name {container} -p {port}:8000 mw-hrms:latest"
+    # The seeded "Provident Fund" Salary Component ships with an empty `component_type`, and
+    # HRMS's Provident Fund Deductions report gates on that field rather than the component
+    # name, so it returned 0 rows AND 0 columns under every filter even though all 15 submitted
+    # salary slips carry a PF deduction. The fixture that sets the field (idempotent) is BAKED INTO
+    # the image at /opt/saas-bench/, along with the script that applies it; the report then returns
+    # 15 rows totalling 70,680, which is what business_065 expects. It used to arrive as a bind
+    # mount, which the Kubernetes run chart cannot do — so the fixture silently never applied there.
+    #
+    # The image's own entrypoint ends in `exec bench start` and ignores its arguments, so the
+    # fixture cannot ride in as a command; it used to need `--entrypoint sh`, which app_spec's
+    # parse_docker_run silently DROPS — on Kubernetes that left `command: ["-c", ...]`, overriding
+    # the image entrypoint and CrashLooping. The baked wrapper entrypoint removes the need for it.
+    # MariaDB is started by that same entrypoint, which is why the baked script waits for the table.
+    start: >-
+      docker run -d --name {container} -p {port}:8000 mw-hrms:latest
+    # First boot imports the full seed DB; measured >20min under 26-way concurrent cold
+    # starts (IO contention with openproject/openemr) — 1200s fired mid-import.
     health_path: "/"
-    startup_wait: 1200
+    startup_wait: 2100
 
   pretix:
     app_index: 7
     fixed_port: 6089
-    container_port: 80
-    start: >-
-      docker run -d --name {container} -p {port}:80
-      -e PRETIX_URL=http://{hostname}:{port}
-      --entrypoint /bin/bash
-      mw-pretix:latest
-      -lc "sed -i 's|^url=.*|url=http://{hostname}:{port}|' /etc/pretix/pretix.cfg && exec /entrypoint-mw.sh all"
-    health_path: "/control/login"
-    extra_health_paths:
-      - "/control/"
-    health_bad_markers:
-      - "Internal Server Error"
-      - "Unknown host"
-      - "no access to any events"
-    startup_wait: 600
+    start_type: compose
+    compose_template_file: docker/pretix.yml.tpl
+    compose_volumes:
+      - -data
+      - -db-data
+      - -redis-data
+    health_path: "/control/login/"
+    # Fresh (public, unseeded) postgres -> pretix runs its full Django migration set on first boot,
+    # which overran 600s. Give it room.
+    startup_wait: 1200
 
   # -- Healthcare Administration ---------------------------------------------
 
@@ -112,15 +164,132 @@ apps:
     app_index: 8
     fixed_port: 6085
     container_port: 80
-    start: "docker run -d --name {container} -p {port}:80 mw-openemr:latest"
+    # The baked database enables ICD10/CPT code types but ships no entries for either one. Fee
+    # Sheet search reads `codes`, so every benchmark-requested diagnosis/procedure search otherwise
+    # returns "No results found". The image also contains the Transfer Summary form files without
+    # installing their table/registry row, lacks the Follow-Up calendar category, and omits two
+    # Procedure Order providers plus one lab that tasks explicitly require. Install this small
+    # benchmark compatibility fixture idempotently before Apache becomes healthy. It can retire
+    # when the mw-openemr image carries the same fixture itself.
+    # NOTE: no shell variables ($!, $app_pid) in this script — the local path runs it through the
+    # host shell (subprocess shell=True), which expands $-vars inside double quotes to empty
+    # strings before docker sees them (`wait ""` -> exit 2). The fixture runs as a background
+    # subshell and the entrypoint execs in the foreground, so nothing needs a PID.
+    start: >-
+      docker run -d --name {container} -p {port}:80 mw-openemr:latest
+      sh -c "(set -e; until mysql -uopenemr -popenemr_pass -Dopenemr -N -B
+      -e \"SELECT 1 FROM patient_data LIMIT 1\" >/dev/null 2>&1; do sleep 2; done;
+      mysql -uopenemr -popenemr_pass -Dopenemr
+      < /var/www/localhost/htdocs/openemr/interface/forms/transfer_summary/table.sql;
+      mysql -uopenemr -popenemr_pass -Dopenemr -e \"INSERT INTO codes
+      (code_text,code_text_short,code,code_type,modifier,units,fee,superbill,related_code,taxrates,
+      cyp_factor,active,reportable,financial_reporting,revenue_code)
+      SELECT catalog.description,catalog.description,catalog.code,catalog.code_type,'',1,0,'','','',
+      0,1,0,0,'' FROM (
+      SELECT 'I50.22' code,'Chronic systolic heart failure' description,102 code_type
+      UNION ALL SELECT 'J18.9','Pneumonia, unspecified organism',102
+      UNION ALL SELECT 'J96.01','Acute respiratory failure with hypoxia',102
+      UNION ALL SELECT 'M16.11','Unilateral primary osteoarthritis, right hip',102
+      UNION ALL SELECT 'Z47.1','Orthopedic aftercare following joint replacement',102
+      UNION ALL SELECT 'Z00.129','Routine child health examination without abnormal findings',102
+      UNION ALL SELECT 'Z71.3','Dietary counseling and surveillance',102
+      UNION ALL SELECT 'Z00.00','General adult medical examination without abnormal findings',102
+      UNION ALL SELECT 'B26.9','Mumps without complication',102
+      UNION ALL SELECT 'K11.20','Sialoadenitis, unspecified',102
+      UNION ALL SELECT 'I20.9','Angina pectoris, unspecified',102
+      UNION ALL SELECT 'R07.9','Chest pain, unspecified',102
+      UNION ALL SELECT 'K62.5','Hemorrhage of anus and rectum',102
+      UNION ALL SELECT 'A49.02','Methicillin resistant Staphylococcus aureus infection, unspecified site',102
+      UNION ALL SELECT 'A04.7','Enterocolitis due to Clostridium difficile',102
+      UNION ALL SELECT 'I10','Essential hypertension',102
+      UNION ALL SELECT 'E11.9','Type 2 diabetes mellitus without complications',102
+      UNION ALL SELECT '45378','Diagnostic colonoscopy',1
+      UNION ALL SELECT '78452','Myocardial perfusion imaging',1
+      UNION ALL SELECT '99214','Office or other outpatient visit',1
+      UNION ALL SELECT '99403','Preventive medicine counseling',1
+      ) catalog LEFT JOIN codes existing ON existing.code_type=catalog.code_type
+      AND existing.code=catalog.code AND existing.modifier=''
+      WHERE existing.id IS NULL;
+      INSERT INTO registry
+      (name,state,directory,sql_run,unpackaged,date,priority,category,nickname,
+      patient_encounter,therapy_group_encounter,aco_spec)
+      SELECT 'Transfer Summary',1,'transfer_summary',1,1,CURRENT_DATE,0,'Clinical','',
+      1,0,'encounters|notes' WHERE NOT EXISTS
+      (SELECT 1 FROM registry WHERE directory='transfer_summary');
+      INSERT INTO openemr_postcalendar_categories
+      (pc_constant_id,pc_catname,pc_catcolor,pc_catdesc,pc_duration,pc_cattype,
+      pc_active,pc_seq,aco_spec)
+      SELECT 'follow_up','Follow-Up','#c0e6ff','Follow-up appointment',900,0,1,16,
+      'encounters|notes' WHERE NOT EXISTS
+      (SELECT 1 FROM openemr_postcalendar_categories WHERE pc_catname='Follow-Up');
+      INSERT INTO procedure_providers
+      (uuid,name,npi,send_app_id,send_fac_id,recv_app_id,recv_fac_id,DorP,direction,protocol,
+      remote_host,login,password,orders_path,results_path,notes,lab_director,active,type)
+      SELECT UNHEX(REPLACE(UUID(),'-','')),'Dr. Krystyna Reinger','','','','','','D','B','DL',
+      '','','','','',NULL,0,1,NULL WHERE NOT EXISTS
+      (SELECT 1 FROM procedure_providers WHERE name='Dr. Krystyna Reinger');
+      INSERT INTO procedure_providers
+      (uuid,name,npi,send_app_id,send_fac_id,recv_app_id,recv_fac_id,DorP,direction,protocol,
+      remote_host,login,password,orders_path,results_path,notes,lab_director,active,type)
+      SELECT UNHEX(REPLACE(UUID(),'-','')),'Riverside Medical Center','','','','','','D','B','DL',
+      '','','','','',NULL,0,1,NULL WHERE NOT EXISTS
+      (SELECT 1 FROM procedure_providers WHERE name='Riverside Medical Center');
+      INSERT INTO procedure_type
+      (parent,name,lab_id,procedure_code,procedure_type,body_site,specimen,route_admin,laterality,
+      description,standard_code,related_code,units,seq,activity,notes,transport,procedure_type_name)
+      SELECT 0,'Mumps IgM/IgG Serology with RT-PCR Buccal Swab',
+      (SELECT ppid FROM procedure_providers WHERE name='Riverside Medical Center'),
+      'MUMPS-PCR','ord','','','','',
+      'Mumps serology and RT-PCR buccal swab','','','',16,1,'',NULL,NULL WHERE NOT EXISTS
+      (SELECT 1 FROM procedure_type
+      WHERE name='Mumps IgM/IgG Serology with RT-PCR Buccal Swab');
+      INSERT INTO procedure_type
+      (parent,name,lab_id,procedure_code,procedure_type,body_site,specimen,route_admin,laterality,
+      description,standard_code,related_code,units,seq,activity,notes,transport,procedure_type_name)
+      SELECT 0,'Complete Blood Count',
+      (SELECT ppid FROM procedure_providers WHERE name='Dr. Krystyna Reinger'),
+      'CBC-85025','ord','','','','',
+      'Complete blood count with differential','CPT4:85025','','',17,1,'',NULL,NULL
+      WHERE NOT EXISTS (SELECT 1 FROM procedure_type WHERE name='Complete Blood Count'
+      AND lab_id=(SELECT ppid FROM procedure_providers WHERE name='Dr. Krystyna Reinger'));
+      INSERT INTO list_options
+      (list_id,option_id,title,seq,is_default,option_value,mapping,notes,codes,activity)
+      SELECT 'reaction','anaphylactoid_hypotension','Anaphylactoid reaction with hypotension',
+      95,0,0,'','','',1 WHERE NOT EXISTS (SELECT 1 FROM list_options
+      WHERE list_id='reaction' AND title='Anaphylactoid reaction with hypotension');\"
+      || echo '[openemr fixture] FAILED' >&2) &
+      exec /entrypoint-wrapper.sh"
     health_path: "/interface/login/login.php?site=default"
     startup_wait: 1200
+    # Heavy LAMP stack; on Autopilot it was evicted by the 1Gi ephemeral default (writes logs/temp
+    # beyond it) and starved at 250m. Give it dedicated CPU + headroom ephemeral storage.
+    cpu: "4"
+    cpu_limit: "8"
+    memory: "8Gi"
+    memory_limit: "16Gi"
+    ephemeral_storage: "8Gi"
+    ephemeral_storage_limit: "8Gi"
 
   opnform:
     app_index: 9
     fixed_port: 6046
     container_port: 8080
-    start: "docker run -d --name {container} -p {port}:8080 -e APP_URL=http://{hostname}:{port} mw-opnform:latest"
+    # The baked seed restores 60 rows into `forms` without advancing `forms_id_seq`, which is left
+    # at 1. Every form insert then collides on forms_pkey ("Key (id)=(1) already exists"), Laravel
+    # returns 500, and the builder shows "An error occurred while saving the form, please try
+    # again." — so no agent could ever persist a form. Realign the sequence with the table's max id
+    # once Postgres is serving. The statement is idempotent and only ever moves the sequence to the
+    # current max, so re-running it during the first-boot restore window is harmless; the loop
+    # simply outlasts that window. Fixing the image seed is the upstream-proper fix (the mw-* images
+    # are prebuilt artifacts this repo only loads), and this override can retire with it.
+    start: >-
+      docker run -d --name {container} -p {port}:8080
+      -e APP_URL=http://{hostname}:{port}
+      mw-opnform:latest
+      sh -c "( for i in 1 2 3 4 5 6 7 8 9 10; do sleep 12; psql -h 127.0.0.1 -U forge -d forge
+      -Atq -c \"SELECT setval(pg_get_serial_sequence('public.forms','id'),
+      GREATEST((SELECT MAX(id) FROM public.forms),1))\" >/dev/null 2>&1; done ) &
+      exec /entrypoint.sh"
     health_path: "/"
     health_bad_markers:
       - "An error occurred while saving the form"
@@ -146,21 +315,33 @@ apps:
       - _ds_cache
       - _ds_files
       - _ds_fonts
-    health_path: "/Auth.aspx"
-    extra_health_paths:
-      - "/Products/Files/Default.aspx"
-      - "/ds-vpath/healthcheck"
-    health_bad_markers:
-      - "Runtime Error"
-      - "Service Unavailable"
-      - "502 Bad Gateway"
-      - "503 Service Temporarily Unavailable"
-    compose_health_services:
-      - mysql
-      - elasticsearch
-      - documentserver
-      - community
-    startup_wait: 600
+    # The portal root can answer before the seeded database and portal services are usable.
+    # Capabilities is the first unauthenticated API the real client needs and returned 200 only
+    # after the full stack completed warm-up in staging acceptance.
+    health_path: "/api/2.0/capabilities.json"
+    startup_wait: 360
+    # 4-container stack: community (mono/.NET, 22 services under supervisord) + mysql + ES + ds.
+    # cpu/memory size the community (web) container; sidecar_* size mysql/ES/ds. ephemeral_storage
+    # caps emptyDir+logs (Autopilot's 1Gi default evicts the data-heavy ds/community). Per-pod
+    # ephemeral sum stays under Autopilot's ~10Gi cap (3 + 3*2 = 9Gi). Hosted-playground only.
+    cpu: "4"
+    cpu_limit: "6"
+    memory: "8Gi"
+    memory_limit: "12Gi"
+    ephemeral_storage: "3Gi"
+    ephemeral_storage_limit: "3Gi"
+    sidecar_cpu: "2"
+    sidecar_cpu_limit: "3"
+    sidecar_memory: "4Gi"
+    sidecar_memory_limit: "6Gi"
+    sidecar_ephemeral_storage: "2Gi"
+    sidecar_ephemeral_storage_limit: "2Gi"
+    # Volume mountpaths holding baked seed data to copy into the emptyDir (k8s drops it; see
+    # render_compose_values). The seeded MySQL DB, the portal data, and the documentserver fonts.
+    seed_volumes:
+      - /var/lib/mysql
+      - /var/www/onlyoffice/Data
+      - /usr/share/fonts
 
   mattermost:
     app_index: 11
@@ -177,6 +358,10 @@ apps:
       - -pg-data
     health_path: "/api/v4/system/ping"
     startup_wait: 360
+    # Only the seeded postgres data needs preserving (k8s emptyDir drops it). The mattermost app
+    # image is shell-less and DB-backed, so its volumes are left as fresh emptyDir (not seeded).
+    seed_volumes:
+      - /var/lib/postgresql/data
 
   owncloud:
     app_index: 12
@@ -217,7 +402,14 @@ apps:
     app_index: 14
     fixed_port: 7079
     container_port: 80
-    start: "docker run -d --name {container} -p {port}:80 mw-grocy:latest"
+    # Grocy builds absolute browser URLs from BASE_URL and does not infer the public scheme from
+    # X-Forwarded-Proto. Without this override, the HTTPS login form posts to http:// and Chrome
+    # blocks authentication as mixed content. Grocy natively maps GROCY_BASE_URL to BASE_URL; the
+    # hosted renderer canonicalizes this placeholder to https://<per-run-host>.
+    start: >-
+      docker run -d --name {container} -p {port}:80
+      -e GROCY_BASE_URL=http://{hostname}:{port}
+      mw-grocy:latest
     health_path: "/"
     startup_wait: 60
 
@@ -225,7 +417,15 @@ apps:
     app_index: 15
     fixed_port: 7033
     container_port: 8078
-    start: "docker run -d --name {container} -p {port}:8078 -e RECIPYA_SERVER_URL=http://{hostname}:{port} mw-recipya:latest"
+    # recipya's first-boot config wizard assigns a RANDOM listen port (e.g. 36299/38373) and ignores
+    # RECIPYA_SERVER_* env, so the fixed-port readiness probe on 8078 never matches and prepare times
+    # out. Pre-write config.json with port 8078 (if absent) before serving so the wizard is skipped
+    # and recipya binds 8078. The seeded recipe DB lives in a separate dir and is untouched.
+    start: >-
+      docker run -d --name {container} -p {port}:8078
+      -e RECIPYA_SERVER_URL=http://{hostname}:{port}
+      mw-recipya:latest
+      sh -c 'mkdir -p /root/.config/Recipya; [ -f /root/.config/Recipya/config.json ] || printf %s "{\"server\":{\"port\":8078,\"isProduction\":true,\"url\":\"http://0.0.0.0\"}}" > /root/.config/Recipya/config.json; exec /app/recipya serve'
     health_path: "/"
     startup_wait: 60
 

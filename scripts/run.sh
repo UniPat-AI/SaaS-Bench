@@ -29,7 +29,7 @@ export BROWSER_USE_LOGGING_LEVEL=warning
 
 # -- Default arguments -------------------------------------------------------
 TASKS_DIR="${REPO_ROOT}/tasks"
-MODEL="${LLM_MODEL:-claude-opus-4-6}"
+MODEL="${LLM_MODEL:-}"          # no default: valid names depend on your LLM_BASE_URL endpoint
 WORKERS=4
 MAX_STEPS=400
 HOSTNAME_VAL="localhost"
@@ -38,6 +38,7 @@ APPS_YAML="${REPO_ROOT}/saas_bench/apps.yaml"
 NO_ISOLATION=""
 TASK_IDS=""
 LOG_FILE=""
+AGENT_MODULE=""
 
 # -- Argument parsing --------------------------------------------------------
 usage() {
@@ -46,7 +47,9 @@ Usage: $(basename "$0") [options]
 
 Options:
   --tasks-dir <path>      Task directory root (default: rollout/tasks)
-  --model <name>          LLM model name (default: claude-opus-4-6)
+  --model <name>          LLM model name (default: $LLM_MODEL from .env; required)
+  --agent-module <mod>    Python module exposing run_task (bring-your-own-agent seam;
+                          e.g. saas_bench.harness.kimi_code). Default: stock browser-use agent
   --workers <n>           Number of concurrent workers (default: 3)
   --max-steps <n>         Max steps per task (default: 400)
   --hostname <host>       Hostname the agent uses to access apps (default: localhost)
@@ -79,6 +82,7 @@ while [[ $# -gt 0 ]]; do
             done
             ;;
         --log)         LOG_FILE="$2";        shift 2 ;;
+        --agent-module) AGENT_MODULE="$2";   shift 2 ;;
         -h|--help)     usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -95,6 +99,12 @@ fi
 
 if [[ -z "${LLM_API_KEY:-}" || -z "${LLM_BASE_URL:-}" ]]; then
     echo "[ERROR] LLM_API_KEY / LLM_BASE_URL not set; please cp .env.example .env, fill it in, and retry" >&2
+    exit 1
+fi
+
+if [[ -z "$MODEL" ]]; then
+    echo "[ERROR] no model selected: set LLM_MODEL in .env or pass --model <name>." >&2
+    echo "        There is no default because valid model names depend on your LLM_BASE_URL endpoint." >&2
     exit 1
 fi
 
@@ -141,6 +151,7 @@ CMD=(
 )
 
 [[ -n "$NO_ISOLATION" ]] && CMD+=("$NO_ISOLATION")
+[[ -n "$AGENT_MODULE" ]] && CMD+=(--agent-module "$AGENT_MODULE")
 
 if [[ -n "$TASK_IDS" ]]; then
     CMD+=(--task-ids)

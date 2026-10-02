@@ -1,9 +1,11 @@
 """
 Verifier for Teamwork-043-I3: Archive expiring PPT files and notify stakeholders
 
-Checks: 13 weighted checks across owncloud, onlyoffice, mattermost, roundcubemail.
-Strategy: docker exec DB for owncloud/mattermost/roundcubemail,
-          REST API for onlyoffice, docker exec maildir for roundcubemail email.
+Checks: 14 weighted checks (20 pt) across owncloud, onlyoffice, mattermost, roundcubemail.
+Strategy: docker exec DB queries (ownCloud MariaDB, OnlyOffice MySQL, Mattermost Postgres,
+          Roundcube MariaDB), REST API for OnlyOffice sharing, xlsx content probes read
+          from the OnlyOffice data dir (API download fallback), and raw Maildir parsing
+          of the sender's mail copies (docker exec + Python email stdlib).
 
 Required env vars:
   SERVER_HOSTNAME,
@@ -13,9 +15,17 @@ Required env vars:
   ROUNDCUBEMAIL_PORT, ROUNDCUBEMAIL_CONTAINER, ROUNDCUBEMAIL_DB_CONTAINER
 """
 
+import email
+import email.message
+import io
 import os
-import sys
+import re
 import subprocess
+import sys
+import zipfile
+from email.header import decode_header
+from email.utils import getaddresses
+
 import requests
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
@@ -63,36 +73,102 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
     return r.returncode, r.stdout, r.stderr
 
 
+def _docker_cat_bytes(container: str, path: str, timeout: int = 30) -> bytes | None:
+    r = subprocess.run(
+        ["docker", "exec", container, "cat", path],
+        capture_output=True, timeout=timeout,
+    )
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return r.stdout
+
+
 def oc_db(sql: str) -> str:
     """Query ownCloud MariaDB."""
-    _, out, _ = docker_exec(
+    # -h 127.0.0.1: the ownCloud MariaDB image ships anonymous ''@'localhost'
+    # users that shadow 'owncloud'@'%' over the unix socket.
+    rc, out, err = docker_exec(
         OWNCLOUD_DB_CONTAINER,
-        "mysql", "--default-character-set=utf8mb4",
+        "mysql", "-h", "127.0.0.1", "--default-character-set=utf8mb4",
         "-u", "owncloud", "-powncloud", "owncloud", "-N", "-e", sql,
     )
+    if rc != 0:
+        raise RuntimeError(f"owncloud mysql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
+    return out.strip()
+
+
+def oo_db(sql: str) -> str:
+    """Query OnlyOffice MySQL."""
+    rc, out, err = docker_exec(
+        ONLYOFFICE_DB_CONTAINER,
+        "mysql", "-u", "onlyoffice_user", "-ponlyoffice_pass",
+        "--default-character-set=utf8mb4", "-N", "-B", "onlyoffice", "-e", sql,
+    )
+    if rc != 0:
+        raise RuntimeError(f"onlyoffice mysql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
     return out.strip()
 
 
 def mm_db(sql: str) -> str:
     """Query Mattermost PostgreSQL."""
-    _, out, _ = docker_exec(
+    rc, out, err = docker_exec(
         MATTERMOST_DB_CONTAINER,
         "psql", "-U", "mmuser", "-d", "mattermost", "-t", "-A", "-c", sql,
     )
+    if rc != 0:
+        raise RuntimeError(f"mattermost psql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
     return out.strip()
 
 
 def rc_db(sql: str) -> str:
     """Query Roundcube MariaDB."""
-    _, out, _ = docker_exec(
+    rc, out, err = docker_exec(
         ROUNDCUBEMAIL_DB_CONTAINER,
         "mysql", "--default-character-set=utf8mb4",
         "-u", "roundcube", "-proundcube123", "roundcubemail", "-N", "-e", sql,
     )
+    if rc != 0:
+        raise RuntimeError(f"roundcube mysql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
     return out.strip()
 
 
+def _sql_in_list(values: list[str]) -> str:
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+def _oc_count_paths(paths: list[str]) -> int:
+    """COUNT(*) of exact paths in admin's home storage."""
+    out = oc_db(
+        "SELECT COUNT(*) FROM oc_filecache fc "
+        "JOIN oc_storages s ON fc.storage = s.numeric_id "
+        f"WHERE s.id = 'home::admin' AND fc.path IN ({_sql_in_list(paths)});"
+    )
+    return int(out or "0")
+
+
+def _oc_tagged_count(paths: list[str], tag: str) -> int:
+    """COUNT(DISTINCT fileid) of exact paths carrying a system tag."""
+    out = oc_db(
+        "SELECT COUNT(DISTINCT fc.fileid) FROM oc_filecache fc "
+        "JOIN oc_storages s ON fc.storage = s.numeric_id "
+        "JOIN oc_systemtag_object_mapping m ON m.objectid = CAST(fc.fileid AS CHAR) "
+        "AND m.objecttype = 'files' "
+        f"JOIN oc_systemtag t ON t.id = m.systemtagid AND t.name = '{tag}' "
+        "WHERE s.id = 'home::admin' "
+        f"AND fc.path IN ({_sql_in_list(paths)});"
+    )
+    return int(out or "0")
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
+ORIGINAL_FILES = [
+    "IDCC2022_FosterinCollaborationDMP_JAC.pptx",
+    "Ionescu_S1.pptx",
+    "Li_et_al_ESR1_mutations_paper_updated_SM.pptx",
+    "Module5-Repositories_presentation.pptx",
+    "Fathallah_Exeter University_November 2023_slides.pptx",
+]
+
 EXPIRED_FILES = [
     "IDCC2022_FosterinCollaborationDMP_JAC_EXPIRED_2025-09-30.pptx",
     "Ionescu_S1_EXPIRED_2025-09-30.pptx",
@@ -109,128 +185,153 @@ REPLACEMENT_FILES = [
     "Fathallah_Exeter_University_November_2023_slides_2025Q4.txt",
 ]
 
+RETIRED_DIR = "files/ppt/Retired_2025Q3"
+EXPIRED_PATHS = [f"{RETIRED_DIR}/{n}" for n in EXPIRED_FILES]
+ORIGINAL_PATHS = [f"files/ppt/{n}" for n in ORIGINAL_FILES]
+REPLACEMENT_PATHS = [f"files/ppt/{n}" for n in REPLACEMENT_FILES]
 
-# ── Individual checks ─────────────────────────────────────────────────────────
+OO_SHEET_TITLE = "Presentation_Renewal_Register_2025Q3"
+XLSX_HEADERS = ["Document Name", "Archived Filename", "Replacement Filename"]
 
-def check_1_retired_folder() -> None:
-    """Verify Retired_2025Q3 folder exists inside ppt in ownCloud."""
-    try:
-        result = oc_db(
-            "SELECT COUNT(*) FROM oc_filecache "
-            "WHERE path LIKE '%/ppt/Retired\\_2025Q3' "
-            "OR path = 'files/ppt/Retired_2025Q3'"
+MM_NOTICE_FRAGMENT = "Presentation Document Renewal Notice"
+MM_NOTICE_MAPPINGS = [
+    f"{orig} -> {repl}" for orig, repl in zip(ORIGINAL_FILES, REPLACEMENT_FILES)
+]
+MM_DM_FRAGMENT = "presentation files you previously contributed"
+MM_DM_ANCHOR = (
+    "Hi research team, the presentation files you previously contributed to in "
+    "/ppt have been retired as of 2025-10-01. Please review the replacement "
+    "placeholder files in ownCloud and upload the updated content versions."
+)
+
+EMAIL_SUBJECT = "Q3 2025 Presentation Document Renewal Notification"
+EMAIL_TO_SET = {"compliance-oversight@regulator.gov"}
+EMAIL_BCC_SET = {"compliance-internal@mail.local"}
+EMAIL_BODY_PROBES = [
+    "IDCC2022_FosterinCollaborationDMP_JAC (replaced by IDCC2022_FosterinCollaborationDMP_JAC_2025Q4)",
+    "Ionescu_S1 (replaced by Ionescu_S1_2025Q4)",
+    "Li_et_al_ESR1_mutations_paper_updated_SM (replaced by Li_et_al_ESR1_mutations_paper_updated_SM_2025Q4)",
+    "Module5-Repositories_presentation (replaced by Module5-Repositories_presentation_2025Q4)",
+    "Fathallah_Exeter_University_November_2023_slides (replaced by Fathallah_Exeter_University_November_2023_slides_2025Q4)",
+    "Please acknowledge receipt",
+]
+
+RC_MAIL_BASE = "/var/mail/mail.local/james.whitfield"
+
+
+# ── Mail parsing helpers (raw Maildir + stdlib) ───────────────────────────────
+def _maildir_messages(folder: str) -> list[tuple[str, email.message.Message]]:
+    """Read raw RFC822 files from a Maildir++ folder (e.g. '.Sent') of the
+    sender's mailbox and parse them with the Python email stdlib."""
+    msgs: list[tuple[str, email.message.Message]] = []
+    for sub in ("cur", "new"):
+        d = f"{RC_MAIL_BASE}/{folder}/{sub}"
+        rc, out, _ = docker_exec(
+            ROUNDCUBEMAIL_CONTAINER, "bash", "-c",
+            f"ls -1 '{d}' 2>/dev/null || true", timeout=20,
         )
-        found = bool(result.strip()) and int(result) > 0
-        check("1. ownCloud: Retired_2025Q3 folder in ppt", 1, found,
-              "found" if found else "not found")
-    except Exception as e:
-        check("1. ownCloud: Retired_2025Q3 folder in ppt", 1, False, f"exception: {e}")
+        for fname in out.splitlines():
+            fname = fname.strip()
+            if not fname:
+                continue
+            raw = _docker_cat_bytes(ROUNDCUBEMAIL_CONTAINER, f"{d}/{fname}")
+            if raw:
+                msgs.append((f"{d}/{fname}", email.message_from_bytes(raw)))
+    return msgs
 
 
-def check_2_expired_files() -> None:
-    """Verify 5 expired/renamed files exist in Retired_2025Q3."""
+def _decode_hdr(value) -> str:
+    """RFC2047-decode a header value and collapse folded whitespace."""
+    if not value:
+        return ""
     try:
-        result = oc_db(
-            "SELECT name FROM oc_filecache "
-            "WHERE path LIKE '%/Retired\\_2025Q3/%' "
-            "AND name LIKE '%\\_EXPIRED\\_2025-09-30%'"
+        s = "".join(
+            part.decode(enc or "ascii", "replace") if isinstance(part, bytes) else part
+            for part, enc in decode_header(str(value))
         )
-        found_names = {n.strip() for n in result.split("\n") if n.strip()} if result else set()
-        found_count = sum(1 for ef in EXPIRED_FILES if ef in found_names)
-        missing = [ef for ef in EXPIRED_FILES if ef not in found_names]
-        detail = f"{found_count}/5 found"
-        if missing:
-            detail += f"; missing e.g. {missing[0][:50]}"
-        check("2. ownCloud: expired files in Retired_2025Q3", 2, found_count == 5, detail)
-    except Exception as e:
-        check("2. ownCloud: expired files in Retired_2025Q3", 2, False, f"exception: {e}")
+    except Exception:
+        s = str(value)
+    return " ".join(s.split())
 
 
-def check_3_archived_tags() -> None:
-    """Verify expired files tagged 'archived' and not 'pending'."""
-    try:
-        archived_count = int(oc_db(
-            "SELECT COUNT(DISTINCT fc.fileid) FROM oc_filecache fc "
-            "JOIN oc_systemtag_object_mapping m ON CAST(fc.fileid AS CHAR) = m.objectid "
-            "JOIN oc_systemtag st ON st.id = m.systemtagid "
-            "WHERE fc.path LIKE '%/Retired\\_2025Q3/%' "
-            "AND fc.name LIKE '%\\_EXPIRED\\_2025-09-30%' "
-            "AND m.objecttype = 'files' AND st.name = 'archived'"
-        ) or "0")
-        pending_count = int(oc_db(
-            "SELECT COUNT(DISTINCT fc.fileid) FROM oc_filecache fc "
-            "JOIN oc_systemtag_object_mapping m ON CAST(fc.fileid AS CHAR) = m.objectid "
-            "JOIN oc_systemtag st ON st.id = m.systemtagid "
-            "WHERE fc.path LIKE '%/Retired\\_2025Q3/%' "
-            "AND fc.name LIKE '%\\_EXPIRED\\_2025-09-30%' "
-            "AND m.objecttype = 'files' AND st.name = 'pending'"
-        ) or "0")
-        passed = archived_count >= 5 and pending_count == 0
-        check("3. ownCloud: expired files tagged archived/not pending", 2, passed,
-              f"archived={archived_count}, pending={pending_count}")
-    except Exception as e:
-        check("3. ownCloud: expired files tagged archived/not pending", 2, False, f"exception: {e}")
+def _addr_set(msg: email.message.Message, header: str) -> set[str]:
+    """Lower-cased set of addresses parsed from all instances of a header."""
+    return {addr.lower() for _, addr in getaddresses(msg.get_all(header) or []) if addr}
 
 
-def check_4_replacement_files() -> None:
-    """Verify 5 replacement .txt files exist in ppt folder (or subfolders)."""
-    try:
-        result = oc_db(
-            "SELECT name FROM oc_filecache "
-            "WHERE path LIKE '%/ppt/%' "
-            "AND path NOT LIKE '%/Retired\\_2025Q3/%' "
-            "AND name LIKE '%\\_2025Q4.txt'"
-        )
-        found_names = {n.strip() for n in result.split("\n") if n.strip()} if result else set()
-        found_count = sum(1 for rf in REPLACEMENT_FILES if rf in found_names)
-        check("4. ownCloud: replacement files in ppt", 2, found_count == 5,
-              f"{found_count}/5 found")
-    except Exception as e:
-        check("4. ownCloud: replacement files in ppt", 2, False, f"exception: {e}")
+def _body_text(msg: email.message.Message) -> str:
+    """Decoded, whitespace-normalized text of all text/* parts."""
+    chunks = []
+    for part in msg.walk():
+        if part.get_content_maintype() != "text":
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        chunks.append(payload.decode(charset, "replace"))
+    return " ".join(" ".join(chunks).split())
 
 
-def check_5_approved_tags() -> None:
-    """Verify replacement files tagged 'approved'."""
-    try:
-        approved_count = int(oc_db(
-            "SELECT COUNT(DISTINCT fc.fileid) FROM oc_filecache fc "
-            "JOIN oc_systemtag_object_mapping m ON CAST(fc.fileid AS CHAR) = m.objectid "
-            "JOIN oc_systemtag st ON st.id = m.systemtagid "
-            "WHERE fc.path LIKE '%/ppt/%' "
-            "AND fc.path NOT LIKE '%/Retired\\_2025Q3/%' "
-            "AND fc.name LIKE '%\\_2025Q4.txt' "
-            "AND m.objecttype = 'files' AND st.name = 'approved'"
-        ) or "0")
-        check("5. ownCloud: replacement files tagged approved", 1, approved_count >= 5,
-              f"{approved_count}/5 tagged")
-    except Exception as e:
-        check("5. ownCloud: replacement files tagged approved", 1, False, f"exception: {e}")
+def _subject_matches(msg: email.message.Message) -> bool:
+    return _decode_hdr(msg.get("Subject")) == EMAIL_SUBJECT
 
 
-def check_6_oo_spreadsheet() -> None:
-    """Verify Presentation_Renewal_Register_2025Q3 exists in OnlyOffice Common Docs."""
-    try:
-        base = f"http://{HOST}:{ONLYOFFICE_PORT}"
-        auth = requests.post(
-            f"{base}/api/2.0/authentication",
-            json={"userName": "admin@onlyoffice.local", "password": "NewAdmin123!"},
-            timeout=15,
-        )
-        token = auth.json()["response"]["token"]
-        hdrs = {"Authorization": f"Bearer {token}"}
-
-        resp = requests.get(f"{base}/api/2.0/files/@common", headers=hdrs, timeout=15)
-        data = resp.json().get("response", {})
-        files = data.get("files", []) if isinstance(data, dict) else []
-        found = any("Presentation_Renewal_Register_2025Q3" in f.get("title", "") for f in files)
-        check("6. OnlyOffice: spreadsheet exists", 1, found,
-              "found" if found else "not in Common Documents")
-    except Exception as e:
-        check("6. OnlyOffice: spreadsheet exists", 1, False, f"exception: {e}")
+_NOTICE_MSG_CACHE: tuple | None = None
 
 
-def _oo_get_file_id() -> tuple[str, str, int | None]:
-    """Authenticate to OnlyOffice and find the spreadsheet. Returns (base, token, file_id)."""
+def _find_renewal_msg() -> tuple[str | None, email.message.Message | None]:
+    """Locate the sent renewal email: Archive first (ck13 archives it), then Sent."""
+    global _NOTICE_MSG_CACHE
+    if _NOTICE_MSG_CACHE is None:
+        found: tuple = (None, None)
+        for folder in (".Archive", ".Sent"):
+            for path, msg in _maildir_messages(folder):
+                if _subject_matches(msg):
+                    found = (path, msg)
+                    break
+            if found[1] is not None:
+                break
+        _NOTICE_MSG_CACHE = found
+    return _NOTICE_MSG_CACHE
+
+
+# ── OnlyOffice document helpers (fs + API fetch chain) ───────────────────────
+def _xml_unescape(s: str) -> str:
+    s = s.replace("&quot;", '"').replace("&apos;", "'")
+    return s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _xml_texts(xml: str, tag: str) -> list[str]:
+    return [
+        _xml_unescape(m)
+        for m in re.findall(rf"<{tag}(?:\s[^>]*)?>(.*?)</{tag}>", xml, re.DOTALL)
+    ]
+
+
+def _oo_file_id_db() -> str:
+    out = oo_db(
+        "SELECT id FROM files_file "
+        f"WHERE title IN ('{OO_SHEET_TITLE}', '{OO_SHEET_TITLE}.xlsx') "
+        "ORDER BY id DESC LIMIT 1;"
+    )
+    return out.splitlines()[0].strip() if out.strip() else ""
+
+
+def _oo_content_bytes_fs(file_id: str, ext: str) -> bytes | None:
+    rc, out, _ = docker_exec(
+        ONLYOFFICE_CONTAINER, "bash", "-c",
+        f"find /var/www/onlyoffice/Data -type f -path '*file_{file_id}/*content.{ext}' "
+        "2>/dev/null | sort -V | tail -1",
+        timeout=30,
+    )
+    path = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if not path:
+        return None
+    return _docker_cat_bytes(ONLYOFFICE_CONTAINER, path)
+
+
+def _oo_auth_headers() -> dict:
     base = f"http://{HOST}:{ONLYOFFICE_PORT}"
     auth = requests.post(
         f"{base}/api/2.0/authentication",
@@ -238,25 +339,185 @@ def _oo_get_file_id() -> tuple[str, str, int | None]:
         timeout=15,
     )
     token = auth.json()["response"]["token"]
-    hdrs = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{base}/api/2.0/files/@common", headers=hdrs, timeout=15)
-    data = resp.json().get("response", {})
-    files = data.get("files", []) if isinstance(data, dict) else []
-    for f in files:
-        if "Presentation_Renewal_Register_2025Q3" in f.get("title", ""):
-            return base, token, f["id"]
-    return base, token, None
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _oo_content_bytes_api(file_id: str) -> bytes | None:
+    base = f"http://{HOST}:{ONLYOFFICE_PORT}"
+    hdrs = _oo_auth_headers()
+    r = requests.get(
+        f"{base}/products/files/httphandlers/filehandler.ashx",
+        params={"action": "download", "fileid": str(file_id)},
+        headers=hdrs, timeout=30, allow_redirects=True,
+    )
+    if r.status_code == 200 and len(r.content) > 100:
+        return r.content
+    r = requests.get(f"{base}/api/2.0/files/file/{file_id}/download",
+                     headers=hdrs, timeout=30, allow_redirects=True)
+    if r.status_code == 200 and len(r.content) > 100:
+        return r.content
+    return None
+
+
+def _oo_get_register_xlsx() -> tuple[bytes | None, str]:
+    """Fetch the renewal register xlsx: data dir first, HTTP download fallback."""
+    file_id = _oo_file_id_db()
+    if not file_id:
+        return None, "spreadsheet not found in files_file"
+    detail = ""
+    try:
+        data = _oo_content_bytes_fs(file_id, "xlsx")
+        if data:
+            return data, "fs (content.xlsx via docker exec)"
+        detail = "content.xlsx not found in data dir"
+    except Exception as e:
+        detail = f"fs read failed: {e}"
+    try:
+        data = _oo_content_bytes_api(file_id)
+        if data:
+            return data, "api download (fallback)"
+    except Exception as e:
+        return None, f"{detail}; api download failed: {e}"
+    return None, f"{detail}; api download failed"
+
+
+def _xlsx_cells_and_formulas(data: bytes) -> tuple[list[str], list[str]]:
+    """Return (sharedString cell values, formula texts)."""
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    cells: list[str] = []
+    try:
+        ss_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", "replace")
+        for si in re.findall(r"<si(?:\s[^>]*)?>(.*?)</si>", ss_xml, re.DOTALL):
+            cells.append("".join(_xml_texts(si, "t")).strip())
+    except KeyError:
+        pass
+    formulas: list[str] = []
+    for name in zf.namelist():
+        if name.startswith("xl/worksheets/") and name.endswith(".xml"):
+            xml = zf.read(name).decode("utf-8", "replace")
+            formulas.extend(_xml_texts(xml, "f"))
+    return cells, formulas
+
+
+# ── Individual checks ─────────────────────────────────────────────────────────
+
+def check_1_retired_folder() -> None:
+    """Verify Retired_2025Q3 folder exists at the exact path in ownCloud."""
+    try:
+        count = _oc_count_paths([RETIRED_DIR])
+        found = count >= 1
+        check("1. ownCloud: Retired_2025Q3 folder in ppt", 1, found,
+              "found" if found else f"{RETIRED_DIR} not found")
+    except Exception as e:
+        check("1. ownCloud: Retired_2025Q3 folder in ppt", 1, False, f"exception: {e}")
+
+
+def check_2_expired_files() -> None:
+    """Move+rename proven both ways: 5 exact EXPIRED paths exist in
+    Retired_2025Q3 AND the 5 original names are gone from files/ppt/."""
+    label = "2. ownCloud: expired files in Retired_2025Q3 (originals gone)"
+    try:
+        new_count = _oc_count_paths(EXPIRED_PATHS)
+        old_count = _oc_count_paths(ORIGINAL_PATHS)
+        passed = new_count == 5 and old_count == 0
+        check(label, 2, passed,
+              f"expired_paths={new_count}/5, original_paths_remaining={old_count}")
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
+def check_3_archived_tags() -> None:
+    """Each of the 5 exact archived paths tagged 'archived' and none 'pending'."""
+    label = "3. ownCloud: expired files tagged archived/not pending"
+    try:
+        archived_count = _oc_tagged_count(EXPIRED_PATHS, "archived")
+        pending_count = _oc_tagged_count(EXPIRED_PATHS, "pending")
+        passed = archived_count == 5 and pending_count == 0
+        check(label, 2, passed,
+              f"archived={archived_count}/5, pending={pending_count}")
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
+def check_4_replacement_files() -> None:
+    """Verify the 5 replacement .txt files exist at exact paths in files/ppt/."""
+    label = "4. ownCloud: replacement files in ppt"
+    try:
+        count = _oc_count_paths(REPLACEMENT_PATHS)
+        check(label, 1, count == 5, f"{count}/5 found at exact paths")
+    except Exception as e:
+        check(label, 1, False, f"exception: {e}")
+
+
+def check_5_approved_tags() -> None:
+    """Verify the 5 replacement files (exact paths) are tagged 'approved'."""
+    label = "5. ownCloud: replacement files tagged approved"
+    try:
+        approved_count = _oc_tagged_count(REPLACEMENT_PATHS, "approved")
+        check(label, 1, approved_count == 5, f"{approved_count}/5 tagged")
+    except Exception as e:
+        check(label, 1, False, f"exception: {e}")
+
+
+def check_6_oo_spreadsheet() -> None:
+    """Verify Presentation_Renewal_Register_2025Q3 exists (exact title)."""
+    try:
+        titles = {OO_SHEET_TITLE, OO_SHEET_TITLE + ".xlsx"}
+        base = f"http://{HOST}:{ONLYOFFICE_PORT}"
+        hdrs = _oo_auth_headers()
+        resp = requests.get(f"{base}/api/2.0/files/@common", headers=hdrs, timeout=15)
+        data = resp.json().get("response", {})
+        files = data.get("files", []) if isinstance(data, dict) else []
+        found = any(f.get("title", "") in titles for f in files)
+        check("6. OnlyOffice: spreadsheet exists", 1, found,
+              "found" if found else "not in Common Documents")
+    except Exception as e:
+        check("6. OnlyOffice: spreadsheet exists", 1, False, f"exception: {e}")
+
+
+def check_6b_oo_spreadsheet_content() -> None:
+    """Register xlsx: 3 headers, all 15 filenames, 'Documents Renewed' row,
+    and a COUNTA formula over column C."""
+    label = "6b. OnlyOffice: spreadsheet register content"
+    try:
+        data, source = _oo_get_register_xlsx()
+        if not data:
+            check(label, 2, False, f"could not read spreadsheet: {source}")
+            return
+        cells, formulas = _xlsx_cells_and_formulas(data)
+        cell_set = set(cells)
+
+        required_cells = (XLSX_HEADERS + ORIGINAL_FILES + EXPIRED_FILES
+                          + REPLACEMENT_FILES + ["Documents Renewed"])
+        missing = [c for c in required_cells if c not in cell_set]
+
+        counta_ok = any(re.search(r"COUNTA\(\s*\$?C", f, re.IGNORECASE)
+                        for f in formulas)
+
+        passed = not missing and counta_ok
+        details = []
+        if missing:
+            details.append(f"missing cells: {missing[:4]}")
+        if not counta_ok:
+            details.append(f"no COUNTA formula on column C (formulas={formulas[:3]})")
+        check(label, 2, passed,
+              "; ".join(details) if details else f"all probes found, source: {source}")
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_7_oo_sharing() -> None:
-    """Verify spreadsheet shared with Jun Chen (edit) and Laura Brown (view)."""
+    """Spreadsheet shared with jun.chen (edit, access==1) and laura.brown
+    (view, access==2); userName exact equality primary, displayName fallback."""
+    label = "7. OnlyOffice: spreadsheet sharing"
     try:
-        base, token, file_id = _oo_get_file_id()
-        if file_id is None:
-            check("7. OnlyOffice: spreadsheet sharing", 2, False, "file not found")
+        file_id = _oo_file_id_db()
+        if not file_id:
+            check(label, 2, False, "file not found")
             return
 
-        hdrs = {"Authorization": f"Bearer {token}"}
+        base = f"http://{HOST}:{ONLYOFFICE_PORT}"
+        hdrs = _oo_auth_headers()
         share_resp = requests.get(
             f"{base}/api/2.0/files/file/{file_id}/share", headers=hdrs, timeout=15,
         )
@@ -264,44 +525,58 @@ def check_7_oo_sharing() -> None:
         jun_edit = False
         laura_view = False
         for s in shares:
-            shared_to = s.get("sharedTo", {})
-            name = shared_to.get("displayName", "")
-            access = s.get("access", -1)
-            # OnlyOffice access levels: 0=FullAccess, 1=ReadWrite, 2=Read
-            if "Jun Chen" in name and access in (0, 1):
+            shared_to = s.get("sharedTo", {}) or {}
+            uname = str(shared_to.get("userName", ""))
+            dname = str(shared_to.get("displayName", ""))
+            try:
+                access = int(s.get("access", -1))
+            except (TypeError, ValueError):
+                access = -1
+            # OnlyOffice access levels: 1=ReadWrite (edit), 2=Read (view).
+            is_jun = uname == "jun.chen" or (not uname and dname == "Jun Chen")
+            is_laura = uname == "laura.brown" or (not uname and dname == "Laura Brown")
+            if is_jun and access == 1:
                 jun_edit = True
-            if "Laura Brown" in name and access == 2:
+            if is_laura and access == 2:
                 laura_view = True
         passed = jun_edit and laura_view
-        check("7. OnlyOffice: spreadsheet sharing", 2, passed,
-              f"Jun_edit={jun_edit}, Laura_view={laura_view}")
+        check(label, 2, passed,
+              f"jun_edit(access==1)={jun_edit}, laura_view(access==2)={laura_view}")
     except Exception as e:
-        check("7. OnlyOffice: spreadsheet sharing", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_8_mm_renewal_notice() -> None:
-    """Verify renewal notice posted in UX Research channel."""
+    """Renewal notice in UX Research (Product & Design team) lists all 5
+    'original -> replacement' mappings in a single post."""
+    label = "8. Mattermost: renewal notice in UX Research"
     try:
         result = mm_db(
             "SELECT p.message FROM posts p "
             "JOIN channels c ON p.channelid = c.id "
-            "WHERE c.displayname = 'UX Research' "
+            "JOIN teams t ON c.teamid = t.id "
+            "WHERE t.displayname = 'Product & Design' "
+            "AND c.displayname = 'UX Research' "
             "AND p.deleteat = 0 "
-            "AND p.message LIKE '%Presentation Document Renewal Notice%' "
-            "LIMIT 1"
+            f"AND p.message LIKE '%{MM_NOTICE_FRAGMENT}%';"
         )
-        found = bool(result) and "IDCC2022" in result and "Ionescu" in result
-        check("8. Mattermost: renewal notice in UX Research", 2, found,
-              "found with file refs" if found else "not found or incomplete")
+        probes = [MM_NOTICE_FRAGMENT + ":"] + MM_NOTICE_MAPPINGS
+        found = any(all(p in line for p in probes) for line in result.splitlines())
+        check(label, 2, found,
+              "single post with all 5 mappings" if found
+              else "no single post contains all 5 original -> replacement mappings")
     except Exception as e:
-        check("8. Mattermost: renewal notice in UX Research", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_9_mm_purpose() -> None:
-    """Verify UX Research channel purpose updated."""
+    """Verify UX Research channel purpose updated (Product & Design team)."""
     try:
         result = mm_db(
-            "SELECT purpose FROM channels WHERE displayname = 'UX Research' LIMIT 1"
+            "SELECT c.purpose FROM channels c "
+            "JOIN teams t ON c.teamid = t.id "
+            "WHERE t.displayname = 'Product & Design' "
+            "AND c.displayname = 'UX Research' LIMIT 1;"
         )
         expected = "track Q3 2025 presentation renewals"
         passed = expected in (result or "")
@@ -312,80 +587,107 @@ def check_9_mm_purpose() -> None:
 
 
 def check_10_mm_group_dm() -> None:
-    """Verify group DM sent to genesis, ginny, nilda."""
+    """Group DM whose member set is exactly {genesis, ginny, nilda, admin}
+    contains the full notification text."""
+    label = "10. Mattermost: group DM to genesis/ginny/nilda"
     try:
         result = mm_db(
             "SELECT p.message FROM posts p "
             "JOIN channels c ON p.channelid = c.id "
             "WHERE c.type = 'G' AND p.deleteat = 0 "
-            "AND p.message LIKE '%presentation files you previously contributed%' "
-            "LIMIT 1"
+            f"AND p.message LIKE '%{MM_DM_FRAGMENT}%' "
+            "AND (SELECT COUNT(*) FROM channelmembers cm "
+            "JOIN users u ON cm.userid = u.id "
+            "WHERE cm.channelid = c.id "
+            "AND u.username IN ('genesis','ginny','nilda','admin')) = 4;"
         )
-        found = bool(result) and "retired as of 2025-10-01" in (result or "")
-        check("10. Mattermost: group DM to genesis/ginny/nilda", 2, found,
-              "found" if found else "not found in group channels")
+        found = any(MM_DM_ANCHOR in line for line in result.splitlines())
+        check(label, 2, found,
+              "full-text anchor in group DM with all 4 members" if found
+              else "not found in a group DM containing genesis+ginny+nilda+admin")
     except Exception as e:
-        check("10. Mattermost: group DM to genesis/ginny/nilda", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_11_rc_archive_pref() -> None:
-    """Verify Roundcube archive folder preference set to 'Archive'."""
+    """Archive folder preference resolves to 'Archive': explicit serialized
+    pref, or absent while the container default is already 'Archive'
+    (the task step is verify-and-set-if-needed; Roundcube drops prefs that
+    equal the configured default)."""
+    label = "11. Roundcube: archive folder set to Archive"
     try:
-        result = rc_db(
+        prefs = rc_db(
             "SELECT preferences FROM users "
-            "WHERE username = 'james.whitfield@mail.local'"
+            "WHERE username = 'james.whitfield@mail.local';"
         )
-        passed = "archive_mbox" in (result or "") and "Archive" in (result or "")
-        check("11. Roundcube: archive folder set to Archive", 1, passed,
-              "preference found" if passed else "archive_mbox not set or user not found")
+        m = re.search(r'"archive_mbox";s:\d+:"([^"]*)"', prefs or "")
+        if m:
+            passed = m.group(1) == "Archive"
+            check(label, 1, passed, f"explicit pref archive_mbox={m.group(1)!r}")
+            return
+        # No explicit pref: inspect the container's configured default.
+        rc, out, _ = docker_exec(
+            ROUNDCUBEMAIL_CONTAINER, "bash", "-c",
+            "find /var/www/html /usr/src/roundcubemail -maxdepth 4 "
+            "\\( -name 'config.inc.php' -o -name 'defaults.inc.php' \\) 2>/dev/null "
+            "| xargs grep -h archive_mbox 2>/dev/null || true",
+            timeout=20,
+        )
+        dm = re.search(r"archive_mbox'\]\s*=\s*'([^']*)'", out or "")
+        if dm and dm.group(1) == "Archive":
+            check(label, 1, True,
+                  "pref absent; container default archive_mbox='Archive' "
+                  "already satisfies the verify-only step")
+        else:
+            default_val = repr(dm.group(1)) if dm else "not found"
+            check(label, 1, False,
+                  f"pref absent and container default is {default_val}")
     except Exception as e:
-        check("11. Roundcube: archive folder set to Archive", 1, False, f"exception: {e}")
+        check(label, 1, False, f"exception: {e}")
 
 
 def check_12_rc_email_sent() -> None:
-    """Verify email sent with correct subject and high priority."""
+    """Renewal email: exact subject; To/Bcc set equality; X-Priority == 2
+    only; body lists all 5 replacements + acknowledgement request."""
+    label = "12. Roundcube: email sent with high priority"
     try:
-        rc, out, _ = docker_exec(
-            ROUNDCUBEMAIL_CONTAINER,
-            "bash", "-c",
-            "grep -rl 'Subject: Q3 2025 Presentation Document Renewal Notification' "
-            "/var/mail/ 2>/dev/null || true",
-            timeout=15,
-        )
-        mail_files = [f.strip() for f in out.strip().split("\n") if f.strip()]
-        found = len(mail_files) > 0
-        high_priority = False
-        if mail_files:
-            rc2, out2, _ = docker_exec(
-                ROUNDCUBEMAIL_CONTAINER,
-                "bash", "-c",
-                f"grep -iE 'X-Priority: 1|Importance: high' "
-                f"'{mail_files[0]}' 2>/dev/null || true",
-                timeout=15,
-            )
-            high_priority = bool(out2.strip())
-        passed = found and high_priority
-        check("12. Roundcube: email sent with high priority", 2, passed,
-              f"email_found={found}, high_priority={high_priority}")
+        _, msg = _find_renewal_msg()
+        if msg is None:
+            check(label, 1, False,
+                  "no message with the exact subject in Archive or Sent")
+            return
+        to_ok = _addr_set(msg, "To") == EMAIL_TO_SET
+        bcc_ok = _addr_set(msg, "Bcc") == EMAIL_BCC_SET
+        xp = msg.get("X-Priority") or ""
+        prio_ok = (xp.strip().split() or [""])[0] == "2"
+        body = _body_text(msg)
+        missing = [p[:40] for p in EMAIL_BODY_PROBES if p not in body]
+        passed = to_ok and bcc_ok and prio_ok and not missing
+        check(label, 1, passed,
+              f"to={to_ok}, bcc={bcc_ok}, x_priority={xp.strip()!r} (must be 2), "
+              f"body_missing={missing}")
     except Exception as e:
-        check("12. Roundcube: email sent with high priority", 2, False, f"exception: {e}")
+        check(label, 1, False, f"exception: {e}")
 
 
 def check_13_rc_email_archived() -> None:
-    """Verify sent email archived to Archive folder."""
+    """Archive semantics: exact-subject message present in Archive AND absent
+    from Sent."""
+    label = "13. Roundcube: email archived"
     try:
-        rc, out, _ = docker_exec(
-            ROUNDCUBEMAIL_CONTAINER,
-            "bash", "-c",
-            "grep -rl 'Subject: Q3 2025 Presentation Document Renewal Notification' "
-            "/var/mail/ 2>/dev/null | grep -i archive || true",
-            timeout=15,
+        in_archive = any(
+            _subject_matches(m) for _, m in _maildir_messages(".Archive")
         )
-        found = bool(out.strip())
-        check("13. Roundcube: email archived", 1, found,
-              "found in Archive" if found else "not in Archive folder")
+        sent_count = sum(
+            1 for _, m in _maildir_messages(".Sent") if _subject_matches(m)
+        )
+        passed = in_archive and sent_count == 0
+        check(label, 1, passed,
+              f"in_archive={in_archive}, sent_copies={sent_count} "
+              "(archive must move the message out of Sent; a copy-semantics "
+              "config fails the Sent-absence sub-assertion)")
     except Exception as e:
-        check("13. Roundcube: email archived", 1, False, f"exception: {e}")
+        check(label, 1, False, f"exception: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -396,6 +698,7 @@ def main() -> None:
     check_4_replacement_files()
     check_5_approved_tags()
     check_6_oo_spreadsheet()
+    check_6b_oo_spreadsheet_content()
     check_7_oo_sharing()
     check_8_mm_renewal_notice()
     check_9_mm_purpose()

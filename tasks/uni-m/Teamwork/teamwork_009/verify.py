@@ -1,7 +1,7 @@
 """
 Verifier for Teamwork-009-I5: Coordinate Media Response to Data Privacy Inquiry
 
-Checks: 13 weighted checks across roundcubemail, mattermost, onlyoffice.
+Checks: 9 checks (total weight 13) across mattermost and onlyoffice.
 Strategy: docker exec (maildir) for roundcubemail, docker exec (DB) for mattermost,
           docker exec (DB) + API for onlyoffice.
 
@@ -12,10 +12,15 @@ Required env vars:
   ONLYOFFICE_PORT, ONLYOFFICE_CONTAINER, ONLYOFFICE_DB_CONTAINER
 """
 
-import os
-import sys
-import subprocess
+import io
 import json
+import os
+import re
+import subprocess
+import sys
+import zipfile
+from html import unescape as _xml_unescape
+
 import requests
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
@@ -76,6 +81,8 @@ def mm_db_query(sql: str) -> str:
         MATTERMOST_DB_CONTAINER,
         "psql", "-U", "mmuser", "-d", "mattermost", "-t", "-A", "-c", sql,
     )
+    if rc != 0:
+        raise RuntimeError(f"psql query failed (rc={rc}): {stderr.strip()[-300:]}")
     return stdout.strip()
 
 
@@ -83,9 +90,12 @@ def oo_db_query(sql: str) -> str:
     """Query OnlyOffice MySQL DB."""
     rc, stdout, stderr = docker_exec(
         ONLYOFFICE_DB_CONTAINER,
-        "mysql", "-u", "onlyoffice_user", "-ponlyoffice_pass", "-D", "onlyoffice",
+        "mysql", "--default-character-set=utf8mb4",
+        "-u", "onlyoffice_user", "-ponlyoffice_pass", "-D", "onlyoffice",
         "-N", "-e", sql,
     )
+    if rc != 0:
+        raise RuntimeError(f"mysql query failed (rc={rc}): {stderr.strip()[-300:]}")
     return stdout.strip()
 
 
@@ -105,6 +115,32 @@ def mail_cat(filepath: str) -> str:
 
 
 # ── Mattermost checks ────────────────────────────────────────────────────────
+
+# Exact inquiry-brief text from description.md (full-text anchor).
+_BRIEF_ANCHOR = (
+    "Journalist: Robert Singh (Stellar Tech). Key questions: "
+    "(1) data protection controls and certifications, "
+    "(2) incident response readiness and breach notification commitments, "
+    "(3) executive availability to discuss our security roadmap."
+)
+
+
+def _mm_brief_post_id() -> str:
+    """Resolve the inquiry-brief post id via the exact full-text anchor.
+    Returns '' when no such top-level post exists in the channel."""
+    result = mm_db_query(
+        "SELECT p.id FROM posts p "
+        "JOIN channels c ON p.channelid = c.id "
+        "JOIN teams t ON c.teamid = t.id "
+        "WHERE c.name = 'media-response-privacy-security' "
+        "AND t.displayname = 'Marketing & Growth' "
+        "AND p.rootid = '' "
+        "AND p.deleteat = 0 "
+        f"AND p.message LIKE '%{_BRIEF_ANCHOR}%' "
+        "ORDER BY p.createat ASC LIMIT 1;"
+    )
+    return result.splitlines()[0].strip() if result else ""
+
 
 def check_6_mm_channel() -> None:
     """Private channel 'media-response-privacy-security' in Marketing & Growth with correct purpose."""
@@ -141,85 +177,88 @@ def check_6_mm_channel() -> None:
 
 
 def check_7_mm_inquiry_brief() -> None:
-    """Inquiry brief message posted in channel."""
+    """Inquiry brief message posted in channel (exact full-text anchor)."""
     try:
-        result = mm_db_query(
-            "SELECT p.message FROM posts p "
-            "JOIN channels c ON p.channelid = c.id "
-            "WHERE c.name = 'media-response-privacy-security' "
-            "AND p.message LIKE '%Journalist: Robert Singh%' "
-            "AND p.deleteat = 0;"
-        )
-
-        has_brief = bool(result)
-        has_content = False
-        if has_brief:
-            has_content = (
-                "data protection controls" in result
-                and "incident response readiness" in result
-                and "executive availability" in result
-            )
-
-        passed = has_brief and has_content
-        check("7. Inquiry brief message posted", 2, passed,
-              "found with correct content" if passed else
-              "not found" if not has_brief else "missing key content")
+        brief_id = _mm_brief_post_id()
+        check("7. Inquiry brief message posted", 1, bool(brief_id),
+              f"brief post id={brief_id}" if brief_id
+              else "no top-level post matching exact brief text")
     except Exception as e:
-        check("7. Inquiry brief message posted", 2, False, f"exception: {e}")
+        check("7. Inquiry brief message posted", 1, False, f"exception: {e}")
 
 
 def check_8_mm_thread_reply() -> None:
-    """Thread reply mentioning @tonda with review request text."""
+    """Single thread reply on the brief post with @tonda review request text."""
     try:
+        brief_id = _mm_brief_post_id()
+        if not brief_id:
+            check("8. Thread reply with @tonda review request", 2, False,
+                  "brief post not found (exact-text anchor), cannot bind thread")
+            return
+
+        # Per-row judging: one reply row must carry ALL three probes itself.
         result = mm_db_query(
-            "SELECT p.message FROM posts p "
-            "JOIN channels c ON p.channelid = c.id "
-            "WHERE c.name = 'media-response-privacy-security' "
-            "AND p.message LIKE '%tonda%' "
-            "AND p.rootid != '' "
-            "AND p.deleteat = 0;"
+            "SELECT p.id FROM posts p "
+            f"WHERE p.rootid = '{brief_id}' "
+            "AND p.deleteat = 0 "
+            "AND p.message LIKE '%@tonda%' "
+            "AND p.message LIKE '%legal vetting and executive sign-off%' "
+            "AND p.message LIKE '%target turnaround: 24 hours%';"
         )
 
-        has_reply = bool(result)
-        has_content = False
-        if has_reply:
-            has_content = (
-                "legal vetting" in result
-                and "executive sign-off" in result
-                and "24 hours" in result
-            )
-
-        passed = has_reply and has_content
+        passed = bool(result)
         check("8. Thread reply with @tonda review request", 2, passed,
-              "found with correct content" if passed else
-              "not found" if not has_reply else "missing key content")
+              "single reply in brief thread carries all probes" if passed else
+              "no single reply with rootid=brief containing @tonda + "
+              "'legal vetting and executive sign-off' + 'target turnaround: 24 hours'")
     except Exception as e:
         check("8. Thread reply with @tonda review request", 2, False, f"exception: {e}")
 
 
 def check_9_mm_message_saved() -> None:
-    """Inquiry brief message is saved/flagged in Mattermost."""
+    """Inquiry brief message is saved/flagged by admin in Mattermost."""
     try:
+        brief_id = _mm_brief_post_id()
+        if not brief_id:
+            check("9. Inquiry brief message saved/flagged", 1, False,
+                  "brief post not found (exact-text anchor)")
+            return
+
         result = mm_db_query(
             "SELECT pr.name FROM preferences pr "
             "WHERE pr.category = 'flagged_post' "
-            "AND pr.name IN ("
-            "  SELECT p.id FROM posts p "
-            "  JOIN channels c ON p.channelid = c.id "
-            "  WHERE c.name = 'media-response-privacy-security' "
-            "  AND p.message LIKE '%Journalist: Robert Singh%' "
-            "  AND p.deleteat = 0"
-            ");"
+            "AND pr.userid = (SELECT id FROM users WHERE username = 'admin') "
+            f"AND pr.name = '{brief_id}';"
         )
 
         passed = bool(result)
         check("9. Inquiry brief message saved/flagged", 1, passed,
-              "flagged" if passed else "not flagged in preferences")
+              "brief post flagged by admin" if passed
+              else "brief post not flagged by admin in preferences")
     except Exception as e:
         check("9. Inquiry brief message saved/flagged", 1, False, f"exception: {e}")
 
 
 # ── OnlyOffice checks ────────────────────────────────────────────────────────
+
+# Exact document title from description.md (with and without .docx extension).
+_OO_DOC_TITLE = "Media Statement - Data Privacy and Security Inquiry"
+_OO_DOC_TITLES = (_OO_DOC_TITLE, _OO_DOC_TITLE + ".docx")
+_OO_DOC_TITLES_SQL = (
+    "('Media Statement - Data Privacy and Security Inquiry',"
+    "'Media Statement - Data Privacy and Security Inquiry.docx')"
+)
+
+
+def _oo_media_statement_file_id() -> str:
+    """Resolve the Media Statement files_file.id by exact title (latest id)."""
+    result = oo_db_query(
+        "SELECT id FROM files_file "
+        f"WHERE title IN {_OO_DOC_TITLES_SQL} "
+        "ORDER BY id DESC LIMIT 1;"
+    )
+    return result.splitlines()[0].strip() if result else ""
+
 
 def _oo_auth_session() -> requests.Session | None:
     """Authenticate to OnlyOffice and return a session with token."""
@@ -246,181 +285,267 @@ def _oo_auth_session() -> requests.Session | None:
 
 
 def check_10_oo_document_exists() -> None:
-    """Document 'Media Statement - Data Privacy and Security Inquiry' exists in OnlyOffice."""
+    """Document 'Media Statement - Data Privacy and Security Inquiry' exists (exact title)."""
     try:
         result = oo_db_query(
-            "SELECT id, title FROM files "
-            "WHERE title LIKE '%Media Statement%Data Privacy%Security Inquiry%' "
-            "LIMIT 5;"
+            "SELECT id, title FROM files_file "
+            f"WHERE title IN {_OO_DOC_TITLES_SQL} "
+            "ORDER BY id DESC LIMIT 5;"
         )
 
-        passed = bool(result) and "Media Statement" in result
+        passed = bool(result)
         check("10. OnlyOffice document exists", 1, passed,
-              f"found: {result[:200]}" if passed else "document not found in DB")
+              f"found: {result[:200]}" if passed
+              else "no files_file row with exact title (with/without .docx)")
     except Exception as e:
         check("10. OnlyOffice document exists", 1, False, f"exception: {e}")
 
 
-def check_11_oo_shared_with_user() -> None:
-    """Document shared with amit.singh for editing."""
+def check_10b_oo_in_my_documents() -> None:
+    """Document is located in My Documents (API @my listing preferred, DB folder join fallback)."""
+    label = "10b. Document located in My Documents"
     try:
-        # Use API to check sharing as DB join logic for OnlyOffice is complex
+        # Preferred: the file appears in the authenticated admin's @my listing.
         session = _oo_auth_session()
-        if not session:
-            # Fallback to DB
-            file_id = oo_db_query(
-                "SELECT id FROM files "
-                "WHERE title LIKE '%Media Statement%Data Privacy%Security Inquiry%' "
-                "LIMIT 1;"
-            ).strip()
-            if not file_id:
-                check("11. Document shared with amit.singh (edit)", 2, False, "document not found")
-                return
-            share_result = oo_db_query(
-                f"SELECT s.security, s.subject FROM security s "
-                f"WHERE s.entry_id = '{file_id}' AND s.entry_type = 2;"
-            )
-            check("11. Document shared with amit.singh (edit)", 2, bool(share_result),
-                  f"shares: {share_result[:200]}" if share_result else "no shares found")
+        if session:
+            try:
+                base_url = session.base_url  # type: ignore[attr-defined]
+                resp = session.get(f"{base_url}/api/2.0/files/@my", timeout=15)
+                if resp.status_code == 200:
+                    files_list = resp.json().get("response", {}).get("files", [])
+                    for f in files_list:
+                        if f.get("title", "") in _OO_DOC_TITLES:
+                            rft = f.get("rootFolderType")
+                            check(label, 1, True,
+                                  f"found in @my listing (rootFolderType={rft})")
+                            return
+            except Exception:
+                pass  # fall through to DB fallback
+
+        # Fallback: DB folder join. FolderType.USER (My Documents root) is
+        # believed to be folder_type=5; value not confirmed on a live slot,
+        # so the detail stays descriptive either way.
+        row = oo_db_query(
+            "SELECT fo.folder_type, fo.title FROM files_file ff "
+            "JOIN files_folder fo ON ff.folder_id = fo.id "
+            f"WHERE ff.title IN {_OO_DOC_TITLES_SQL} "
+            "ORDER BY ff.id DESC LIMIT 1;"
+        )
+        if not row:
+            check(label, 1, False, "document/parent folder not found in DB")
+            return
+        parts = row.splitlines()[0].split("\t")
+        folder_type = parts[0].strip() if parts else ""
+        folder_title = parts[1].strip() if len(parts) > 1 else ""
+        passed = folder_type == "5" or folder_title == "My Documents"
+        check(label, 1, passed,
+              f"parent folder_type={folder_type} title='{folder_title}' "
+              "(expected folder_type 5 = USER/My Documents root; "
+              "mapping not confirmed live)")
+    except Exception as e:
+        check(label, 1, False, f"exception: {e}")
+
+
+def check_11_oo_shared_with_user() -> None:
+    """Document shared with amit.singh for editing (API exact match, strict DB fallback)."""
+    label = "11. Document shared with amit.singh (edit)"
+    try:
+        file_id = _oo_media_statement_file_id()
+        if not file_id:
+            check(label, 2, False, "document not found by exact title")
             return
 
-        base_url = session.base_url  # type: ignore[attr-defined]
-        # List My Documents
+        # Primary: share API — userName full equality + access == 1 (ReadWrite).
+        session = _oo_auth_session()
+        if session:
+            try:
+                base_url = session.base_url  # type: ignore[attr-defined]
+                share_resp = session.get(
+                    f"{base_url}/api/2.0/files/file/{file_id}/share", timeout=15
+                )
+                if share_resp.status_code == 200:
+                    shares = share_resp.json().get("response", [])
+                    amit_shared = False
+                    amit_can_edit = False
+                    for s in shares:
+                        shared_to = s.get("sharedTo", {})
+                        if shared_to.get("userName", "") == "amit.singh":
+                            amit_shared = True
+                            if s.get("access") == 1:  # 1 = ReadWrite (edit)
+                                amit_can_edit = True
+                    passed = amit_shared and amit_can_edit
+                    detail = ("userName=amit.singh with access=1 (API)" if passed else
+                              "amit.singh not in share list (API, exact userName)"
+                              if not amit_shared else
+                              "amit.singh shared but access != 1 (API)")
+                    check(label, 2, passed, detail)
+                    return
+            except Exception:
+                pass  # fall through to DB fallback
+
+        # Fallback: strict DB assertion (subject GUID joined to core_user,
+        # entry bound to this file, security == 1 = edit).
+        row = oo_db_query(
+            "SELECT cu.username, fs.security "
+            "FROM files_security fs "
+            "JOIN core_user cu ON fs.subject = cu.id "
+            "WHERE fs.entry_type = 2 "
+            f"AND fs.entry_id = CAST({file_id} AS CHAR) "
+            "AND cu.username = 'amit.singh' "
+            "AND fs.security = 1;"
+        )
+        check(label, 2, bool(row),
+              f"DB: amit.singh security=1 on file {file_id}" if row else
+              f"DB: no files_security row for amit.singh with security=1 "
+              f"on file {file_id}")
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
+def _oo_docx_bytes_from_fs() -> bytes | None:
+    """Read the Media Statement document's content.docx from the portal data dir
+    via docker exec. Returns raw docx bytes, or None if it cannot be located."""
+    file_id = _oo_media_statement_file_id()
+    if not file_id:
+        return None
+    # '*file_<id>/*content.docx' also covers version subdirectories (v1/v2/...);
+    # when several versions match, pick the highest version directory.
+    rc, stdout, _ = docker_exec(
+        ONLYOFFICE_CONTAINER, "bash", "-c",
+        f"find /var/www/onlyoffice/Data -type f -path '*file_{file_id}/*content.docx' "
+        "2>/dev/null",
+        timeout=20,
+    )
+    paths = [p.strip() for p in stdout.strip().splitlines() if p.strip()]
+    if not paths:
+        return None
+
+    def _version_key(p: str) -> int:
+        m = re.search(r"/v(\d+)/", p)
+        return int(m.group(1)) if m else -1
+
+    path = max(paths, key=_version_key)
+    r = subprocess.run(
+        ["docker", "exec", ONLYOFFICE_CONTAINER, "cat", path],
+        capture_output=True, timeout=30,
+    )
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return r.stdout
+
+
+def _oo_docx_bytes_from_api() -> bytes | None:
+    """Fallback: download the document via the OnlyOffice HTTP API."""
+    session = _oo_auth_session()
+    if not session:
+        return None
+    base_url = session.base_url  # type: ignore[attr-defined]
+    doc_id = _oo_media_statement_file_id()
+    if not doc_id:
+        # Last resort: exact-title lookup in the @my listing.
         resp = session.get(f"{base_url}/api/2.0/files/@my", timeout=15)
-        if resp.status_code != 200:
-            check("11. Document shared with amit.singh (edit)", 2, False,
-                  f"API list failed: {resp.status_code}")
-            return
-
         files_list = resp.json().get("response", {}).get("files", [])
-        doc_id = None
         for f in files_list:
-            title = f.get("title", "")
-            if "Media Statement" in title and "Data Privacy" in title:
+            if f.get("title", "") in _OO_DOC_TITLES:
                 doc_id = f.get("id")
                 break
-
-        if not doc_id:
-            check("11. Document shared with amit.singh (edit)", 2, False,
-                  "document not found via API")
-            return
-
-        # Check shares on the document
-        share_resp = session.get(
-            f"{base_url}/api/2.0/files/file/{doc_id}/share", timeout=15
+    if not doc_id:
+        return None
+    dl_resp = session.get(
+        f"{base_url}/products/files/httphandlers/filehandler.ashx",
+        params={"action": "download", "fileid": str(doc_id)},
+        timeout=30, allow_redirects=True,
+    )
+    if not (dl_resp.status_code == 200 and len(dl_resp.content) > 100):
+        dl_resp = session.get(
+            f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
+            allow_redirects=True,
         )
-        if share_resp.status_code != 200:
-            check("11. Document shared with amit.singh (edit)", 2, False,
-                  f"share API failed: {share_resp.status_code}")
-            return
+    if dl_resp.status_code != 200:
+        return None
+    return dl_resp.content
 
-        shares = share_resp.json().get("response", [])
-        amit_shared = False
-        amit_can_edit = False
-        for s in shares:
-            shared_to = s.get("sharedTo", {})
-            username = shared_to.get("userName", "") or shared_to.get("displayName", "")
-            if "amit" in username.lower() and "singh" in username.lower():
-                amit_shared = True
-                # access: 1 = read+write, 2 = read
-                access = s.get("access", -1)
-                if access == 1:
-                    amit_can_edit = True
 
-        passed = amit_shared and amit_can_edit
-        details = []
-        if not amit_shared:
-            details.append("amit.singh not in share list")
-        elif not amit_can_edit:
-            details.append("amit.singh shared but not with edit access")
-        check("11. Document shared with amit.singh (edit)", 2, passed,
-              "; ".join(details) if details else "OK")
+def _oo_get_media_statement_docx() -> tuple[bytes | None, str]:
+    """Get the Media Statement docx bytes: docker exec on the data dir first,
+    HTTP download as fallback. Returns (bytes|None, source detail)."""
+    try:
+        data = _oo_docx_bytes_from_fs()
+        if data:
+            return data, "fs (content.docx via docker exec)"
     except Exception as e:
-        check("11. Document shared with amit.singh (edit)", 2, False, f"exception: {e}")
+        pass_detail = f"fs read failed: {e}"
+    else:
+        pass_detail = "content.docx not found in data dir"
+    try:
+        data = _oo_docx_bytes_from_api()
+        if data:
+            return data, "api download (fallback)"
+    except Exception as e:
+        return None, f"{pass_detail}; api download failed: {e}"
+    return None, f"{pass_detail}; api download failed"
+
+
+def _docx_body_text(content_data: bytes) -> str | None:
+    """Extract the concatenated <w:t> run text of word/document.xml from raw
+    docx bytes, XML-unescaped and whitespace-normalized. OnlyOffice splits
+    sentences across many runs, so raw-XML grep would false-negative."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content_data))
+    except zipfile.BadZipFile:
+        return None
+    pieces: list[str] = []
+    for name in zf.namelist():
+        if "document.xml" in name.lower() or "word/document" in name.lower():
+            xml_content = zf.read(name).decode("utf-8", errors="replace")
+            for run_text in re.findall(r"<w:t[^>]*>(.*?)</w:t>", xml_content, re.DOTALL):
+                pieces.append(_xml_unescape(run_text))
+            pieces.append(" ")  # paragraph-part separator between xml parts
+    if not pieces:
+        return None
+    return re.sub(r"\s+", " ", "".join(pieces)).strip()
+
+
+# Content probes — exact strings from description.md (incl. em dashes).
+_DOCX_PROBES = {
+    "heading": "Official Statement — Customer Data Privacy and Security Posture",
+    "section Background": "Background",
+    "section Key Messages": "Key Messages",
+    "section Approved Quote": "Approved Quote",
+    "bullet 1": "foundational to our business",
+    "bullet 2": "industry-recognized certifications and undergo regular "
+                "independent third-party audits",
+    "bullet 3": "continuously tested with clear escalation paths and "
+                "transparent customer notification commitments",
+    "bullet 4": "multi-year security investment roadmap in greater depth",
+    "approved quote": "Customer trust is earned through consistent, transparent, "
+                      "and rigorous protection of their data — it is a commitment "
+                      "we live by every day, not a checkbox we periodically revisit.",
+    "quote attribution": "Maria Wilson, Product Manager",
+}
 
 
 def check_12_oo_document_content() -> None:
-    """Document contains Background, Key Messages, and Approved Quote sections."""
+    """Document contains heading, section titles, 4 Key Messages bullets, and
+    the Approved Quote with attribution (probed on concatenated <w:t> text)."""
     try:
-        session = _oo_auth_session()
-        if not session:
-            check("12. Document contains key content sections", 2, False, "auth failed")
-            return
-
-        base_url = session.base_url  # type: ignore[attr-defined]
-        resp = session.get(f"{base_url}/api/2.0/files/@my", timeout=15)
-        files_list = resp.json().get("response", {}).get("files", [])
-
-        doc_id = None
-        content_url = None
-        for f in files_list:
-            title = f.get("title", "")
-            if "Media Statement" in title and "Data Privacy" in title:
-                doc_id = f.get("id")
-                content_url = f.get("viewUrl", "") or f.get("webUrl", "")
-                break
-
-        if not doc_id:
+        content_data, source = _oo_get_media_statement_docx()
+        if not content_data:
             check("12. Document contains key content sections", 2, False,
-                  "document not found via API")
+                  f"could not read document: {source}")
             return
 
-        # Download file content and inspect
-        dl_resp = session.get(
-            f"{base_url}/products/files/httphandlers/filehandler.ashx",
-            params={"action": "download", "fileid": str(doc_id)},
-            timeout=30, allow_redirects=True,
-        )
-        if not (dl_resp.status_code == 200 and len(dl_resp.content) > 100):
-            dl_resp = session.get(
-                f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
-                allow_redirects=True,
-            )
-
-        if dl_resp.status_code != 200:
-            # Fallback: try to find and inspect the file on the filesystem
-            rc, stdout, _ = docker_exec(
-                ONLYOFFICE_CONTAINER, "bash", "-c",
-                "find /var/www/onlyoffice/Data -name '*Media*Statement*' -o -name '*.docx' 2>/dev/null | head -20",
-                timeout=15,
-            )
+        text = _docx_body_text(content_data)
+        if text is None:
             check("12. Document contains key content sections", 2, False,
-                  f"download failed ({dl_resp.status_code}); fs files: {stdout.strip()[:200]}")
+                  f"not a readable docx (no word/document.xml text; source: {source})")
             return
 
-        # The response is likely a docx file (ZIP). Write to temp and inspect XML.
-        import tempfile
-        import zipfile
-        import io
-
-        content_data = dl_resp.content
-        found_sections = {"background": False, "key_messages": False, "approved_quote": False}
-
-        try:
-            zf = zipfile.ZipFile(io.BytesIO(content_data))
-            for name in zf.namelist():
-                if "document.xml" in name.lower() or "word/document" in name.lower():
-                    xml_content = zf.read(name).decode("utf-8", errors="replace")
-                    if "Stellar Tech reporter Robert Singh" in xml_content:
-                        found_sections["background"] = True
-                    if "foundational to our business" in xml_content:
-                        found_sections["key_messages"] = True
-                    if "Customer trust is earned" in xml_content:
-                        found_sections["approved_quote"] = True
-        except zipfile.BadZipFile:
-            # Maybe it's plain text or HTML
-            text = content_data.decode("utf-8", errors="replace")
-            if "Stellar Tech reporter Robert Singh" in text:
-                found_sections["background"] = True
-            if "foundational to our business" in text:
-                found_sections["key_messages"] = True
-            if "Customer trust is earned" in text:
-                found_sections["approved_quote"] = True
-
-        all_found = all(found_sections.values())
-        missing = [k for k, v in found_sections.items() if not v]
+        missing = [name for name, probe in _DOCX_PROBES.items() if probe not in text]
+        all_found = not missing
         check("12. Document contains key content sections", 2, all_found,
-              "all sections found" if all_found else f"missing: {missing}")
+              f"all {len(_DOCX_PROBES)} probes found (source: {source})" if all_found
+              else f"missing: {missing} (source: {source})")
     except Exception as e:
         check("12. Document contains key content sections", 2, False, f"exception: {e}")
 
@@ -428,49 +553,15 @@ def check_12_oo_document_content() -> None:
 def check_13_oo_track_changes() -> None:
     """Track changes is enabled on the document."""
     try:
-        session = _oo_auth_session()
-        if not session:
-            check("13. Track changes enabled", 1, False, "auth failed")
-            return
-
-        base_url = session.base_url  # type: ignore[attr-defined]
-        resp = session.get(f"{base_url}/api/2.0/files/@my", timeout=15)
-        files_list = resp.json().get("response", {}).get("files", [])
-
-        doc_id = None
-        for f in files_list:
-            title = f.get("title", "")
-            if "Media Statement" in title and "Data Privacy" in title:
-                doc_id = f.get("id")
-                break
-
-        if not doc_id:
-            check("13. Track changes enabled", 1, False, "document not found")
-            return
-
-        # Download file and check for trackRevisions in settings XML
-        dl_resp = session.get(
-            f"{base_url}/products/files/httphandlers/filehandler.ashx",
-            params={"action": "download", "fileid": str(doc_id)},
-            timeout=30, allow_redirects=True,
-        )
-        if not (dl_resp.status_code == 200 and len(dl_resp.content) > 100):
-            dl_resp = session.get(
-                f"{base_url}/api/2.0/files/file/{doc_id}/download", timeout=30,
-                allow_redirects=True,
-            )
-
-        if dl_resp.status_code != 200:
+        content_data, source = _oo_get_media_statement_docx()
+        if not content_data:
             check("13. Track changes enabled", 1, False,
-                  f"download failed: {dl_resp.status_code}")
+                  f"could not read document: {source}")
             return
-
-        import zipfile
-        import io
 
         track_changes_on = False
         try:
-            zf = zipfile.ZipFile(io.BytesIO(dl_resp.content))
+            zf = zipfile.ZipFile(io.BytesIO(content_data))
             for name in zf.namelist():
                 if "settings.xml" in name.lower():
                     xml_content = zf.read(name).decode("utf-8", errors="replace")
@@ -483,7 +574,8 @@ def check_13_oo_track_changes() -> None:
             pass
 
         check("13. Track changes enabled", 1, track_changes_on,
-              "trackRevisions found in settings" if track_changes_on else "trackRevisions not found")
+              f"trackRevisions found in settings (source: {source})" if track_changes_on
+              else f"trackRevisions not found (source: {source})")
     except Exception as e:
         check("13. Track changes enabled", 1, False, f"exception: {e}")
 
@@ -495,6 +587,7 @@ def main() -> None:
     check_8_mm_thread_reply()
     check_9_mm_message_saved()
     check_10_oo_document_exists()
+    check_10b_oo_in_my_documents()
     check_11_oo_shared_with_user()
     check_12_oo_document_content()
     check_13_oo_track_changes()

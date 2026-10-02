@@ -95,9 +95,17 @@ def siyuan_export_md(token: str, doc_id: str) -> str:
 
 
 def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, str]:
+    _missing = [_n for _n in ("JUDGE_MODEL", "JUDGE_BASE_URL", "JUDGE_API_KEY")
+                if not os.getenv(_n, "").strip()]
+    if _missing:
+        # The judge is configured independently of the agent's model (see
+        # saas_bench.verify_runner.normalize_judge_env): a benchmark needs ONE fixed grader, or
+        # columns scored by different models are not comparable. Say which piece is missing rather
+        # than posting an empty model name and reporting the provider's HTTP error.
+        return False, "judge not configured: " + ", ".join(_missing) + " not set"
     """Returns (passed, raw_response)."""
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+    api_base = os.getenv("JUDGE_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY", "")
     prompt = (
         f"Does the following content satisfy this condition?\n"
         f"Condition: {condition}\n\n"
@@ -108,7 +116,7 @@ def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, st
         resp = requests.post(
             f"{api_base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"), "messages": [{"role": "user", "content": prompt}],
+            json={"model": os.getenv("JUDGE_MODEL", ""), "messages": [{"role": "user", "content": prompt}],
                   "max_tokens": 512},
             timeout=timeout,
         )
@@ -125,9 +133,17 @@ def llm_judge_vision(
     condition: str,
     timeout: int = 60,
 ) -> tuple[bool, str]:
+    _missing = [_n for _n in ("JUDGE_MODEL", "JUDGE_BASE_URL", "JUDGE_API_KEY")
+                if not os.getenv(_n, "").strip()]
+    if _missing:
+        # The judge is configured independently of the agent's model (see
+        # saas_bench.verify_runner.normalize_judge_env): a benchmark needs ONE fixed grader, or
+        # columns scored by different models are not comparable. Say which piece is missing rather
+        # than posting an empty model name and reporting the provider's HTTP error.
+        return False, "judge not configured: " + ", ".join(_missing) + " not set"
     """Send a PDF (as base64) + recorded value to a vision LLM for cross-modal check."""
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+    api_base = os.getenv("JUDGE_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY", "")
 
     if not os.path.isfile(pdf_path):
         return False, f"file not found: {pdf_path}"
@@ -147,7 +163,7 @@ def llm_judge_vision(
             f"{api_base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+                "model": os.getenv("JUDGE_MODEL", ""),
                 "messages": [{
                     "role": "user",
                     "content": [

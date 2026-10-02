@@ -55,15 +55,30 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - PRETIX_URL=http://$hostname:$port
+      # The upstream default is 2*nproc, which sees the Kubernetes node's CPUs instead of this
+      # container's CPU limit and can spawn dozens of gunicorn workers. Keep the web tier bounded.
+      - NUM_WORKERS=4
     # Patch the baked /etc/pretix/pretix.cfg (which uses "localhost") to point
     # to the networked postgres / redis services before invoking the upstream
-    # entrypoint.
+    # entrypoint. Kubernetes emptyDir mounts start as root:root (unlike Docker's
+    # named-volume initialization). Pre-create all paths opened by Django during the root migration,
+    # otherwise the unprivileged web/task workers cannot reuse its secret or append to its logs.
+    # The image's "all" supervisor mode also starts embedded Postgres/Redis, which collide with the
+    # declared compose sidecars because Kubernetes pod containers share one network namespace.
     entrypoint:
       - /bin/bash
       - -c
       - |
+        mkdir -p /data/logs /data/media /data/cache
+        touch /data/logs/pretix.log /data/logs/csp.log
+        if [ ! -s /data/.secret ]; then
+          (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(50))' > /data/.secret)
+        fi
+        chown -R pretixuser:pretixuser /data
+        chmod 0600 /data/.secret
+        chmod 0644 /data/logs/pretix.log /data/logs/csp.log
+        sed -i 's/^autostart=true/autostart=false/' /etc/supervisord/postgresql.conf /etc/supervisord/redis.conf
         sed -i 's/^host=localhost/host=$prefix-db/' /etc/pretix/pretix.cfg
-        sed -i 's|^url=.*|url=http://$hostname:$port|' /etc/pretix/pretix.cfg
         sed -i 's|^location=redis://localhost:6379|location=redis://$prefix-redis:6379|' /etc/pretix/pretix.cfg
         sed -i 's|^backend=redis://localhost:6379|backend=redis://$prefix-redis:6379|' /etc/pretix/pretix.cfg
         sed -i 's|^broker=redis://localhost:6379|broker=redis://$prefix-redis:6379|' /etc/pretix/pretix.cfg

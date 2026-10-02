@@ -1,7 +1,8 @@
 """
 Verifier for Software-029-I4: Data Platform Migration Portfolio Analysis Q4 2026
 
-Checks: 16 weighted checks across baserow, code-server, metabase, openproject.
+Checks: 19 weighted checks (total weight 38) across baserow, code-server,
+metabase, openproject.
 Strategy: Baserow API, docker exec filesystem, Metabase API, OpenProject DB.
 
 Required env vars:
@@ -16,6 +17,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import unicodedata
 import urllib.request
 import urllib.error
 
@@ -158,6 +161,30 @@ def op_db_query(sql: str) -> str:
     return r.stdout.strip()
 
 
+def baserow_sql(sql: str) -> str:
+    """Run a SQL query against the Baserow Postgres DB."""
+    rc, out, err = docker_exec(
+        BASEROW_DB_CONTAINER,
+        "env", "PGPASSWORD=kdpzkuyhsgb22onku8y7rxkx3czej88nxpngaz4mlmgad67vpc",
+        "psql", "-h", "127.0.0.1", "-U", "baserow", "-d", "baserow",
+        "-t", "-A", "-c", sql,
+        timeout=15,
+    )
+    if rc != 0:
+        raise RuntimeError(f"baserow_sql failed (rc={rc}): {err.strip()}")
+    return out.strip("\r\n")  # NOT .strip(): \x1f is Python whitespace and would eat the last row's trailing field sep
+
+
+def _num_re(x: float, max_dec_zeros: int = 1) -> str:
+    """Regex fragment for a numeric constant tolerating trailing-zero
+    rendering variants: 15.0 -> '15' or '15.0' (or '15.00' when
+    max_dec_zeros=2, e.g. 180000.00); non-integral constants must render
+    exactly as stored (1.71)."""
+    if float(x) == int(x):
+        return rf"{int(x)}(?:\.0{{1,{max_dec_zeros}}})?"
+    return re.escape(str(x))
+
+
 # ── Baserow checks ───────────────────────────────────────────────────────────
 _baserow_token = None
 _baserow_table_id = None
@@ -228,6 +255,31 @@ def _get_rows() -> list[dict] | None:
         return None
     _baserow_rows = resp.get("results", [])
     return _baserow_rows
+
+
+_baserow_fields = None
+
+
+def _get_table_fields() -> list[dict] | None:
+    """Fetch (once) the field definitions of the Migration Candidates table."""
+    global _baserow_fields
+    if _baserow_fields is not None:
+        return _baserow_fields
+    table_id = _find_table_id()
+    if table_id is None:
+        return None
+    status, resp = _baserow_get(f"/api/database/fields/table/{table_id}/")
+    if status != 200 or not isinstance(resp, list):
+        return None
+    _baserow_fields = resp
+    return _baserow_fields
+
+
+def _field_id(name: str) -> int | None:
+    for f in _get_table_fields() or []:
+        if f.get("name") == name:
+            return f.get("id")
+    return None
 
 
 def check_2_table_and_row_count() -> None:
@@ -365,21 +417,87 @@ def check_5_decision() -> None:
 
 
 def check_6_ranked_candidates_view() -> None:
-    """Check that a Grid view named 'Ranked Candidates' exists."""
+    """Grid view 'Ranked Candidates' exists and carries exactly one sorting:
+    ROI Score descending."""
     try:
         table_id = _find_table_id()
         if table_id is None:
-            check("6. View 'Ranked Candidates' exists", 1, False, "table not found")
+            check("6. View 'Ranked Candidates' + sort", 2, False, "table not found")
             return
         status, views = _baserow_get(f"/api/database/views/table/{table_id}/")
         if status != 200:
-            check("6. View 'Ranked Candidates' exists", 1, False, f"API returned {status}")
+            check("6. View 'Ranked Candidates' + sort", 2, False, f"API returned {status}")
             return
-        found = any(v.get("name") == "Ranked Candidates" for v in views)
-        check("6. View 'Ranked Candidates' exists", 1, found,
-              "" if found else f"views: {[v.get('name') for v in views]}")
+        views = views.get("results", views) if isinstance(views, dict) else views
+        view = next((v for v in views if v.get("name") == "Ranked Candidates"), None)
+        if view is None:
+            check("6. View 'Ranked Candidates' + sort", 2, False,
+                  f"view not found among {[v.get('name') for v in views]}")
+            return
+        roi_fid = _field_id("ROI Score")
+        if roi_fid is None:
+            check("6. View 'Ranked Candidates' + sort", 2, False,
+                  "ROI Score field not found")
+            return
+        status, sortings = _baserow_get(f"/api/database/views/{view['id']}/sortings/")
+        if status != 200:
+            check("6. View 'Ranked Candidates' + sort", 2, False,
+                  f"sortings API returned {status}")
+            return
+        sortings = sortings.get("results", sortings) if isinstance(sortings, dict) else sortings
+        got = [(s.get("field"), str(s.get("order", "")).upper()) for s in sortings]
+        ok = got == [(roi_fid, "DESC")]
+        check("6. View 'Ranked Candidates' + sort", 2, ok,
+              f"sortings={got}, expected [({roi_fid}, 'DESC')] (ROI Score DESC)")
     except Exception as e:
-        check("6. View 'Ranked Candidates' exists", 1, False, f"exception: {e}")
+        check("6. View 'Ranked Candidates' + sort", 2, False, f"exception: {e}")
+
+
+# Field spec: name -> (type, select option set or None, decimal places or None)
+_MC_FIELD_SPEC = {
+    "Candidate ID": ("text", None, None),
+    "Candidate Name": ("text", None, None),
+    "Current Annual Cost": ("number", None, 2),
+    "Projected Annual Cost": ("number", None, 2),
+    "Annual Savings": ("number", None, 2),
+    "Effort Weeks": ("number", None, 1),
+    "Risk Score": ("number", None, 1),
+    "Strategic Alignment": ("single_select", {"Low", "Medium", "High"}, None),
+    "ROI Score": ("number", None, 2),
+    "Decision": ("single_select", {"Approve", "Defer", "Reject"}, None),
+}
+
+
+def check_6b_field_schema() -> None:
+    """Migration Candidates fields carry the task's types, decimal places and
+    select options, with Candidate ID as primary (REST fields API)."""
+    try:
+        fields = _get_table_fields()
+        if not fields:
+            check("6b. Field schema", 2, False, "table fields not loaded")
+            return
+        by_name = {f.get("name"): f for f in fields}
+        issues = []
+        for name, (ftype, options, decimals) in _MC_FIELD_SPEC.items():
+            f = by_name.get(name)
+            if f is None:
+                issues.append(f"{name}: field missing")
+                continue
+            if f.get("type") != ftype:
+                issues.append(f"{name}: type={f.get('type')!r}, expected {ftype!r}")
+            if options is not None:
+                got = {o.get("value") for o in f.get("select_options", [])}
+                if got != options:
+                    issues.append(f"{name}: options={sorted(got)}, expected {sorted(options)}")
+            if decimals is not None and f.get("number_decimal_places") != decimals:
+                issues.append(f"{name}: decimals={f.get('number_decimal_places')}, "
+                              f"expected {decimals}")
+            if name == "Candidate ID" and not f.get("primary"):
+                issues.append("Candidate ID: not the primary field")
+        check("6b. Field schema", 2, not issues,
+              "schema OK" if not issues else "; ".join(issues[:5]))
+    except Exception as e:
+        check("6b. Field schema", 2, False, f"exception: {e}")
 
 
 # ── Code-server checks ───────────────────────────────────────────────────────
@@ -392,7 +510,7 @@ def _find_alertmanager_file() -> str | None:
         timeout=10,
     )
     if rc == 0 and out.strip():
-        return out.strip().split("\n")[0]
+        return out.strip("\r\n")  # NOT .strip(): \x1f is Python whitespace and would eat the last row's trailing field sep.split("\n")[0]
     # Also try /config/workspace or other common paths
     rc2, out2, _ = docker_exec(
         CODE_SERVER_CONTAINER,
@@ -425,15 +543,19 @@ def check_7_section_marker() -> None:
 
 
 def check_8_comment_lines() -> None:
-    """Check 6 correctly formatted migration comment lines below the marker."""
+    """Exactly the 6 template comment lines sit immediately below the marker:
+    lines i+1..i+6 must be MC-01..MC-06 in strict order, each matching the
+    template '# MIGRATION-CANDIDATE {id}: {name} — Effort {effort}w, ROI
+    {roi}, Decision {decision}' (NFC-normalized; the em dash is required,
+    '--' is rejected; trailing-zero numeric variants tolerated)."""
     try:
         filepath = _find_alertmanager_file()
         if filepath is None:
-            check("8. 6 migration comment lines", 2, False, "file not found")
+            check("8. 6 migration comment lines", 3, False, "file not found")
             return
         rc, content, _ = docker_exec(CODE_SERVER_CONTAINER, "cat", filepath)
         if rc != 0:
-            check("8. 6 migration comment lines", 2, False, "cannot read file")
+            check("8. 6 migration comment lines", 3, False, "cannot read file")
             return
         marker = "# === DATA PLATFORM MIGRATION Q4 NOTES ==="
         lines = content.split("\n")
@@ -443,42 +565,34 @@ def check_8_comment_lines() -> None:
                 marker_idx = i
                 break
         if marker_idx is None:
-            check("8. 6 migration comment lines", 2, False, "marker not found")
+            check("8. 6 migration comment lines", 3, False, "marker not found")
             return
-        # Get lines after marker, skipping blanks
-        after_lines = []
-        for line in lines[marker_idx + 1:]:
-            stripped = line.strip()
-            if stripped.startswith("# MIGRATION-CANDIDATE"):
-                after_lines.append(stripped)
-            elif stripped and not stripped.startswith("#"):
-                break  # Stop at non-comment content
-            elif len(after_lines) >= 6:
-                break
+
+        window = lines[marker_idx + 1:marker_idx + 7]
         errors = []
-        if len(after_lines) != 6:
-            errors.append(f"expected 6 lines, found {len(after_lines)}")
-        for cand in EXPECTED_CANDIDATES:
-            # Build expected pattern — allow both em dash and double hyphen
-            expected_fragments = [
-                f"# MIGRATION-CANDIDATE {cand['id']}:",
-                cand["name"],
-                f"Effort {cand['effort']}w",
-                f"ROI {cand['roi']}",
-                f"Decision {cand['decision']}",
-            ]
-            found_line = False
-            for line in after_lines:
-                if all(frag in line for frag in expected_fragments):
-                    found_line = True
-                    break
-            if not found_line:
-                errors.append(f"{cand['id']} line missing or malformed")
+        if len(window) < 6:
+            errors.append(f"only {len(window)} line(s) after marker")
+        for k, cand in enumerate(EXPECTED_CANDIDATES):
+            if k >= len(window):
+                errors.append(f"{cand['id']}: line missing")
+                continue
+            actual = unicodedata.normalize("NFC", window[k]).strip()
+            pattern = (
+                rf"^# MIGRATION-CANDIDATE {re.escape(cand['id'])}: "
+                rf"{re.escape(cand['name'])} — "
+                rf"Effort {_num_re(cand['effort'])}w, "
+                rf"ROI {_num_re(cand['roi'])}, "
+                rf"Decision {re.escape(cand['decision'])}$"
+            )
+            if not re.match(pattern, actual):
+                errors.append(f"line marker+{k + 1} is not the {cand['id']} "
+                              f"template line: {actual!r:.90}")
         passed = len(errors) == 0
-        check("8. 6 migration comment lines", 2, passed,
-              "; ".join(errors) if errors else "all 6 correct")
+        check("8. 6 migration comment lines", 3, passed,
+              "; ".join(errors[:3]) if errors else
+              "6 anchored template lines exact (MC-01..MC-06)")
     except Exception as e:
-        check("8. 6 migration comment lines", 2, False, f"exception: {e}")
+        check("8. 6 migration comment lines", 3, False, f"exception: {e}")
 
 
 # ── Metabase checks ──────────────────────────────────────────────────────────
@@ -501,6 +615,18 @@ def _metabase_get(path: str) -> tuple[int, dict | str | list]:
     )
 
 
+def _metabase_post(path: str, data: dict | None = None,
+                   timeout: int = 60) -> tuple[int, dict | str]:
+    session = _get_metabase_session()
+    return http_request(
+        f"{METABASE_URL}/api/{path}",
+        method="POST",
+        data=data if data is not None else {},
+        headers={"X-Metabase-Session": session},
+        timeout=timeout,
+    )
+
+
 def _find_metabase_collection() -> int | None:
     global _metabase_collection_id
     if _metabase_collection_id is not None:
@@ -516,6 +642,180 @@ def _find_metabase_collection() -> int | None:
     return None
 
 
+# ── Metabase card normalization helpers ──────────────────────────────────────
+# Probe-verified against mw-metabase:latest (Metabase v0.58.5.2): GET
+# /api/card/<id> returns dataset_query in pMBQL ({"lib/type":"mbql/query",
+# "database":<id>,"stages":[...]}); field refs carry the integer id in the
+# LAST position; legacy MBQL POSTs are normalized to pMBQL on readback.
+
+
+def _mb_field_id(ref):
+    """Field id from a field ref in pMBQL (["field",{opts},id]) or legacy
+    (["field",id,opts]) form. None if not a field ref."""
+    if not isinstance(ref, (list, tuple)) or not ref or ref[0] != "field":
+        return None
+    for item in ref[1:]:
+        if isinstance(item, int):
+            return item
+    return None
+
+
+def mb_shape(card):
+    """Normalize a Metabase card (GET /api/card/<id> JSON) to a comparable shape.
+    Handles pMBQL stages and legacy MBQL. Keys:
+      display, visualization_settings, database, is_native, native_sql,
+      source_table, agg_ops (set of "count" | (op, fid)), breakout_fids,
+      filters (raw clause list), order_by ([(dir, fid)]), fields_fids.
+    """
+    dq = card.get("dataset_query") or {}
+    shape = {
+        "display": card.get("display"),
+        "visualization_settings": card.get("visualization_settings") or {},
+        "database": dq.get("database"),
+        "is_native": False,
+        "native_sql": None,
+        "source_table": None,
+        "agg_ops": set(),
+        "breakout_fids": [],
+        "filters": [],
+        "order_by": [],
+        "fields_fids": [],
+    }
+    if dq.get("lib/type") == "mbql/query" and dq.get("stages"):
+        stage = dq["stages"][0]
+        if stage.get("lib/type") == "mbql.stage/native":
+            shape["is_native"] = True
+            nat = stage.get("native")
+            shape["native_sql"] = nat if isinstance(nat, str) else (nat or {}).get("query", "")
+            return shape
+        shape["source_table"] = stage.get("source-table")
+        aggs = stage.get("aggregation") or []
+        filters = stage.get("filters") or []
+        breakouts = stage.get("breakout") or []
+        order_by = stage.get("order-by") or []
+        fields = stage.get("fields") or []
+    elif dq.get("type") == "native":
+        shape["is_native"] = True
+        shape["native_sql"] = (dq.get("native") or {}).get("query", "")
+        return shape
+    else:
+        q = dq.get("query") or {}
+        shape["source_table"] = q.get("source-table")
+        aggs = q.get("aggregation") or []
+        filters = [q["filter"]] if q.get("filter") else []
+        breakouts = q.get("breakout") or []
+        order_by = q.get("order-by") or []
+        fields = q.get("fields") or []
+    for agg in aggs:
+        if not isinstance(agg, (list, tuple)) or not agg:
+            continue
+        op = agg[0]
+        fid = None
+        for item in agg[1:]:
+            fid = _mb_field_id(item)
+            if fid is not None:
+                break
+        shape["agg_ops"].add(op if fid is None else (op, fid))
+    shape["breakout_fids"] = [_mb_field_id(b) for b in breakouts]
+    shape["filters"] = filters
+    for o in order_by:
+        if isinstance(o, (list, tuple)) and o:
+            fid = None
+            for item in o[1:]:
+                fid = _mb_field_id(item)
+                if fid is not None:
+                    break
+            shape["order_by"].append((str(o[0]).lower(), fid))
+    shape["fields_fids"] = [_mb_field_id(f) for f in fields]
+    return shape
+
+
+def mb_filter_summary(filters):
+    """Normalize filter clauses to [(op, field_id, values_tuple)]; flattens and/or.
+    Handles pMBQL ["=",{opts},["field",{opts},id],v...] and legacy ["=",["field",id,opts],v...]."""
+    out = []
+
+    def walk(cl):
+        if not isinstance(cl, (list, tuple)) or not cl:
+            return
+        op = cl[0]
+        if op in ("and", "or"):
+            for sub in cl[1:]:
+                walk(sub)
+            return
+        fid = None
+        vals = []
+        for item in cl[1:]:
+            if isinstance(item, dict):
+                continue  # pMBQL opts map
+            got = _mb_field_id(item)
+            if got is not None and fid is None:
+                fid = got
+            elif not isinstance(item, (list, tuple)):
+                vals.append(item)
+        out.append((op, fid, tuple(vals)))
+
+    for cl in filters or []:
+        walk(cl)
+    return out
+
+
+def mb_run_card(card_id: int) -> tuple[list, list]:
+    """Execute a saved card server-side. Returns (col_names, rows).
+    Raises RuntimeError on failure (one retry for sync lag). Works for native
+    SQL cards too."""
+    last_err = None
+    for attempt in range(2):
+        try:
+            status, res = _metabase_post(f"card/{card_id}/query", timeout=60)
+            if isinstance(res, dict) and res.get("status") == "completed":
+                data = res.get("data") or {}
+                cols = [c.get("name") for c in data.get("cols", [])]
+                return cols, data.get("rows", [])
+            if isinstance(res, dict):
+                last_err = (f"status={res.get('status')} "
+                            f"error={str(res.get('error'))[:200]}")
+            else:
+                last_err = f"http={status} body={str(res)[:200]}"
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+        if attempt == 0:
+            time.sleep(5)
+    raise RuntimeError(f"card {card_id} execution failed: {last_err}")
+
+
+def mb_find_pg_db(name: str | None = None) -> dict | None:
+    """Locate the Baserow Postgres datasource. Never hardcode db ids."""
+    status, resp = _metabase_get("/api/database")
+    if status != 200:
+        return None
+    dbs = resp.get("data", resp) if isinstance(resp, dict) else resp
+    for db in dbs:
+        if db.get("engine") != "postgres":
+            continue
+        if name is not None and db.get("name") != name:
+            continue
+        details = db.get("details") or {}
+        if "dbname" in details and details.get("dbname") != "baserow":
+            continue
+        return db
+    return None
+
+
+def mb_resolve_table(mb_db_id: int, physical_table_name: str) -> tuple[int | None, dict]:
+    """(mb_table_id, {physical_field_name: mb_field_id}) via GET
+    /api/database/<id>/metadata. physical_table_name is e.g.
+    f"database_table_{tid}"; field names are f"field_{baserow_fid}"."""
+    status, meta = _metabase_get(f"/api/database/{mb_db_id}/metadata")
+    if status != 200 or not isinstance(meta, dict):
+        return None, {}
+    for tbl in meta.get("tables", []) or []:
+        if tbl.get("name") == physical_table_name:
+            fmap = {f.get("name"): f.get("id") for f in tbl.get("fields", []) or []}
+            return tbl.get("id"), fmap
+    return None, {}
+
+
 def check_9_metabase_collection() -> None:
     """Check that the Metabase collection exists."""
     try:
@@ -526,29 +826,284 @@ def check_9_metabase_collection() -> None:
         check("9. Metabase collection exists", 1, False, f"exception: {e}")
 
 
-def check_10_metabase_questions() -> None:
-    """Check 3 questions exist with correct names in the collection."""
+_EXPECTED_CARD_NAMES = [
+    "Effort vs ROI",
+    "Decisions Breakdown",
+    "Total Projected Annual Savings (Approved)",
+]
+
+_collection_cards = None
+
+
+def _collection_card_ids() -> dict | None:
+    """{card name: card id} for the target collection (cached)."""
+    global _collection_cards
+    if _collection_cards is not None:
+        return _collection_cards
+    cid = _find_metabase_collection()
+    if cid is None:
+        return None
+    status, items = _metabase_get(f"/api/collection/{cid}/items?models=card")
+    if status != 200:
+        return None
+    item_data = items.get("data", items) if isinstance(items, dict) else items
+    _collection_cards = {
+        item.get("name"): item.get("id")
+        for item in item_data if item.get("model") == "card"
+    }
+    return _collection_cards
+
+
+_decision_opts = None
+
+
+def _decision_option_map() -> dict:
+    """{option id (str): option text} for the Decision single-select field.
+    Baserow's physical single-select columns (and MBQL filter values) store
+    option ids, so executed rows/filters must be normalized to text."""
+    global _decision_opts
+    if _decision_opts is not None:
+        return _decision_opts
+    fid = _field_id("Decision")
+    out = {}
+    if fid is not None:
+        try:
+            rows = baserow_sql(
+                f"SELECT id, value FROM database_selectoption WHERE field_id = {fid}"
+            )
+            for line in rows.split("\n"):
+                line = line.strip()
+                if line and "|" in line:
+                    oid, _, val = line.partition("|")
+                    out[oid.strip()] = val
+        except RuntimeError:
+            # Fallback: the REST fields API carries the same id/value pairs.
+            for f in _get_table_fields() or []:
+                if f.get("id") == fid:
+                    for o in f.get("select_options", []):
+                        out[str(o.get("id"))] = o.get("value")
+    _decision_opts = out
+    return out
+
+
+def _norm_decision(cell) -> str:
+    """Map an executed cell (option id as int/float/str, or plain text) to
+    the Decision option text."""
+    if isinstance(cell, float) and cell == int(cell):
+        cell = int(cell)
+    return _decision_option_map().get(str(cell).strip(), str(cell).strip())
+
+
+def _scatter_pairs_from_execution(card_id: int) -> str | None:
+    """Execute a (native) scatter card; some column pair must equal the 6
+    expected (effort, roi) pairs as a multiset. Returns an error string or
+    None on success."""
+    expected = sorted(
+        (round(c["effort"], 2), round(c["roi"], 2)) for c in EXPECTED_CANDIDATES
+    )
     try:
-        cid = _find_metabase_collection()
-        if cid is None:
-            check("10. 3 Metabase questions exist", 2, False, "collection not found")
+        _cols, rows = mb_run_card(card_id)
+    except RuntimeError as e:
+        return str(e)
+    ncols = max((len(r) for r in rows), default=0)
+    for ai in range(ncols):
+        for bi in range(ncols):
+            if ai == bi:
+                continue
+            pairs = []
+            try:
+                for r in rows:
+                    pairs.append((round(float(r[ai]), 2), round(float(r[bi]), 2)))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if sorted(pairs) == expected:
+                return None
+    return (f"no executed column pair matches the 6 (effort, roi) pairs; "
+            f"got {len(rows)} row(s)")
+
+
+def _pie_rows_from_execution(card_id: int) -> str | None:
+    """Execute a (native) pie card; rows must equal the per-Decision counts
+    computed from EXPECTED_CANDIDATES (option ids normalized to text)."""
+    expected = {}
+    for c in EXPECTED_CANDIDATES:
+        expected[c["decision"]] = expected.get(c["decision"], 0) + 1
+    try:
+        _cols, rows = mb_run_card(card_id)
+    except RuntimeError as e:
+        return str(e)
+    got = {}
+    try:
+        for r in rows:
+            got[_norm_decision(r[0])] = got.get(_norm_decision(r[0]), 0) + int(float(r[1]))
+    except (TypeError, ValueError, IndexError):
+        return f"cannot parse executed rows as (decision, count): {rows[:4]}"
+    if got != expected:
+        return f"executed decision counts {got} != expected {expected}"
+    return None
+
+
+def check_10_metabase_questions() -> None:
+    """The 3 questions exist AND are semantically correct: scatter binds
+    Effort Weeks + ROI Score (MBQL fids or viz dimensions/metrics; native
+    fallback by execution), pie is count broken out by Decision (native
+    fallback by execution), scalar is sum(Annual Savings) filtered to
+    Decision=Approve and EXECUTES to the constant-derived total; all three
+    query the Baserow Postgres datasource."""
+    W = 4
+    try:
+        cards = _collection_card_ids()
+        if cards is None:
+            check("10. 3 Metabase questions correct", W, False,
+                  "collection not found / cannot list cards")
             return
-        status, items = _metabase_get(f"/api/collection/{cid}/items?models=card")
-        if status != 200:
-            check("10. 3 Metabase questions exist", 2, False, f"API returned {status}")
+        missing = [n for n in _EXPECTED_CARD_NAMES if n not in cards]
+        if missing:
+            check("10. 3 Metabase questions correct", W, False,
+                  f"missing cards: {missing}")
             return
-        item_data = items.get("data", items) if isinstance(items, dict) else items
-        card_names = [item.get("name") for item in item_data if item.get("model") == "card"]
-        expected_names = [
-            "Effort vs ROI",
-            "Decisions Breakdown",
-            "Total Projected Annual Savings (Approved)",
-        ]
-        missing = [n for n in expected_names if n not in card_names]
-        check("10. 3 Metabase questions exist", 2, len(missing) == 0,
-              f"missing: {missing}" if missing else f"all 3 found among {card_names}")
+
+        # Resolution chain (never hardcoded): Baserow table/field ids ->
+        # physical names database_table_<tid>/field_<fid> -> Metabase table/
+        # field ids via GET /api/database/<db_id>/metadata.
+        table_id = _find_table_id()
+        needed = ["Effort Weeks", "ROI Score", "Decision", "Annual Savings"]
+        br_fid = {n: _field_id(n) for n in needed}
+        if table_id is None or any(v is None for v in br_fid.values()):
+            check("10. 3 Metabase questions correct", W, False,
+                  f"cannot resolve Baserow table/fields: table={table_id}, fids={br_fid}")
+            return
+        pg_db = mb_find_pg_db()
+        if pg_db is None:
+            check("10. 3 Metabase questions correct", W, False,
+                  "no postgres datasource for the 'baserow' DB in Metabase")
+            return
+        pg_db_id = pg_db.get("id")
+        mb_tid, fmap = mb_resolve_table(pg_db_id, f"database_table_{table_id}")
+        col = {n: f"field_{br_fid[n]}" for n in needed}
+        mb_fid = {n: fmap.get(col[n]) for n in needed}
+        sync_ok = mb_tid is not None and all(v is not None for v in mb_fid.values())
+
+        issues = []
+        shapes = {}
+        for name in _EXPECTED_CARD_NAMES:
+            status, card = _metabase_get(f"/api/card/{cards[name]}")
+            if status != 200 or not isinstance(card, dict):
+                issues.append(f"{name}: GET card -> {status}")
+                shapes[name] = None
+            else:
+                shapes[name] = mb_shape(card)
+
+        def _refs_column(strings, logical) -> bool:
+            targets = {col[logical].lower(), logical.lower()}
+            return any(str(s).lower() in targets for s in strings)
+
+        # 1) "Effort vs ROI" — scatter over Effort Weeks / ROI Score.
+        sh = shapes.get("Effort vs ROI")
+        if sh is not None:
+            if sh["database"] != pg_db_id:
+                issues.append(f"Effort vs ROI: database={sh['database']}, expected {pg_db_id}")
+            if sh["display"] != "scatter":
+                issues.append(f"Effort vs ROI: display={sh['display']!r}, expected 'scatter'")
+            if not sh["is_native"]:
+                if not sync_ok:
+                    issues.append("Effort vs ROI: Migration Candidates table not "
+                                  "synced into Metabase (cannot resolve field ids)")
+                else:
+                    fids = set(sh["breakout_fids"]) | set(sh["fields_fids"])
+                    mbql_ok = (sh["source_table"] == mb_tid
+                               and mb_fid["Effort Weeks"] in fids
+                               and mb_fid["ROI Score"] in fids)
+                    viz = sh["visualization_settings"]
+                    axes = list(viz.get("graph.dimensions") or []) + \
+                        list(viz.get("graph.metrics") or [])
+                    viz_ok = (sh["source_table"] == mb_tid
+                              and _refs_column(axes, "Effort Weeks")
+                              and _refs_column(axes, "ROI Score"))
+                    if not (mbql_ok or viz_ok):
+                        issues.append("Effort vs ROI: neither MBQL breakout/fields "
+                                      "nor viz dimensions/metrics bind "
+                                      "Effort Weeks + ROI Score")
+            else:
+                err = _scatter_pairs_from_execution(cards["Effort vs ROI"])
+                if err:
+                    issues.append(f"Effort vs ROI (native): {err}")
+
+        # 2) "Decisions Breakdown" — pie of count by Decision.
+        sh = shapes.get("Decisions Breakdown")
+        if sh is not None:
+            if sh["database"] != pg_db_id:
+                issues.append(f"Decisions Breakdown: database={sh['database']}, expected {pg_db_id}")
+            if sh["display"] != "pie":
+                issues.append(f"Decisions Breakdown: display={sh['display']!r}, expected 'pie'")
+            if not sh["is_native"]:
+                if not sync_ok:
+                    issues.append("Decisions Breakdown: table not synced into Metabase")
+                else:
+                    if sh["source_table"] != mb_tid:
+                        issues.append(f"Decisions Breakdown: source_table={sh['source_table']}, expected {mb_tid}")
+                    if sh["agg_ops"] != {"count"}:
+                        issues.append(f"Decisions Breakdown: agg={sh['agg_ops']}, expected count")
+                    if sh["breakout_fids"] != [mb_fid["Decision"]]:
+                        issues.append(f"Decisions Breakdown: breakout={sh['breakout_fids']}, "
+                                      f"expected [{mb_fid['Decision']}] (Decision)")
+            else:
+                err = _pie_rows_from_execution(cards["Decisions Breakdown"])
+                if err:
+                    issues.append(f"Decisions Breakdown (native): {err}")
+
+        # 3) Scalar — sum(Annual Savings) where Decision = Approve. The
+        # execution assertion applies to MBQL and native forms alike.
+        scalar_name = "Total Projected Annual Savings (Approved)"
+        sh = shapes.get(scalar_name)
+        if sh is not None:
+            if sh["database"] != pg_db_id:
+                issues.append(f"scalar: database={sh['database']}, expected {pg_db_id}")
+            if sh["display"] != "scalar":
+                issues.append(f"scalar: display={sh['display']!r}, expected 'scalar'")
+            if not sh["is_native"]:
+                if not sync_ok:
+                    issues.append("scalar: table not synced into Metabase")
+                else:
+                    if sh["source_table"] != mb_tid:
+                        issues.append(f"scalar: source_table={sh['source_table']}, expected {mb_tid}")
+                    if sh["agg_ops"] != {("sum", mb_fid["Annual Savings"])}:
+                        issues.append(f"scalar: agg={sh['agg_ops']}, expected "
+                                      f"sum(fid {mb_fid['Annual Savings']} = Annual Savings)")
+                    fsum = mb_filter_summary(sh["filters"])
+                    approve_ids = {oid for oid, val in _decision_option_map().items()
+                                   if val == "Approve"}
+                    filter_ok = False
+                    if len(fsum) == 1:
+                        op, fid, vals = fsum[0]
+                        if op == "=" and fid == mb_fid["Decision"] and len(vals) == 1:
+                            v = vals[0]
+                            if isinstance(v, float) and v == int(v):
+                                v = int(v)
+                            # single-select filter value may be the option id
+                            # or the option text — accept both.
+                            filter_ok = str(v) == "Approve" or str(v) in approve_ids
+                    if not filter_ok:
+                        issues.append(f"scalar: filter {fsum} != Decision == 'Approve'")
+            expected_total = round(sum(c["savings"] for c in APPROVED), 2)
+            try:
+                _cols, rows = mb_run_card(cards[scalar_name])
+                if len(rows) != 1 or not rows[0]:
+                    issues.append(f"scalar execution returned {len(rows)} row(s), expected 1")
+                else:
+                    val = float(rows[0][0])
+                    if abs(val - expected_total) > 0.01:
+                        issues.append(f"scalar executes to {val}, expected {expected_total}")
+            except (RuntimeError, TypeError, ValueError) as e:
+                issues.append(f"scalar execution failed: {e}")
+
+        passed = len(issues) == 0
+        check("10. 3 Metabase questions correct", W, passed,
+              "; ".join(issues[:4]) if issues else
+              f"all 3 cards verified against pg db {pg_db_id} "
+              f"(table database_table_{table_id})")
     except Exception as e:
-        check("10. 3 Metabase questions exist", 2, False, f"exception: {e}")
+        check("10. 3 Metabase questions correct", W, False, f"exception: {e}")
 
 
 def check_11_metabase_dashboard() -> None:
@@ -614,12 +1169,27 @@ def check_12_dashboard_cards() -> None:
         if status2 != 200:
             check("12. Dashboard has 3 cards", 1, False, f"cannot fetch dashboard: {status2}")
             return
-        # Count cards that are question cards (not text/heading cards)
-        cards = dash_detail.get("dashcards", dash_detail.get("ordered_cards", []))
-        question_cards = [c for c in cards if c.get("card_id") or c.get("card", {}).get("id")]
-        count = len(question_cards)
-        check("12. Dashboard has 3 cards", 1, count >= 3,
-              f"found {count} question cards")
+        # Question cards only (not text/heading cards), bound by card id
+        # where available and resolved to the card's name.
+        dashcards = dash_detail.get("dashcards", dash_detail.get("ordered_cards", []))
+        id_to_name = {v: k for k, v in (_collection_card_ids() or {}).items()}
+        names = []
+        for c in dashcards:
+            card_obj = c.get("card") or {}
+            card_id = c.get("card_id") or card_obj.get("id")
+            if not card_id:
+                continue
+            name = id_to_name.get(card_id) or card_obj.get("name")
+            if name is None:
+                status3, card_json = _metabase_get(f"/api/card/{card_id}")
+                name = (card_json.get("name")
+                        if status3 == 200 and isinstance(card_json, dict)
+                        else f"<card {card_id}>")
+            names.append(name)
+        expected = set(_EXPECTED_CARD_NAMES)
+        ok = set(names) == expected and len(names) == 3
+        check("12. Dashboard has 3 cards", 1, ok,
+              f"dashcards={sorted(names)}, expected exactly {sorted(expected)}")
     except Exception as e:
         check("12. Dashboard has 3 cards", 1, False, f"exception: {e}")
 
@@ -661,8 +1231,13 @@ def check_13_op_version() -> None:
         check("13. OpenProject version exists", 2, False, f"exception: {e}")
 
 
+def _expected_epic_subjects() -> list[str]:
+    return [f"Migrate: {c['name']}" for c in APPROVED]
+
+
 def check_14_op_epic_subjects() -> None:
-    """Check 2 Epic work packages exist for approved candidates."""
+    """The set of Epic subjects LIKE 'Migrate:%' (type Epic) equals exactly
+    the expected Approve-derived subjects — extras fail."""
     try:
         sql = (
             "SELECT wp.subject "
@@ -671,78 +1246,62 @@ def check_14_op_epic_subjects() -> None:
             "JOIN types t ON wp.type_id = t.id "
             "WHERE p.identifier = 'data-analytics-pipeline' "
             "AND t.name = 'Epic' "
+            "AND wp.subject LIKE 'Migrate:%' "
             "ORDER BY wp.subject"
         )
         result = op_db_query(sql)
-        if not result:
-            check("14. 2 Epic work packages for approved candidates", 2, False, "no epics found")
-            return
-        subjects = [s.strip() for s in result.split("\n") if s.strip()]
-        expected_subjects = [
-            "Migrate: Migrate Hadoop Cluster to EMR Serverless",
-            "Migrate: Replace Talend ETL with dbt Cloud",
-        ]
-        missing = [s for s in expected_subjects if s not in subjects]
-        extra = [s for s in subjects if s not in expected_subjects]
-        errors = []
+        subjects = {s.strip() for s in result.split("\n") if s.strip()}
+        expected = set(_expected_epic_subjects())
+        missing = sorted(expected - subjects)
+        extra = sorted(subjects - expected)
+        passed = not missing and not extra
+        detail = f"{len(subjects)} 'Migrate:' epic(s)"
         if missing:
-            errors.append(f"missing: {missing}")
+            detail += f"; missing: {missing}"
         if extra:
-            errors.append(f"extra epics: {extra}")
-        passed = len(missing) == 0 and len(subjects) == 2
-        check("14. 2 Epic work packages for approved candidates", 2, passed,
-              "; ".join(errors) if errors else f"found: {subjects}")
+            detail += f"; extra: {extra}"
+        if passed:
+            detail = "exactly the 2 expected epics"
+        check("14. 2 Epic work packages for approved candidates", 2, passed, detail)
     except Exception as e:
         check("14. 2 Epic work packages for approved candidates", 2, False, f"exception: {e}")
 
 
 def check_15_op_descriptions() -> None:
-    """Check work package descriptions contain correct values."""
+    """Each approved Epic's description (fetched per id) matches the full
+    anchored template 'Effort: <E> weeks; Annual Savings: <S>; ROI: <R>;
+    Strategic Alignment: <A>' with tolerant numeric variants."""
     try:
-        sql = (
-            "SELECT wp.subject, wp.description "
-            "FROM work_packages wp "
-            "JOIN projects p ON wp.project_id = p.id "
-            "JOIN types t ON wp.type_id = t.id "
-            "WHERE p.identifier = 'data-analytics-pipeline' "
-            "AND t.name = 'Epic' "
-            "AND (wp.subject LIKE 'Migrate:%')"
-        )
-        result = op_db_query(sql)
-        if not result:
-            check("15. Epic descriptions correct", 2, False, "no epics found")
-            return
-        rows = [r.strip() for r in result.split("\n") if r.strip()]
         errors = []
         for cand in APPROVED:
-            expected_subject = f"Migrate: {cand['name']}"
-            found = False
-            for row in rows:
-                if expected_subject in row:
-                    found = True
-                    desc = row.split("|", 1)[1] if "|" in row else ""
-                    # Check key values in description
-                    checks_list = [
-                        (f"{cand['effort']}", "effort"),
-                        (f"{cand['savings']}", "savings"),
-                        (f"{cand['roi']}", "roi"),
-                        (cand["alignment"], "alignment"),
-                    ]
-                    for val, label in checks_list:
-                        if str(val) not in desc:
-                            # Try alternate formats
-                            if label == "savings":
-                                alt = f"{int(cand['savings'])}"
-                                if alt not in desc:
-                                    errors.append(f"{cand['id']}: {label} value {val} not in description")
-                            else:
-                                errors.append(f"{cand['id']}: {label} value {val} not in description")
-                    break
-            if not found:
-                errors.append(f"{cand['id']}: epic '{expected_subject}' not found")
+            subj = f"Migrate: {cand['name']}".replace("'", "''")
+            wp_id = op_db_query(
+                "SELECT wp.id FROM work_packages wp "
+                "JOIN projects p ON wp.project_id = p.id "
+                "JOIN types t ON wp.type_id = t.id "
+                "WHERE p.identifier = 'data-analytics-pipeline' "
+                "AND t.name = 'Epic' "
+                f"AND wp.subject = '{subj}' ORDER BY wp.id LIMIT 1"
+            )
+            if not wp_id:
+                errors.append(f"{cand['id']}: epic 'Migrate: {cand['name']}' not found")
+                continue
+            desc = op_db_query(
+                f"SELECT COALESCE(description, '') FROM work_packages WHERE id = {wp_id}"
+            )
+            desc_clean = re.sub(r"\s+", " ", desc).strip()
+            pattern = (
+                rf"^Effort: {_num_re(cand['effort'])} weeks; "
+                rf"Annual Savings: {_num_re(cand['savings'], max_dec_zeros=2)}; "
+                rf"ROI: {_num_re(cand['roi'])}; "
+                rf"Strategic Alignment: {re.escape(cand['alignment'])}$"
+            )
+            if not re.match(pattern, desc_clean):
+                errors.append(f"{cand['id']}: desc={desc_clean!r:.90} "
+                              f"does not match the exact template")
         passed = len(errors) == 0
         check("15. Epic descriptions correct", 2, passed,
-              "; ".join(errors) if errors else "")
+              "; ".join(errors) if errors else "both descriptions match the template")
     except Exception as e:
         check("15. Epic descriptions correct", 2, False, f"exception: {e}")
 
@@ -789,6 +1348,86 @@ def check_16_op_priorities() -> None:
         check("16. Epic priorities correct", 1, False, f"exception: {e}")
 
 
+_op_assignment_rows = None
+_op_assignment_err = None
+
+
+def _epic_assignment_rows() -> list[tuple[str, str, str]]:
+    """(subject, assignee login, version name) for every 'Migrate:' Epic,
+    queried once with a \\x1f field separator (subjects may contain '|')."""
+    global _op_assignment_rows, _op_assignment_err
+    if _op_assignment_err:
+        raise RuntimeError(_op_assignment_err)
+    if _op_assignment_rows is not None:
+        return _op_assignment_rows
+    sql = (
+        "SELECT wp.subject, COALESCE(u.login, '<none>'), COALESCE(v.name, '<none>') "
+        "FROM work_packages wp "
+        "JOIN projects p ON p.id = wp.project_id AND p.identifier = 'data-analytics-pipeline' "
+        "JOIN types t    ON t.id = wp.type_id    AND t.name = 'Epic' "
+        "LEFT JOIN users    u ON u.id = wp.assigned_to_id "
+        "LEFT JOIN versions v ON v.id = wp.version_id "
+        "WHERE wp.subject LIKE 'Migrate:%'"
+    )
+    r = subprocess.run(
+        ["docker", "exec", "-e", "PGPASSWORD=openproject",
+         OPENPROJECT_CONTAINER,
+         "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
+         "-t", "-A", "-F", "\x1f", "-c", sql],
+        capture_output=True, text=True, errors="replace", timeout=15,
+    )
+    if r.returncode != 0:
+        _op_assignment_err = f"OpenProject DB query failed: {r.stderr.strip()}"
+        raise RuntimeError(_op_assignment_err)
+    rows = []
+    for line in r.stdout.strip().split("\n"):
+        parts = line.split("\x1f")
+        if len(parts) == 3:
+            rows.append((parts[0], parts[1], parts[2]))
+    _op_assignment_rows = rows
+    return rows
+
+
+def check_17_op_epic_assignee() -> None:
+    """Every expected 'Migrate:' Epic (ck14's row set) is assigned to the
+    login user9 — missing Epic or assignee scores 0."""
+    try:
+        by_subject = {s: (login, ver) for s, login, ver in _epic_assignment_rows()}
+        errors = []
+        for subj in _expected_epic_subjects():
+            if subj not in by_subject:
+                errors.append(f"'{subj}': epic missing")
+            elif by_subject[subj][0] != "user9":
+                errors.append(f"'{subj}': assignee={by_subject[subj][0]}, expected user9")
+        passed = len(errors) == 0
+        check("17. Epic assignee user9", 2, passed,
+              "; ".join(errors) if errors else "both epics assigned to user9")
+    except Exception as e:
+        check("17. Epic assignee user9", 2, False, f"exception: {e}")
+
+
+def check_18_op_epic_version() -> None:
+    """Every expected 'Migrate:' Epic is assigned to the version
+    'Migration-Portfolio-2026-10-08' — missing Epic/version or a different
+    version scores 0."""
+    try:
+        expected_version = "Migration-Portfolio-2026-10-08"
+        by_subject = {s: (login, ver) for s, login, ver in _epic_assignment_rows()}
+        errors = []
+        for subj in _expected_epic_subjects():
+            if subj not in by_subject:
+                errors.append(f"'{subj}': epic missing")
+            elif by_subject[subj][1] != expected_version:
+                errors.append(f"'{subj}': version={by_subject[subj][1]}, "
+                              f"expected {expected_version}")
+        passed = len(errors) == 0
+        check("18. Epic version assignment", 3, passed,
+              "; ".join(errors) if errors else
+              f"both epics in version {expected_version}")
+    except Exception as e:
+        check("18. Epic version assignment", 3, False, f"exception: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     check_1_baserow_database_exists()
@@ -797,6 +1436,7 @@ def main() -> None:
     check_4_roi_score()
     check_5_decision()
     check_6_ranked_candidates_view()
+    check_6b_field_schema()
     check_7_section_marker()
     check_8_comment_lines()
     check_9_metabase_collection()
@@ -807,6 +1447,8 @@ def main() -> None:
     check_14_op_epic_subjects()
     check_15_op_descriptions()
     check_16_op_priorities()
+    check_17_op_epic_assignee()
+    check_18_op_epic_version()
 
     total = sum(w for _, w, _, _ in _checks)
     earned = sum(w for _, w, p, _ in _checks if p)

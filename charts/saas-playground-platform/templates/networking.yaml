@@ -1,0 +1,61 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.gateway.name }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+  {{- if .Values.gateway.certMap }}
+  annotations:
+    networking.gke.io/certmap: {{ .Values.gateway.certMap }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ .Values.gateway.className }}
+  {{- if .Values.gateway.addressName }}
+  addresses:
+    - type: NamedAddress
+      value: {{ .Values.gateway.addressName }}
+  {{- end }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ .Values.gateway.wildcardHost | quote }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+      {{- if and (not .Values.gateway.certMap) .Values.gateway.tlsSecretName }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: {{ .Values.gateway.tlsSecretName }}
+      {{- end }}
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: {{ .Values.gateway.wildcardHost | quote }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+# The service's exact-host API route wins over the wildcard run-router route on HTTPS. The API stays
+# unavailable on the plaintext listener; there, the router rejects its non-run hostname with 404.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "pg.name" . }}-api
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    saas-playground.route: "true"
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      sectionName: https
+  hostnames:
+    - {{ .Values.gateway.apiHost | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ include "pg.name" . }}
+          port: {{ .Values.service.port }}
+{{- end }}

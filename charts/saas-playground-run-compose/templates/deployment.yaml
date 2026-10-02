@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "run.fullname" . }}
+  labels:
+    {{- include "run.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "run.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "run.labels" . | nindent 8 }}
+      annotations:
+        # Compose state uses pod-local emptyDir volumes. On Autopilot this requests extended runtime
+        # for the benchmark window; the grader rejects any replacement instead of scoring reset data.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        # Name the exec target explicitly. Without this, `kubectl exec <pod>` still picks the first
+        # container (the web service, below) but prints `Defaulted container "app" out of: ...` to
+        # STDERR. Bundled verifiers surface exec stderr verbatim in their failure detail, so that
+        # warning masked the real psql/mysql error and turned graded checks into check_exception
+        # (observed: business_084's four Pretix checks). With the annotation kubectl selects the
+        # same container silently, leaving stderr for genuine errors only.
+        kubectl.kubernetes.io/default-container: {{ .Values.mainContainer.name | default "app" }}
+    spec:
+      # Per-run pods don't talk to the K8s API; no SA token reduces the blast radius if any of
+      # the seeded mw-* images is compromised. The shim grader execs in from the service pod.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # One pod = shared localhost; map each compose service name to 127.0.0.1 so the web service's
+      # inter-service URLs (e.g. postgres://...@<run>-postgres:5432) resolve in-pod.
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.initContainers }}
+      # Seed each emptyDir from its image's baked volume data (Docker named-volume-from-image
+      # semantics, which emptyDir doesn't provide) so seeded compose apps don't boot empty.
+      initContainers:
+        {{- range . }}
+        - name: {{ .name }}
+          image: {{ .image }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          {{- with .command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if not (kindIs "invalid" .runAsUser) }}
+          securityContext:
+            runAsUser: {{ .runAsUser }}
+          {{- end }}
+          resources:
+            {{- toYaml $.Values.initResources | nindent 12 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        # Web service first, so `kubectl exec <pod>` (no -c) targets it.
+        - name: {{ .Values.mainContainer.name | default "app" }}
+          image: {{ .Values.mainContainer.image | required "mainContainer.image is required" }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          {{- with .Values.mainContainer.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.mainContainer.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mainContainer.containerPort }}
+          {{- with .Values.mainContainer.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.mainContainer.volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.mainContainer.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # TCP readiness (apps 403 on "/" unauthenticated); waits for the web service to bind.
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.mainContainer.containerPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 120
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        {{- range .Values.sidecars }}
+        - name: {{ .name }}
+          image: {{ .image }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          {{- with .command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $.Values.sidecarResources | nindent 12 }}
+        {{- end }}
+      {{- with .Values.volumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

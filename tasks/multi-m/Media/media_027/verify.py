@@ -160,8 +160,16 @@ def llm_judge_vision(
     condition: str,
     timeout: int = 45,
 ) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+    _missing = [_n for _n in ("JUDGE_MODEL", "JUDGE_BASE_URL", "JUDGE_API_KEY")
+                if not os.getenv(_n, "").strip()]
+    if _missing:
+        # The judge is configured independently of the agent's model (see
+        # saas_bench.verify_runner.normalize_judge_env): a benchmark needs ONE fixed grader, or
+        # columns scored by different models are not comparable. Say which piece is missing rather
+        # than posting an empty model name and reporting the provider's HTTP error.
+        return False, "judge not configured: " + ", ".join(_missing) + " not set"
+    api_base = os.getenv("JUDGE_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY", "")
 
     ext = os.path.splitext(image_path)[1].lower().lstrip(".")
     mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
@@ -189,7 +197,7 @@ def llm_judge_vision(
             headers={"Authorization": f"Bearer {api_key}",
                      "Content-Type": "application/json"},
             json={
-                "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+                "model": os.getenv("JUDGE_MODEL", ""),
                 "messages": [{
                     "role": "user",
                     "content": [

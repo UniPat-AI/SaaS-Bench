@@ -1,0 +1,7 @@
+apiVersion: v2
+name: saas-playground-run-compose
+description: One per-run preview env for a multi-container (compose) app — every compose service as a
+  container in a single pod, inter-service hostnames resolved via hostAliases, named volumes as emptyDir.
+type: application
+version: 0.2.0
+appVersion: "0.1.0"

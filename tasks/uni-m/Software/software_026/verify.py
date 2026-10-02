@@ -1,7 +1,7 @@
 """
 Verifier for Software-026-I1: Q4-2024 Engineering Investment Portfolio Review
 
-Checks: 12 weighted checks across openproject, baserow, code-server.
+Checks: 14 weighted checks (total weight 28) across openproject, baserow, code-server.
 Strategy: OpenProject embedded Postgres, Baserow REST API, code-server docker exec.
 
 Required env vars:
@@ -11,9 +11,11 @@ Required env vars:
 """
 
 import os
+import re
 import sys
 import subprocess
 import json
+import unicodedata
 import requests
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
@@ -243,13 +245,15 @@ def select_value(val) -> str:
 
 # ── Cached Baserow state ─────────────────────────────────────────────────────
 _br_db_id = None
+_br_cwp_tid = None   # Closed Work Packages table id
+_br_bt_tid = None    # Bucket Totals table id
 _br_cwp_rows = None  # Closed Work Packages rows
 _br_bt_rows = None   # Bucket Totals rows
 
 
 def load_baserow_state():
     """Load Baserow database, tables and rows into cache."""
-    global _br_db_id, _br_cwp_rows, _br_bt_rows
+    global _br_db_id, _br_cwp_tid, _br_bt_tid, _br_cwp_rows, _br_bt_rows
     if _br_db_id is not None:
         return
 
@@ -259,13 +263,27 @@ def load_baserow_state():
         return
     _br_db_id = db_id
 
-    cwp_tid = find_baserow_table(db_id, "Closed Work Packages")
-    if cwp_tid:
-        _br_cwp_rows = get_baserow_rows(cwp_tid)
+    _br_cwp_tid = find_baserow_table(db_id, "Closed Work Packages")
+    if _br_cwp_tid:
+        _br_cwp_rows = get_baserow_rows(_br_cwp_tid)
 
-    bt_tid = find_baserow_table(db_id, "Bucket Totals")
-    if bt_tid:
-        _br_bt_rows = get_baserow_rows(bt_tid)
+    _br_bt_tid = find_baserow_table(db_id, "Bucket Totals")
+    if _br_bt_tid:
+        _br_bt_rows = get_baserow_rows(_br_bt_tid)
+
+
+def _cwp_rows_by_wp_id() -> dict[int, dict]:
+    """Index Closed Work Packages rows by integer WP ID (rows with an empty or
+    non-numeric WP ID are simply not indexable — the GT-driven checks then
+    report the corresponding GT WP as missing)."""
+    by_id: dict[int, dict] = {}
+    for row in _br_cwp_rows or []:
+        try:
+            wp_id = int(float(row.get("WP ID")))
+        except (TypeError, ValueError):
+            continue
+        by_id.setdefault(wp_id, row)
+    return by_id
 
 
 # ── Individual checks ─────────────────────────────────────────────────────────
@@ -280,28 +298,48 @@ def check_1_baserow_db_exists() -> None:
         check("1. Baserow DB exists", 1, False, f"exception: {e}")
 
 
-def check_2_cwp_table_row_count() -> None:
-    """'Closed Work Packages' table exists with correct row count."""
+def check_2_cwp_table_rows() -> None:
+    """'Closed Work Packages' table has exactly the GT rows: row count AND
+    WP ID set equality (rows with empty/non-numeric WP IDs count as extra)."""
     try:
         compute_ground_truth()
         load_baserow_state()
         if _gt_err:
-            check("2. CWP table row count", 2, False, f"ground truth error: {_gt_err}")
+            check("2. CWP table rows", 2, False, f"ground truth error: {_gt_err}")
             return
         if _br_cwp_rows is None:
-            check("2. CWP table row count", 2, False, "table not found")
+            check("2. CWP table rows", 2, False, "table not found")
             return
-        expected = len(_gt['wps'])
-        actual = len(_br_cwp_rows)
-        ok = actual == expected
-        check("2. CWP table row count", 2, ok,
-              f"expected={expected}, actual={actual}")
+
+        expected_ids = {wp['wp_id'] for wp in _gt['wps']}
+        actual_ids: list[int] = []
+        bad_id_rows = 0
+        for row in _br_cwp_rows:
+            try:
+                actual_ids.append(int(float(row.get("WP ID"))))
+            except (TypeError, ValueError):
+                bad_id_rows += 1
+
+        missing = sorted(expected_ids - set(actual_ids))
+        extra = sorted(set(actual_ids) - expected_ids)
+        count_ok = len(_br_cwp_rows) == len(_gt['wps'])
+        ok = count_ok and not missing and not extra and bad_id_rows == 0
+
+        detail = f"gt_rows={len(_gt['wps'])}, table_rows={len(_br_cwp_rows)}"
+        if missing:
+            detail += f", missing WP IDs: {missing}"
+        if extra:
+            detail += f", extra WP IDs: {extra}"
+        if bad_id_rows:
+            detail += f", {bad_id_rows} row(s) with empty/invalid WP ID"
+        check("2. CWP table rows", 2, ok, detail)
     except Exception as e:
-        check("2. CWP table row count", 2, False, f"exception: {e}")
+        check("2. CWP table rows", 2, False, f"exception: {e}")
 
 
 def check_3_cwp_bucket_classification() -> None:
-    """Closed WPs have correct Investment Bucket classification."""
+    """Every GT WP has a row with the correct Investment Bucket (GT-driven:
+    a missing row or an empty bucket is wrong, no short-circuits)."""
     try:
         compute_ground_truth()
         load_baserow_state()
@@ -310,23 +348,22 @@ def check_3_cwp_bucket_classification() -> None:
                   _gt_err or "table not found")
             return
 
-        # Build expected bucket by WP ID
-        expected_buckets = {wp['wp_id']: wp['bucket'] for wp in _gt['wps']}
-
+        by_id = _cwp_rows_by_wp_id()
         wrong = []
-        for row in _br_cwp_rows:
-            wp_id_val = row.get("WP ID")
-            if wp_id_val is None:
+        for wp in _gt['wps']:
+            row = by_id.get(wp['wp_id'])
+            if row is None:
+                wrong.append(f"WP#{wp['wp_id']}: row missing")
                 continue
-            wp_id = int(wp_id_val) if not isinstance(wp_id_val, int) else wp_id_val
             actual_bucket = select_value(row.get("Investment Bucket", ""))
-            expected_bucket = expected_buckets.get(wp_id)
-            if expected_bucket and actual_bucket != expected_bucket:
-                wrong.append(f"WP#{wp_id}: expected={expected_bucket}, got={actual_bucket}")
+            if actual_bucket != wp['bucket']:
+                wrong.append(f"WP#{wp['wp_id']}: expected={wp['bucket']}, "
+                             f"got={actual_bucket or '<empty>'}")
 
-        ok = len(wrong) == 0 and len(_br_cwp_rows) > 0
+        ok = len(wrong) == 0 and len(_gt['wps']) > 0
         check("3. CWP bucket classification", 2, ok,
-              f"{len(wrong)} wrong" if wrong else f"all {len(_br_cwp_rows)} correct")
+              f"{len(wrong)} wrong of {len(_gt['wps'])}" if wrong
+              else f"all {len(_gt['wps'])} correct")
         if wrong:
             for w in wrong[:5]:
                 print(f"  detail: {w}", file=sys.stderr)
@@ -335,7 +372,8 @@ def check_3_cwp_bucket_classification() -> None:
 
 
 def check_4_cwp_team_assignment() -> None:
-    """Closed WPs have correct Team assignments."""
+    """Every GT WP has a row with the correct Team (GT-driven: a missing row
+    or an empty team is wrong, no short-circuits)."""
     try:
         compute_ground_truth()
         load_baserow_state()
@@ -344,24 +382,62 @@ def check_4_cwp_team_assignment() -> None:
                   _gt_err or "table not found")
             return
 
-        expected_teams = {wp['wp_id']: wp['team'] for wp in _gt['wps']}
-
+        by_id = _cwp_rows_by_wp_id()
         wrong = []
-        for row in _br_cwp_rows:
-            wp_id_val = row.get("WP ID")
-            if wp_id_val is None:
+        for wp in _gt['wps']:
+            row = by_id.get(wp['wp_id'])
+            if row is None:
+                wrong.append(f"WP#{wp['wp_id']}: row missing")
                 continue
-            wp_id = int(wp_id_val) if not isinstance(wp_id_val, int) else wp_id_val
             actual_team = select_value(row.get("Team", ""))
-            expected_team = expected_teams.get(wp_id)
-            if expected_team and actual_team != expected_team:
-                wrong.append(f"WP#{wp_id}: expected={expected_team}, got={actual_team}")
+            if actual_team != wp['team']:
+                wrong.append(f"WP#{wp['wp_id']}: expected={wp['team']}, "
+                             f"got={actual_team or '<empty>'}")
 
-        ok = len(wrong) == 0 and len(_br_cwp_rows) > 0
+        ok = len(wrong) == 0 and len(_gt['wps']) > 0
         check("4. CWP team assignment", 2, ok,
-              f"{len(wrong)} wrong" if wrong else f"all {len(_br_cwp_rows)} correct")
+              f"{len(wrong)} wrong of {len(_gt['wps'])}" if wrong
+              else f"all {len(_gt['wps'])} correct")
     except Exception as e:
         check("4. CWP team assignment", 2, False, f"exception: {e}")
+
+
+def check_4b_cwp_row_fields() -> None:
+    """Per GT WP: Subject, Type, Assignee and Closed Date match the GT values
+    recomputed from OpenProject (Closed Date compared as ::date)."""
+    try:
+        compute_ground_truth()
+        load_baserow_state()
+        if _gt_err or _br_cwp_rows is None:
+            check("4b. CWP row field equality", 3, False,
+                  _gt_err or "table not found")
+            return
+
+        by_id = _cwp_rows_by_wp_id()
+        wrong = []
+        for wp in _gt['wps']:
+            row = by_id.get(wp['wp_id'])
+            if row is None:
+                wrong.append(f"WP#{wp['wp_id']}: row missing")
+                continue
+            subject = str(row.get("Subject") or "")
+            if subject != wp['subject']:
+                wrong.append(f"WP#{wp['wp_id']}: Subject={subject!r}, expected={wp['subject']!r}")
+            wp_type = select_value(row.get("Type", ""))
+            if wp_type != wp['type']:
+                wrong.append(f"WP#{wp['wp_id']}: Type={wp_type!r}, expected={wp['type']!r}")
+            assignee = str(row.get("Assignee") or "")
+            if assignee != wp['assignee']:
+                wrong.append(f"WP#{wp['wp_id']}: Assignee={assignee!r}, expected={wp['assignee']!r}")
+            closed = str(row.get("Closed Date") or "")[:10]
+            if closed != wp['closed_date']:
+                wrong.append(f"WP#{wp['wp_id']}: Closed Date={closed!r}, expected={wp['closed_date']!r}")
+
+        ok = len(wrong) == 0 and len(_gt['wps']) > 0
+        check("4b. CWP row field equality", 3, ok,
+              f"all {len(_gt['wps'])} rows match" if ok else "; ".join(wrong[:4]))
+    except Exception as e:
+        check("4b. CWP row field equality", 3, False, f"exception: {e}")
 
 
 def check_5_bucket_totals_exists() -> None:
@@ -414,7 +490,9 @@ def check_6_bucket_totals_count_share() -> None:
 
             if actual_count != exp['count']:
                 wrong.append(f"{bucket} Count: expected={exp['count']}, got={actual_count}")
-            if actual_share is not None and abs(float(actual_share) - exp['share_pct']) > 0.15:
+            if actual_share is None:
+                wrong.append(f"{bucket} Share: expected={exp['share_pct']}, got=<empty>")
+            elif abs(float(actual_share) - exp['share_pct']) > 0.15:
                 wrong.append(f"{bucket} Share: expected={exp['share_pct']}, got={actual_share}")
 
         ok = len(wrong) == 0 and len(_br_bt_rows) > 0
@@ -440,6 +518,7 @@ def check_7_bucket_totals_target_gap() -> None:
             bucket = select_value(row.get("Bucket", ""))
             exp = expected_by_bucket.get(bucket)
             if not exp:
+                wrong.append(f"{bucket or '<empty>'}: unexpected bucket")
                 continue
 
             actual_target = row.get("Target Pct")
@@ -449,9 +528,13 @@ def check_7_bucket_totals_target_gap() -> None:
             if isinstance(actual_gap, str):
                 actual_gap = float(actual_gap)
 
-            if actual_target is not None and abs(float(actual_target) - exp['target_pct']) > 0.15:
+            if actual_target is None:
+                wrong.append(f"{bucket} Target: expected={exp['target_pct']}, got=<empty>")
+            elif abs(float(actual_target) - exp['target_pct']) > 0.15:
                 wrong.append(f"{bucket} Target: expected={exp['target_pct']}, got={actual_target}")
-            if actual_gap is not None and abs(float(actual_gap) - exp['gap_pct']) > 0.15:
+            if actual_gap is None:
+                wrong.append(f"{bucket} Gap: expected={exp['gap_pct']}, got=<empty>")
+            elif abs(float(actual_gap) - exp['gap_pct']) > 0.15:
                 wrong.append(f"{bucket} Gap: expected={exp['gap_pct']}, got={actual_gap}")
 
         ok = len(wrong) == 0 and len(_br_bt_rows) > 0
@@ -459,6 +542,70 @@ def check_7_bucket_totals_target_gap() -> None:
               "all correct" if ok else "; ".join(wrong[:5]))
     except Exception as e:
         check("7. Bucket Target & Gap Pct", 2, False, f"exception: {e}")
+
+
+# Field spec per table: name -> (type, select option set or None,
+#                                number_decimal_places or None)
+_CWP_FIELD_SPEC = {
+    "WP ID": ("number", None, None),
+    "Subject": ("text", None, None),
+    "Type": ("single_select", {"Task", "Bug", "Feature", "Epic", "Milestone"}, None),
+    "Assignee": ("text", None, None),
+    "Investment Bucket": ("single_select",
+                          {"NewFeature", "TechDebt", "Reliability", "Security"}, None),
+    "Team": ("single_select",
+             {"Platform", "Product", "Data", "Security", "Reliability"}, None),
+    "Closed Date": ("date", None, None),
+}
+_BT_FIELD_SPEC = {
+    "Bucket": ("single_select",
+               {"NewFeature", "TechDebt", "Reliability", "Security"}, None),
+    "Count": ("number", None, None),
+    "Share Pct": ("number", None, 1),
+    "Target Pct": ("number", None, 1),
+    "Gap Pct": ("number", None, 1),
+}
+
+
+def check_7b_field_schema() -> None:
+    """Both Baserow tables carry the field types/options/decimals the task
+    specifies, with the correct primary fields (REST fields API)."""
+    try:
+        load_baserow_state()
+        if not _br_cwp_tid or not _br_bt_tid:
+            check("7b. Field schema", 2, False, "table(s) not found")
+            return
+
+        issues = []
+
+        def _check_table(tid: int, spec: dict, primary_name: str, label: str) -> None:
+            fields = br_get(f"database/fields/table/{tid}/")
+            by_name = {f.get("name"): f for f in fields}
+            for name, (ftype, options, decimals) in spec.items():
+                f = by_name.get(name)
+                if f is None:
+                    issues.append(f"{label}.{name}: field missing")
+                    continue
+                if f.get("type") != ftype:
+                    issues.append(f"{label}.{name}: type={f.get('type')!r}, expected {ftype!r}")
+                if options is not None:
+                    got = {o.get("value") for o in f.get("select_options", [])}
+                    if got != options:
+                        issues.append(f"{label}.{name}: options={sorted(got)}, "
+                                      f"expected {sorted(options)}")
+                if decimals is not None and f.get("number_decimal_places") != decimals:
+                    issues.append(f"{label}.{name}: decimals="
+                                  f"{f.get('number_decimal_places')}, expected {decimals}")
+                if name == primary_name and not f.get("primary"):
+                    issues.append(f"{label}.{name}: not the primary field")
+
+        _check_table(_br_cwp_tid, _CWP_FIELD_SPEC, "WP ID", "CWP")
+        _check_table(_br_bt_tid, _BT_FIELD_SPEC, "Bucket", "BT")
+
+        check("7b. Field schema", 2, not issues,
+              "both tables OK" if not issues else "; ".join(issues[:5]))
+    except Exception as e:
+        check("7b. Field schema", 2, False, f"exception: {e}")
 
 
 def check_8_codeserver_file_exists() -> None:
@@ -475,57 +622,90 @@ def check_8_codeserver_file_exists() -> None:
         check("8. Code-server file exists", 1, False, f"exception: {e}")
 
 
+def _norm_report_line(line: str) -> str:
+    """NFC-normalize (canonicalizes em-dash/arrow lookalikes) and collapse
+    internal whitespace so only the characters of the template are compared."""
+    line = unicodedata.normalize("NFC", line)
+    return re.sub(r"\s+", " ", line).strip()
+
+
+# Matches one "<num>%" slot of the share-line templates.
+_PCT_RE = r"(-?\d+(?:\.\d+)?)%"
+
+
+def _check_share_line(line: str, prefix: str, expected: dict[str, float]) -> str | None:
+    """Validate 'Actual/Target shares' line structure exactly and each numeric
+    value against GT (tolerant numeric regex per value; structure is fixed:
+    bucket order, '; ' separators, em dash after the prefix)."""
+    pattern = (
+        rf"^{re.escape(prefix)} — "
+        rf"NewFeature: {_PCT_RE}; TechDebt: {_PCT_RE}; "
+        rf"Reliability: {_PCT_RE}; Security: {_PCT_RE}$"
+    )
+    m = re.match(pattern, line)
+    if not m:
+        return f"structure mismatch: {line!r}"
+    for got, bucket in zip(m.groups(), BUCKET_ORDER):
+        if abs(float(got) - expected[bucket]) > 0.05:
+            return f"{bucket}: got {got}%, expected {expected[bucket]}%"
+    return None
+
+
 def check_9_codeserver_file_content() -> None:
-    """Markdown file has the five expected lines with correct data."""
+    """Markdown file consists of exactly the five GT-derived lines (exact
+    sequence equality after unicode normalization; share values via tolerant
+    numeric regex inside the fixed template)."""
     try:
         compute_ground_truth()
+        if _gt_err:
+            check("9. Code-server file content", 3, False,
+                  f"ground truth error: {_gt_err}")
+            return
         rc, out, err = docker_exec(
             CS_CONTAINER, "cat",
             "/home/coder/workspace/devops-configs/docs/portfolio-review-Q4-2024.md",
         )
         if rc != 0:
-            check("9. Code-server file content", 2, False, "cannot read file")
+            check("9. Code-server file content", 3, False, "cannot read file")
             return
 
-        lines = [l for l in out.strip().split('\n') if l.strip()]
+        lines = [_norm_report_line(l) for l in out.split('\n')]
+        lines = [l for l in lines if l]
 
         issues = []
-        # Line 1: title
-        if not lines or "Engineering Investment Portfolio" not in lines[0]:
-            issues.append("line 1 missing/wrong title")
-        # Line 2: window
-        if len(lines) < 2 or "2024-10-01" not in lines[1] or "2024-12-31" not in lines[1]:
-            issues.append("line 2 missing/wrong window dates")
-        # Line 3: total closed
-        if _gt and len(lines) >= 3:
-            expected_total = str(_gt['total'])
-            if expected_total not in lines[2]:
-                issues.append(f"line 3 expected total={expected_total}, got: {lines[2]}")
-        elif len(lines) < 3:
-            issues.append("line 3 missing")
-        # Line 4: actual shares
-        if _gt and len(lines) >= 4:
-            for bt in _gt['bucket_totals']:
-                share_str = str(bt['share_pct'])
-                if share_str not in lines[3]:
-                    issues.append(f"line 4 missing {bt['bucket']} share {share_str}")
-                    break
-        elif len(lines) < 4:
+        if len(lines) != 5:
+            issues.append(f"expected exactly 5 non-empty lines, got {len(lines)}")
+
+        expected_fixed = [
+            _norm_report_line("# Engineering Investment Portfolio — Q4-2024"),
+            _norm_report_line("Window: 2024-10-01 → 2024-12-31"),
+            _norm_report_line(f"Closed work packages: {_gt['total']}"),
+        ]
+        for i, exp in enumerate(expected_fixed):
+            if len(lines) <= i:
+                issues.append(f"line {i + 1} missing")
+            elif lines[i] != exp:
+                issues.append(f"line {i + 1}: {lines[i]!r} != {exp!r}")
+
+        actual_shares = {bt['bucket']: bt['share_pct'] for bt in _gt['bucket_totals']}
+        if len(lines) >= 4:
+            err4 = _check_share_line(lines[3], "Actual shares", actual_shares)
+            if err4:
+                issues.append(f"line 4 {err4}")
+        else:
             issues.append("line 4 missing")
-        # Line 5: target shares
         if len(lines) >= 5:
-            for b, t in TARGET_PCT.items():
-                if str(t) not in lines[4]:
-                    issues.append(f"line 5 missing {b} target {t}")
-                    break
-        elif len(lines) < 5:
+            err5 = _check_share_line(lines[4], "Target shares", TARGET_PCT)
+            if err5:
+                issues.append(f"line 5 {err5}")
+        else:
             issues.append("line 5 missing")
 
         ok = len(issues) == 0
-        check("9. Code-server file content", 2, ok,
-              "all 5 lines correct" if ok else "; ".join(issues[:3]))
+        check("9. Code-server file content", 3, ok,
+              "all 5 lines exact" if ok else "; ".join(issues[:3]))
     except Exception as e:
-        check("9. Code-server file content", 2, False, f"exception: {e}")
+        check("9. Code-server file content", 3, False, f"exception: {e}")
 
 
 def check_10_rebalance_wp_count() -> None:
@@ -599,7 +779,9 @@ def check_11_rebalance_wp_subjects() -> None:
 
 
 def check_12_rebalance_wp_details() -> None:
-    """Rebalance WPs have correct assignee, priority, and description."""
+    """Rebalance WPs have the correct assignee, priority and an exactly
+    matching description. Row retrieval is per-id single-value queries so
+    multiline descriptions or '|' characters cannot corrupt parsing."""
     try:
         compute_ground_truth()
         if _gt_err:
@@ -607,67 +789,62 @@ def check_12_rebalance_wp_details() -> None:
             return
 
         project_id = op_sql("SELECT id FROM projects WHERE name = 'API Gateway' LIMIT 1")
-        # Get admin user ID
-        admin_id = op_sql(
-            "SELECT id FROM users WHERE login = 'admin' LIMIT 1"
-        )
+        admin_id = op_sql("SELECT id FROM users WHERE login = 'admin' LIMIT 1")
 
-        rows = op_sql(f"""
-            SELECT wp.subject, wp.assigned_to_id, wp.description,
-                   p.name AS priority_name
-            FROM work_packages wp
+        id_rows = op_sql(f"""
+            SELECT wp.id FROM work_packages wp
             JOIN types t ON t.id = wp.type_id
-            LEFT JOIN enumerations p ON p.id = wp.priority_id
             WHERE wp.project_id = {project_id}
               AND t.name = 'Task'
               AND wp.subject LIKE 'Rebalance next quarter:%'
+            ORDER BY wp.id
         """)
-
-        if not rows:
+        wp_ids = [l.strip() for l in id_rows.split('\n') if l.strip()]
+        if not wp_ids:
             check("12. Rebalance WP details", 2, False, "no rebalance WPs found")
             return
 
         expected_by_bucket = {bt['bucket']: bt for bt in _gt['bucket_totals']}
         issues = []
-        for line in rows.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split('|')
-            if len(parts) < 4:
-                continue
-            subject, assigned_id, description, priority = [p.strip() for p in parts]
+        for wp_id in wp_ids:
+            subject = op_sql(f"SELECT subject FROM work_packages WHERE id = {wp_id}")
+            assigned_id = op_sql(
+                f"SELECT COALESCE(assigned_to_id::text, '') FROM work_packages WHERE id = {wp_id}"
+            )
+            priority = op_sql(f"""
+                SELECT COALESCE(p.name, '') FROM work_packages wp
+                LEFT JOIN enumerations p ON p.id = wp.priority_id
+                WHERE wp.id = {wp_id}
+            """)
+            description = op_sql(
+                f"SELECT COALESCE(description, '') FROM work_packages WHERE id = {wp_id}"
+            )
 
-            # Check assignee is admin
-            if admin_id and assigned_id != admin_id:
-                issues.append(f"{subject}: wrong assignee (id={assigned_id}, expected={admin_id})")
-
-            # Check priority is Normal
+            if not admin_id or assigned_id != admin_id:
+                issues.append(f"WP#{wp_id}: wrong assignee "
+                              f"(id={assigned_id or '<none>'}, expected={admin_id})")
             if priority.lower() != 'normal':
-                issues.append(f"{subject}: priority={priority}, expected=Normal")
+                issues.append(f"WP#{wp_id}: priority={priority}, expected=Normal")
 
-            # Check description format
-            # Extract bucket from subject: "Rebalance next quarter: <Bucket> (+<Gap>%)"
-            import re
             m = re.search(r'Rebalance next quarter: (\w+)', subject)
-            if m:
-                bucket = m.group(1)
-                bt = expected_by_bucket.get(bucket)
-                if bt:
-                    expected_desc = (
-                        f"Current: {bt['share_pct']}%; "
-                        f"Target: {bt['target_pct']}%; "
-                        f"Quarter under review: Q4-2024"
-                    )
-                    # Description may contain HTML or markdown formatting
-                    desc_clean = description.replace('\n', ' ').strip()
-                    if expected_desc not in desc_clean and \
-                       f"Current: {bt['share_pct']}%" not in desc_clean:
-                        issues.append(
-                            f"{bucket}: desc mismatch, expected contains '{expected_desc}'"
-                        )
+            bt = expected_by_bucket.get(m.group(1)) if m else None
+            if not bt:
+                issues.append(f"WP#{wp_id}: subject {subject!r} does not map to a bucket")
+                continue
+            expected_desc = (
+                f"Current: {bt['share_pct']}%; "
+                f"Target: {bt['target_pct']}%; "
+                f"Quarter under review: Q4-2024"
+            )
+            # Normalize: strip HTML tags, collapse whitespace — then require
+            # exact equality (no substring fallback).
+            desc_clean = re.sub(r"<[^>]+>", " ", description)
+            desc_clean = re.sub(r"\s+", " ", desc_clean).strip()
+            if desc_clean != expected_desc:
+                issues.append(f"WP#{wp_id} ({bt['bucket']}): "
+                              f"desc={desc_clean!r} != expected {expected_desc!r}")
 
-        ok = len(issues) == 0 and rows.strip() != ""
+        ok = len(issues) == 0
         check("12. Rebalance WP details", 2, ok,
               "all correct" if ok else "; ".join(issues[:3]))
     except Exception as e:
@@ -677,12 +854,14 @@ def check_12_rebalance_wp_details() -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     check_1_baserow_db_exists()
-    check_2_cwp_table_row_count()
+    check_2_cwp_table_rows()
     check_3_cwp_bucket_classification()
     check_4_cwp_team_assignment()
+    check_4b_cwp_row_fields()
     check_5_bucket_totals_exists()
     check_6_bucket_totals_count_share()
     check_7_bucket_totals_target_gap()
+    check_7b_field_schema()
     check_8_codeserver_file_exists()
     check_9_codeserver_file_content()
     check_10_rebalance_wp_count()

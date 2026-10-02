@@ -1,7 +1,8 @@
 """
 Verifier for Software-009-I2: Establish ADR Governance Workflow
 
-Checks: 13 weighted checks across code-server, baserow, openproject.
+Checks: 13 checks across code-server, baserow, openproject (total weight 20;
+ck1 and ck10 are 0-weight diagnostics — a FAIL there still blocks all_pass).
 Strategy: docker exec (code-server filesystem, openproject DB), REST API (baserow)
 
 Required env vars:
@@ -136,13 +137,13 @@ ADR_DIR = "/home/coder/workspace/devops-configs/docs/adr"
 
 
 def check_1_adr_directory_exists() -> None:
-    """Check that devops-configs/docs/adr/ directory exists in code-server."""
+    """0-weight diagnostic: devops-configs/docs/adr/ directory exists (implied by ck2-5)."""
     try:
         rc, out, err = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", ADR_DIR)
-        check("1. ADR directory exists", 1, rc == 0,
+        check("1. ADR directory exists", 0, rc == 0,
               "directory not found" if rc != 0 else "")
     except Exception as e:
-        check("1. ADR directory exists", 1, False, f"exception: {e}")
+        check("1. ADR directory exists", 0, False, f"exception: {e}")
 
 
 def check_2_file_005_content() -> None:
@@ -197,20 +198,22 @@ def check_4_file_007_content() -> None:
 
 
 def check_5_exactly_3_files() -> None:
-    """Check that adr directory contains exactly 3 .md files."""
+    """Check adr directory exists and contains exactly the 3 expected .md entries."""
     try:
         rc, out, err = docker_exec(
-            CODE_SERVER_CONTAINER, "bash", "-c",
-            f"ls -1 {ADR_DIR}/*.md 2>/dev/null | wc -l"
+            CODE_SERVER_CONTAINER, "bash", "-c", f"ls -A {ADR_DIR}"
         )
         if rc != 0:
-            check("5. Exactly 3 .md files in adr dir", 1, False, "ls failed")
+            check("5. adr dir has exactly the 3 ADR files", 1, False,
+                  "directory not found or ls failed")
             return
-        count = int(out.strip())
-        check("5. Exactly 3 .md files in adr dir", 1, count == 3,
-              f"found {count} files" if count != 3 else "")
+        entries = [e for e in out.split("\n") if e.strip()]
+        expected = set(ADR_FILENAMES)
+        passed = len(entries) == 3 and set(entries) == expected
+        detail = "" if passed else f"entries {sorted(entries)}, expected exactly {sorted(expected)}"
+        check("5. adr dir has exactly the 3 ADR files", 1, passed, detail)
     except Exception as e:
-        check("5. Exactly 3 .md files in adr dir", 1, False, f"exception: {e}")
+        check("5. adr dir has exactly the 3 ADR files", 1, False, f"exception: {e}")
 
 
 def check_6_baserow_database_exists() -> None:
@@ -244,26 +247,58 @@ def _get_baserow_table(token: str):
 
 
 def check_7_baserow_table_fields() -> None:
-    """Check ADR Registry table exists with correct field structure."""
+    """Check ADR Registry table has exactly the 7 specified fields with correct schema."""
     try:
         token = baserow_auth()
         table_id = _get_baserow_table(token)
         if table_id is None:
-            check("7. Baserow table 'ADR Registry' with fields", 2, False,
+            check("7. Baserow table 'ADR Registry' schema", 2, False,
                   "table not found")
             return
         resp = baserow_get(f"/database/fields/table/{table_id}/", token)
         resp.raise_for_status()
-        fields = resp.json()
-        field_names = {f["name"] for f in fields}
+        fields = {f["name"]: f for f in resp.json()}
         expected_fields = {"ADR ID", "Title", "Status", "Author", "Reviewer",
                            "Created Date", "Review Duration Days"}
-        missing = expected_fields - field_names
-        passed = len(missing) == 0
-        detail = f"missing fields: {missing}" if missing else ""
-        check("7. Baserow table 'ADR Registry' with fields", 2, passed, detail)
+        problems = []
+        actual_names = set(fields)
+        if actual_names != expected_fields:
+            missing = expected_fields - actual_names
+            extra = actual_names - expected_fields
+            if missing:
+                problems.append(f"missing fields: {sorted(missing)}")
+            if extra:
+                problems.append(f"extra fields: {sorted(extra)}")
+
+        def ftype(name: str) -> str:
+            return (fields.get(name) or {}).get("type", "")
+
+        adr_f = fields.get("ADR ID") or {}
+        if adr_f.get("type") != "text" or not adr_f.get("primary"):
+            problems.append("ADR ID not primary text")
+        for name in ("Title", "Author", "Reviewer"):
+            if ftype(name) != "text":
+                problems.append(f"{name} not text")
+        status_f = fields.get("Status") or {}
+        if status_f.get("type") != "single_select":
+            problems.append("Status not single_select")
+        else:
+            opts = {o.get("value") for o in status_f.get("select_options", [])}
+            if opts != {"Draft", "Review", "Approved", "Implemented"}:
+                problems.append(f"Status options {sorted(opts)}")
+        if ftype("Created Date") != "date":
+            problems.append("Created Date not date")
+        dur_f = fields.get("Review Duration Days") or {}
+        if dur_f.get("type") != "number":
+            problems.append("Review Duration Days not number")
+        elif int(dur_f.get("number_decimal_places") or 0) != 0:
+            problems.append(
+                f"Review Duration Days decimal places {dur_f.get('number_decimal_places')}, expected 0")
+        passed = not problems
+        check("7. Baserow table 'ADR Registry' schema", 2, passed,
+              "; ".join(problems[:4]) if problems else "")
     except Exception as e:
-        check("7. Baserow table 'ADR Registry' with fields", 2, False, f"exception: {e}")
+        check("7. Baserow table 'ADR Registry' schema", 2, False, f"exception: {e}")
 
 
 def check_8_baserow_rows_adr_ids_titles() -> None:
@@ -282,23 +317,20 @@ def check_8_baserow_rows_adr_ids_titles() -> None:
             check("8. Baserow 3 rows with ADR IDs/Titles", 2, False,
                   f"expected 3 rows, got {len(rows)}")
             return
-        expected_ids = {f"ADR-{n}" for n in ADR_NUMBERS}
-        expected_titles = set(ADR_TITLES)
-        actual_ids = set()
-        actual_titles = set()
-        for row in rows:
-            adr_id = str(row.get("ADR ID", "")).strip()
-            title = str(row.get("Title", "")).strip()
-            actual_ids.add(adr_id)
-            actual_titles.add(title)
-        id_ok = expected_ids == actual_ids
-        title_ok = expected_titles == actual_titles
-        passed = id_ok and title_ok
+        expected_pairs = {(f"ADR-{ADR_NUMBERS[i]}", ADR_TITLES[i]) for i in range(3)}
+        actual_pairs = {
+            (str(row.get("ADR ID", "")).strip(), str(row.get("Title", "")).strip())
+            for row in rows
+        }
+        passed = actual_pairs == expected_pairs
         details = []
-        if not id_ok:
-            details.append(f"IDs: expected {expected_ids}, got {actual_ids}")
-        if not title_ok:
-            details.append(f"Titles: expected {expected_titles}, got {actual_titles}")
+        if not passed:
+            missing_pairs = expected_pairs - actual_pairs
+            extra_pairs = actual_pairs - expected_pairs
+            if missing_pairs:
+                details.append(f"missing (ADR ID, Title) pairs: {sorted(missing_pairs)}")
+            if extra_pairs:
+                details.append(f"unexpected pairs: {sorted(extra_pairs)}")
         check("8. Baserow 3 rows with ADR IDs/Titles", 2, passed,
               "; ".join(details) if details else "")
     except Exception as e:
@@ -318,9 +350,13 @@ def check_9_baserow_rows_status_reviewer_date() -> None:
         resp.raise_for_status()
         rows = resp.json().get("results", [])
         issues = []
-        expected_reviewers = set(ADR_REVIEWERS)
-        actual_reviewers = set()
+        # Reviewer is keyed positionally to the ADR (ADR-005 -> Emma Wilson, ...).
+        expected_reviewer_by_id = {
+            f"ADR-{ADR_NUMBERS[i]}": ADR_REVIEWERS[i] for i in range(3)
+        }
         for row in rows:
+            adr_id = str(row.get("ADR ID", "")).strip()
+
             # Status - single select field returns dict with value key
             status = row.get("Status", {})
             if isinstance(status, dict):
@@ -328,26 +364,30 @@ def check_9_baserow_rows_status_reviewer_date() -> None:
             else:
                 status_val = str(status)
             if status_val != ADR_STATUS:
-                issues.append(f"row Status={status_val}, expected {ADR_STATUS}")
+                issues.append(f"{adr_id or 'row'} Status={status_val}, expected {ADR_STATUS}")
 
+            # Reviewer keyed by the row's ADR ID (unknown IDs count as failures)
             reviewer = str(row.get("Reviewer", "")).strip()
-            actual_reviewers.add(reviewer)
+            expected_rev = expected_reviewer_by_id.get(adr_id)
+            if expected_rev is None:
+                issues.append(f"unknown ADR ID '{adr_id}'")
+            elif reviewer != expected_rev:
+                issues.append(f"{adr_id} Reviewer={reviewer}, expected {expected_rev}")
 
             # Created Date
             date_val = str(row.get("Created Date", "")).strip()
             if not date_val.startswith(ADR_DATE):
-                issues.append(f"row date={date_val}, expected {ADR_DATE}")
+                issues.append(f"{adr_id or 'row'} date={date_val}, expected {ADR_DATE}")
 
             # Review Duration Days
             duration = row.get("Review Duration Days")
             duration_str = str(duration).strip() if duration is not None else ""
-            if duration_str not in ("0", "0.0", "0.00"):
-                issues.append(f"row duration={duration}, expected 0")
+            if duration_str not in ("0", "0.0"):
+                issues.append(f"{adr_id or 'row'} duration={duration}, expected 0")
 
-        if expected_reviewers != actual_reviewers:
-            issues.append(f"reviewers: expected {expected_reviewers}, got {actual_reviewers}")
-
-        passed = len(issues) == 0
+        passed = len(issues) == 0 and bool(rows)
+        if not rows:
+            issues.append("no rows found")
         check("9. Baserow row details (Status/Reviewer/Date/Duration)", 2, passed,
               "; ".join(issues[:3]) if issues else "")
     except Exception as e:
@@ -355,31 +395,49 @@ def check_9_baserow_rows_status_reviewer_date() -> None:
               f"exception: {e}")
 
 
+_op_project_id: int | None = None
+_op_epics_cache: list[dict] | None = None
+
+
 def check_10_openproject_project_exists() -> None:
-    """Check OpenProject project 'DevOps Automation' exists via DB."""
+    """0-weight diagnostic: locate seeded 'DevOps Automation' project id for ck11-13."""
+    global _op_project_id
     try:
-        result = op_db_query("SELECT name FROM projects WHERE name = 'DevOps Automation'")
-        found = result == "DevOps Automation"
-        check("10. OpenProject project 'DevOps Automation' exists", 1, found,
-              "project not found" if not found else "")
+        result = op_db_query("SELECT id FROM projects WHERE name = 'DevOps Automation'")
+        pid = result.split("\n")[0].strip() if result else ""
+        _op_project_id = int(pid) if pid.isdigit() else None
+        check("10. OpenProject project 'DevOps Automation' exists", 0,
+              _op_project_id is not None,
+              f"project id {pid}" if _op_project_id is not None else "project not found")
     except Exception as e:
-        check("10. OpenProject project 'DevOps Automation' exists", 1, False,
+        check("10. OpenProject project 'DevOps Automation' exists", 0, False,
               f"exception: {e}")
 
 
 def _get_op_epics() -> list[dict]:
-    """Get Epic work packages in 'DevOps Automation' project from DB.
-    Returns list of dicts with subject, assigned_to_id, priority_name, description.
+    """Get 'Implement ADR-*' Epic-type work packages in 'DevOps Automation' from DB.
+    Epic type id is resolved by name (never hardcoded); computed once and cached.
+    Returns list of dicts with subject, assigned_to_id, priority, description.
     """
+    global _op_epics_cache
+    if _op_epics_cache is not None:
+        return _op_epics_cache
+    if _op_project_id is None:
+        raise RuntimeError("project 'DevOps Automation' not found (see check 10)")
+    type_result = op_db_query("SELECT id FROM types WHERE name = 'Epic'")
+    type_id = type_result.split("\n")[0].strip() if type_result else ""
+    if not type_id.isdigit():
+        raise RuntimeError("Epic type not found in OpenProject types table")
     sql = (
         "SELECT wp.subject, wp.assigned_to_id, e.name AS priority, wp.description "
         "FROM work_packages wp "
-        "JOIN projects p ON wp.project_id = p.id "
         "JOIN enumerations e ON wp.priority_id = e.id "
-        "WHERE p.name = 'DevOps Automation' AND wp.type_id = 5"
+        f"WHERE wp.project_id = {_op_project_id} AND wp.type_id = {int(type_id)} "
+        "AND wp.subject LIKE 'Implement ADR-%'"
     )
     result = op_db_query(sql)
     if not result:
+        _op_epics_cache = []
         return []
     epics = []
     for line in result.split("\n"):
@@ -391,16 +449,17 @@ def _get_op_epics() -> list[dict]:
                 "priority": parts[2],
                 "description": parts[3],
             })
+    _op_epics_cache = epics
     return epics
 
 
 def check_11_openproject_3_epics_subjects() -> None:
-    """Check 3 Epic work packages with correct subjects."""
+    """Check exactly 3 'Implement ADR-%' Epic WPs with correct subjects (extras fail)."""
     try:
         epics = _get_op_epics()
         if len(epics) != 3:
             check("11. 3 Epic WPs with correct subjects", 2, False,
-                  f"expected 3 epics, got {len(epics)}")
+                  f"expected exactly 3 'Implement ADR-%' epics, got {len(epics)}")
             return
         expected_subjects = {
             f"Implement ADR-{ADR_NUMBERS[i]}: {ADR_TITLES[i]}" for i in range(3)

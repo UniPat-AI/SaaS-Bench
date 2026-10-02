@@ -1,7 +1,7 @@
 """
 Verifier for Software-024-I5: Data Platform RFC workflow — files, Baserow registry, OpenProject Epics
 
-Checks: 13 weighted checks across code-server, baserow, openproject.
+Checks: 16 weighted checks (total weight 27) across code-server, baserow, openproject.
 Strategy: docker exec filesystem (code-server), REST API (baserow), docker exec psql (openproject).
 
 Required env vars:
@@ -128,7 +128,7 @@ def baserow_get(path: str, token: str) -> dict:
 
 # ── Check 1: All 5 RFC files exist ───────────────────────────────────────────
 def check_1_files_exist() -> None:
-    """Verify all 5 RFC markdown files exist in code-server."""
+    """Verify the RFC dir contains exactly the 5 expected markdown files."""
     try:
         rc, out, _ = docker_exec(
             CODE_SERVER_CONTAINER, "ls", f"/home/coder/workspace/{RFC_DIR}/"
@@ -137,9 +137,18 @@ def check_1_files_exist() -> None:
             check("1. RFC files exist", 1, False, f"directory not found: {RFC_DIR}")
             return
         files = out.strip().split("\n") if out.strip() else []
-        missing = [f for f in RFC_FILENAMES if f not in files]
-        check("1. RFC files exist", 1, not missing,
-              f"all 5 present" if not missing else f"missing: {missing}")
+        md_files = {f.strip() for f in files if f.strip().endswith(".md")}
+        expected = set(RFC_FILENAMES)
+        missing = sorted(expected - md_files)
+        extra = sorted(md_files - expected)
+        ok = md_files == expected
+        detail = "exactly the 5 expected .md files"
+        if not ok:
+            detail = "; ".join(
+                p for p in (f"missing: {missing}" if missing else "",
+                            f"extra: {extra}" if extra else "") if p
+            )
+        check("1. RFC files exist", 1, ok, detail)
     except Exception as e:
         check("1. RFC files exist", 1, False, f"exception: {e}")
 
@@ -250,6 +259,27 @@ def check_5_status_lines() -> None:
         check("5. Status lines correct", 2, False, f"exception: {e}")
 
 
+# ── Check 5b: Exactly six lines per file ─────────────────────────────────────
+def check_5b_exact_line_counts() -> None:
+    """Verify each RFC file has exactly 6 lines (no trailing extra content)."""
+    try:
+        issues = []
+        for fname in RFC_FILENAMES:
+            content = read_file_in_container(
+                CODE_SERVER_CONTAINER, f"/home/coder/workspace/{RFC_DIR}/{fname}"
+            )
+            if content is None:
+                issues.append(f"{fname}: file not found")
+                continue
+            n_lines = len(content.rstrip("\n").split("\n"))
+            if n_lines != 6:
+                issues.append(f"{fname}: {n_lines} lines, expected 6")
+        check("5b. Files exactly 6 lines", 1, not issues,
+              "all 5 files have exactly 6 lines" if not issues else "; ".join(issues))
+    except Exception as e:
+        check("5b. Files exactly 6 lines", 1, False, f"exception: {e}")
+
+
 # ── Check 6: Baserow database and table exist ────────────────────────────────
 _baserow_token: str | None = None
 _baserow_table_id: int | None = None
@@ -355,6 +385,50 @@ def check_7_baserow_rows() -> None:
         check("7. Baserow rows (IDs & titles)", 2, False, f"exception: {e}")
 
 
+# ── Check 7b: Author, Reviewer, Created Date columns ─────────────────────────
+def check_7b_baserow_author_reviewer_created() -> None:
+    """Verify Author, Reviewer, Created Date per row match the task constants."""
+    try:
+        if not _baserow_rows or not _baserow_field_map:
+            check("7b. Baserow author/reviewer/created", 2, False, "no rows loaded")
+            return
+        rfc_id_field = _baserow_field_map.get("RFC ID", "")
+        author_field = _baserow_field_map.get("Author", "")
+        reviewer_field = _baserow_field_map.get("Reviewer", "")
+        created_field = _baserow_field_map.get("Created Date", "")
+        missing_fields = [n for n, k in [
+            ("RFC ID", rfc_id_field), ("Author", author_field),
+            ("Reviewer", reviewer_field), ("Created Date", created_field),
+        ] if not k]
+        if missing_fields:
+            check("7b. Baserow author/reviewer/created", 2, False,
+                  f"fields not found: {missing_fields}")
+            return
+        issues = []
+        for row in _baserow_rows:
+            rfc_id = row.get(rfc_id_field, "")
+            m = re.match(r"RFC-(\d{3})$", str(rfc_id).strip())
+            if not m:
+                issues.append(f"unrecognized RFC ID: {rfc_id!r}")
+                continue
+            num = m.group(1)
+            author = str(row.get(author_field) or "").strip()
+            if author != RFC_AUTHOR:
+                issues.append(f"{rfc_id}: author={author!r}, expected {RFC_AUTHOR!r}")
+            expected_reviewer = RFC_REVIEWERS.get(num, "")
+            reviewer = str(row.get(reviewer_field) or "").strip()
+            if reviewer != expected_reviewer:
+                issues.append(f"{rfc_id}: reviewer={reviewer!r}, expected {expected_reviewer!r}")
+            created = row.get(created_field, None)
+            created_str = str(created).strip() if created is not None else ""
+            if not created_str or not created_str.startswith(RFC_CREATED):
+                issues.append(f"{rfc_id}: created={created!r}, expected {RFC_CREATED}")
+        check("7b. Baserow author/reviewer/created", 2, not issues,
+              "all correct" if not issues else "; ".join(issues))
+    except Exception as e:
+        check("7b. Baserow author/reviewer/created", 2, False, f"exception: {e}")
+
+
 # ── Check 8: Baserow row fields (Status, Decision Date, Duration) ────────────
 def check_8_baserow_row_fields() -> None:
     """Verify Status, Decision Date, Review Duration Days for each row."""
@@ -371,6 +445,7 @@ def check_8_baserow_row_fields() -> None:
             rfc_id = row.get(rfc_id_field, "")
             m = re.match(r"RFC-(\d+)", rfc_id)
             if not m:
+                issues.append(f"unrecognized RFC ID: {rfc_id!r}")
                 continue
             idx = int(m.group(1))
             is_approved = idx in APPROVED_INDICES
@@ -389,31 +464,72 @@ def check_8_baserow_row_fields() -> None:
             else:
                 if dd is not None and dd != "":
                     issues.append(f"{rfc_id}: decision_date should be null, got {dd!r}")
-            # Review Duration Days
+            # Review Duration Days (must be 24 for approved, 0 for draft;
+            # null/missing always fails)
             dur = row.get(duration_field, None)
             expected_dur = REVIEW_DURATION_DAYS if is_approved else 0
-            if dur is not None:
-                dur_str = str(dur).strip()
+            dur_str = str(dur).strip() if dur is not None else ""
+            if not dur_str:
+                issues.append(f"{rfc_id}: duration is null/empty, expected {expected_dur}")
+            else:
                 try:
-                    dur_int = int(float(dur_str)) if dur_str else 0
+                    dur_int = int(float(dur_str))
                 except (ValueError, TypeError):
                     dur_int = -1
                 if dur_int != expected_dur:
                     issues.append(f"{rfc_id}: duration={dur}, expected {expected_dur}")
-            elif expected_dur != 0:
-                issues.append(f"{rfc_id}: duration is null, expected {expected_dur}")
         check("8. Baserow row fields", 2, not issues,
               "all correct" if not issues else "; ".join(issues))
     except Exception as e:
         check("8. Baserow row fields", 2, False, f"exception: {e}")
 
 
-# ── Check 9: Baserow "Approved RFCs" view ────────────────────────────────────
-def check_9_baserow_view() -> None:
-    """Verify 'Approved RFCs' grid view exists on the RFC Registry table."""
+# ── Check 8b: Baserow field schema ───────────────────────────────────────────
+def check_8b_baserow_field_schema() -> None:
+    """Verify field types, primary flag, and Status select options."""
     try:
         if not _baserow_token or not _baserow_table_id:
-            check("9. Baserow 'Approved RFCs' view", 2, False, "no table found")
+            check("8b. Baserow field schema", 1, False, "no table found")
+            return
+        fields = baserow_get(f"database/fields/table/{_baserow_table_id}/", _baserow_token)
+        by_name = {f.get("name"): f for f in fields}
+        expected_types = {
+            "RFC ID": "text", "Title": "text", "Author": "text", "Reviewer": "text",
+            "Status": "single_select", "Created Date": "date", "Decision Date": "date",
+            "Review Duration Days": "number",
+        }
+        expected_status_options = {"Draft", "Review", "Approved", "Implemented", "Deprecated"}
+        issues = []
+        missing = set(expected_types) - set(by_name)
+        if missing:
+            issues.append(f"missing fields: {sorted(missing)}")
+        for name, ftype in expected_types.items():
+            f = by_name.get(name)
+            if f is None:
+                continue  # already reported as missing
+            if f.get("type") != ftype:
+                issues.append(f"{name}: type={f.get('type')!r}, expected {ftype!r}")
+            if name == "RFC ID" and not f.get("primary"):
+                issues.append("RFC ID: not the primary field")
+            if name == "Status":
+                opts = {o.get("value") for o in f.get("select_options", [])}
+                if opts != expected_status_options:
+                    issues.append(
+                        f"Status: options={sorted(opts)}, "
+                        f"expected {sorted(expected_status_options)}"
+                    )
+        check("8b. Baserow field schema", 1, not issues,
+              "schema OK" if not issues else "; ".join(issues))
+    except Exception as e:
+        check("8b. Baserow field schema", 1, False, f"exception: {e}")
+
+
+# ── Check 9: Baserow "Approved RFCs" view ────────────────────────────────────
+def check_9_baserow_view() -> None:
+    """Verify 'Approved RFCs' grid view with Status=Approved filter and ascending duration sort."""
+    try:
+        if not _baserow_token or not _baserow_table_id:
+            check("9. Baserow 'Approved RFCs' view", 3, False, "no table found")
             return
         views = baserow_get(f"database/views/table/{_baserow_table_id}/", _baserow_token)
         view = None
@@ -422,14 +538,63 @@ def check_9_baserow_view() -> None:
                 view = v
                 break
         if view is None:
-            check("9. Baserow 'Approved RFCs' view", 2, False, "view not found")
+            check("9. Baserow 'Approved RFCs' view", 3, False, "view not found")
             return
-        # View exists — check it's a grid type
-        is_grid = view.get("type") == "grid"
-        check("9. Baserow 'Approved RFCs' view", 2, is_grid,
-              f"type={view.get('type')}" if not is_grid else "view exists")
+        if view.get("type") != "grid":
+            check("9. Baserow 'Approved RFCs' view", 3, False,
+                  f"type={view.get('type')!r}, expected 'grid'")
+            return
+
+        # Resolve field ids and the "Approved" option id (never hardcoded)
+        fields = baserow_get(f"database/fields/table/{_baserow_table_id}/", _baserow_token)
+        status_field = next((f for f in fields if f.get("name") == "Status"), None)
+        duration_field = next(
+            (f for f in fields if f.get("name") == "Review Duration Days"), None)
+        if status_field is None or duration_field is None:
+            check("9. Baserow 'Approved RFCs' view", 3, False,
+                  "Status or Review Duration Days field not found")
+            return
+        approved_ids = {str(o.get("id")) for o in status_field.get("select_options", [])
+                        if o.get("value") == "Approved"}
+        if not approved_ids:
+            check("9. Baserow 'Approved RFCs' view", 3, False,
+                  "no 'Approved' option on Status field")
+            return
+
+        issues = []
+        # Exactly one filter: Status single_select_equal <Approved option id>
+        filters = baserow_get(f"database/views/{view['id']}/filters/", _baserow_token)
+        filter_list = filters if isinstance(filters, list) else filters.get("results", filters)
+        if len(filter_list) != 1:
+            issues.append(f"expected exactly 1 filter, found {len(filter_list)}")
+        else:
+            f = filter_list[0]
+            if f.get("field") != status_field["id"]:
+                issues.append(f"filter field={f.get('field')}, expected Status ({status_field['id']})")
+            if f.get("type") != "single_select_equal":
+                issues.append(f"filter type={f.get('type')!r}, expected 'single_select_equal'")
+            if str(f.get("value", "")).strip() not in approved_ids:
+                issues.append(
+                    f"filter value={f.get('value')!r}, expected Approved option id {sorted(approved_ids)}")
+
+        # Exactly one sorting: Review Duration Days ascending
+        sortings = baserow_get(f"database/views/{view['id']}/sortings/", _baserow_token)
+        sort_list = sortings if isinstance(sortings, list) else sortings.get("results", sortings)
+        if len(sort_list) != 1:
+            issues.append(f"expected exactly 1 sorting, found {len(sort_list)}")
+        else:
+            s = sort_list[0]
+            if s.get("field") != duration_field["id"]:
+                issues.append(
+                    f"sort field={s.get('field')}, expected Review Duration Days ({duration_field['id']})")
+            if str(s.get("order", "")).upper() != "ASC":
+                issues.append(f"sort order={s.get('order')!r}, expected 'ASC'")
+
+        check("9. Baserow 'Approved RFCs' view", 3, not issues,
+              "grid view + Status=Approved filter + duration ASC sort"
+              if not issues else "; ".join(issues))
     except Exception as e:
-        check("9. Baserow 'Approved RFCs' view", 2, False, f"exception: {e}")
+        check("9. Baserow 'Approved RFCs' view", 3, False, f"exception: {e}")
 
 
 # ── Check 10: OpenProject project exists ──────────────────────────────────────
@@ -452,18 +617,18 @@ _op_project_id: int | None = None
 
 
 def check_10_op_project() -> None:
-    """Verify OpenProject project 'Data Analytics Pipeline' exists."""
+    """Locate seed project 'Data Analytics Pipeline' (0-weight diagnostic; resolves project_id)."""
     global _op_project_id
     try:
         result = op_psql("SELECT id, name FROM projects WHERE name = 'Data Analytics Pipeline';")
         if not result:
-            check("10. OP project exists", 1, False, "project not found")
+            check("10. OP project exists", 0, False, "project not found")
             return
         parts = result.split("|")
         _op_project_id = int(parts[0])
-        check("10. OP project exists", 1, True, f"project_id={_op_project_id}")
+        check("10. OP project exists", 0, True, f"project_id={_op_project_id}")
     except Exception as e:
-        check("10. OP project exists", 1, False, f"exception: {e}")
+        check("10. OP project exists", 0, False, f"exception: {e}")
 
 
 # ── Check 11: OpenProject Epics with correct subjects ────────────────────────
@@ -493,15 +658,30 @@ def check_11_op_epic_subjects() -> None:
         for row in rows:
             parts = row.split("|", 1)
             if len(parts) == 2:
-                _op_epics.append({"id": int(parts[0]), "subject": parts[1]})
+                subject = parts[1]
+                # Only consider the task-created Epics ("Implement RFC-NNN: ...");
+                # the project ships with seed Epics that must be ignored.
+                if not re.match(r"Implement RFC-\d{3}:", subject):
+                    continue
+                _op_epics.append({"id": int(parts[0]), "subject": subject})
         expected_subjects = []
         for i in sorted(APPROVED_INDICES):
             title = RFC_TITLES[i - 1]
             expected_subjects.append(f"Implement RFC-{i:03d}: {title}")
-        found_subjects = {e["subject"] for e in _op_epics}
+        found_subjects = [e["subject"] for e in _op_epics]
+        # Exact multiset equality: exactly the 3 expected subjects, no
+        # duplicates and no extra "Implement RFC-NNN:" Epics (e.g. RFC-002/005).
+        ok = sorted(found_subjects) == sorted(expected_subjects)
         missing = [s for s in expected_subjects if s not in found_subjects]
-        check("11. OP Epic subjects", 2, not missing and len(_op_epics) >= 3,
-              f"found {len(_op_epics)} epics" + (f", missing: {missing}" if missing else ""))
+        extra = [s for s in found_subjects if s not in expected_subjects]
+        detail = f"found {len(_op_epics)} epics"
+        if missing:
+            detail += f", missing: {missing}"
+        if extra:
+            detail += f", extra: {extra}"
+        if not missing and not extra and not ok:
+            detail += ", duplicate subjects"
+        check("11. OP Epic subjects", 2, ok, detail)
     except Exception as e:
         check("11. OP Epic subjects", 2, False, f"exception: {e}")
 
@@ -593,10 +773,13 @@ def main() -> None:
     check_3_metadata_lines()
     check_4_decisions()
     check_5_status_lines()
+    check_5b_exact_line_counts()
     # Baserow checks
     check_6_baserow_db_table()
     check_7_baserow_rows()
+    check_7b_baserow_author_reviewer_created()
     check_8_baserow_row_fields()
+    check_8b_baserow_field_schema()
     check_9_baserow_view()
     # OpenProject checks
     check_10_op_project()

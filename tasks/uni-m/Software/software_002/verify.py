@@ -1,8 +1,13 @@
 """
 Verifier for Software-002-I3: Test Execution Audit for data-analyzer and todo-api
 
-Checks: 12 weighted checks across code-server, baserow, openproject.
-Strategy: code-server=filesystem, baserow=REST API, openproject=docker exec psql
+Checks: 13 weighted checks (21 pts; check 1 is a 0pt diagnostic) across
+code-server, baserow, openproject. Ground truth for test counts is recomputed
+by re-running both test commands in a throwaway container from the code-server
+container's own pristine image (once, cached) — agent-entered numbers are never
+trusted and agent edits to the live workspace cannot skew the truth.
+Strategy: code-server=docker exec (deliverables) + pristine-image docker run
+(ground truth), baserow=REST API, openproject=docker exec psql
 
 Required env vars:
   SERVER_HOSTNAME,
@@ -53,11 +58,34 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
+def docker_exec(container: str, *args: str, timeout: int = 15,
+                exec_args: tuple[str, ...] = ()) -> tuple[int, str, str]:
     r = subprocess.run(
-        ["docker", "exec", container, *args],
+        ["docker", "exec", *exec_args, container, *args],
         capture_output=True, text=True, errors="replace", timeout=timeout,
     )
+    return r.returncode, r.stdout, r.stderr
+
+
+_pristine_image_cache: str | None = None
+
+
+def _pristine_image() -> str:
+    """The code-server container's own image ref — truth reads go here, immune to agent edits."""
+    global _pristine_image_cache
+    if _pristine_image_cache is None:
+        r = subprocess.run(["docker", "inspect", CODE_SERVER_CONTAINER, "--format", "{{.Image}}"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not r.stdout.strip():
+            raise RuntimeError(f"docker inspect failed: {r.stderr.strip()[:200]}")
+        _pristine_image_cache = r.stdout.strip()
+    return _pristine_image_cache
+
+
+def image_exec(*args: str, timeout: int = 60) -> tuple[int, str, str]:
+    """Run a command in a throwaway container from the PRISTINE image (not the live one)."""
+    r = subprocess.run(["docker", "run", "--rm", "--entrypoint", args[0], _pristine_image(), *args[1:]],
+                       capture_output=True, text=True, errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -97,6 +125,12 @@ def op_sql(query: str) -> str:
     if r.returncode != 0:
         raise RuntimeError(f"psql error: {r.stderr.strip()}")
     return r.stdout.strip()
+
+
+def _oneline(text: str, limit: int = 4000) -> str:
+    """Flatten text to a single line so check details stay protocol-safe."""
+    flat = text.replace("\r", "").replace("\n", "\\n")
+    return flat if len(flat) <= limit else flat[:limit] + "..."
 
 
 # ── Shared state for Baserow checks ──────────────────────────────────────────
@@ -142,10 +176,105 @@ def _init_baserow():
     _br_rows = rows_resp.get("results", [])
 
 
+# ── Ground-truth recompute (each command run ONCE, result cached) ─────────────
+_TRUTH_CMDS = {
+    "data-analyzer": ("/home/coder/workspace/data-analyzer", "pytest tests/test_analyzer.py -v"),
+    "todo-api": ("/home/coder/workspace/todo-api", "make test"),
+}
+
+_truth: dict | None = None
+
+
+def _parse_test_summary(out: str) -> tuple[dict | None, str]:
+    """Extract passed/failed counts from the pytest summary line ONLY.
+
+    The summary line is the last line matching ^=+ .* =+$ or containing
+    ' passed' (make echoes other lines; numbers are never taken from them).
+    Returns ({'passed': n, 'failed': n}, summary) or (None, reason).
+    """
+    summary = ""
+    for line in out.splitlines():
+        s = line.strip()
+        if re.match(r"^=+ .* =+$", s) or " passed" in s:
+            summary = s
+    if not summary:
+        return None, "no pytest summary line found"
+    if re.search(r"(\d+) error", summary):
+        return None, f"errors in summary: {summary}"
+    m_passed = re.search(r"(\d+) passed", summary)
+    if not m_passed:
+        return None, f"no passed count in summary: {summary}"
+    m_failed = re.search(r"(\d+) failed", summary)
+    failed = int(m_failed.group(1)) if m_failed else 0
+    return {"passed": int(m_passed.group(1)), "failed": failed}, summary
+
+
+def _get_truth() -> dict:
+    """Re-run both test commands once each (in a throwaway container from the
+    code-server container's pristine image, never the agent-touched live one)
+    and cache the parsed ground truth.
+
+    Per project: {'ok': bool, 'passed', 'failed', 'rate', 'verdict', 'detail'}.
+    If truth acquisition fails for a project, ok=False and every check that
+    depends on it must FAIL (never fall back to agent-entered data).
+    """
+    global _truth
+    if _truth is not None:
+        return _truth
+    truth = {}
+    for proj, (workdir, cmd) in _TRUTH_CMDS.items():
+        entry = {"ok": False, "detail": ""}
+        try:
+            rc, out, err = image_exec(
+                "bash", "-lc", f"cd {workdir} && {cmd}",
+                timeout=240,
+            )
+            counts, summary = _parse_test_summary(out)
+            tail = _oneline("\n".join((out + "\n" + err).splitlines()[-30:]), 1500)
+            if counts is None:
+                entry["detail"] = f"{summary}; output tail: {tail}"
+            elif rc != 0 and counts["failed"] == 0:
+                entry["detail"] = (f"command failed (rc={rc}) without failed tests; "
+                                   f"output tail: {tail}")
+            elif counts["passed"] + counts["failed"] == 0:
+                entry["detail"] = f"no tests ran; summary: {summary}"
+            else:
+                total = counts["passed"] + counts["failed"]
+                rate = round(counts["passed"] / total * 100, 2)
+                entry.update({
+                    "ok": True,
+                    "passed": counts["passed"],
+                    "failed": counts["failed"],
+                    "rate": rate,
+                    "verdict": "Pass" if rate >= 85.00 else "Fail",
+                    "detail": summary,
+                })
+        except Exception as e:
+            entry["detail"] = f"exception: {e}"
+        truth[proj] = entry
+    _truth = truth
+    return _truth
+
+
+def _truth_str(t: dict) -> str:
+    """Short measured-truth summary for check details."""
+    if t.get("ok"):
+        return (f"measured: {t['passed']} passed/{t['failed']} failed, "
+                f"rate={t['rate']}, verdict={t['verdict']} [{t['detail']}]")
+    return f"truth unavailable: {t.get('detail', '')}"
+
+
+def _rate_regex(rate: float) -> str:
+    """Regex matching the truth pass rate (e.g. 100 -> 100, 100.0, 100.00)."""
+    if float(rate).is_integer():
+        return rf"\b{int(rate)}(\.0{{1,2}})?\b"
+    return rf"\b{re.escape(f'{rate:.2f}')}\b"
+
+
 # ── Individual checks ─────────────────────────────────────────────────────────
 
 def check_1_projects_exist():
-    """Verify data-analyzer and todo-api project dirs exist in code-server."""
+    """Diagnostic (0pt): data-analyzer and todo-api project dirs exist (seeded)."""
     try:
         rc1, out1, _ = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", "/home/coder/workspace/data-analyzer")
         rc2, out2, _ = docker_exec(CODE_SERVER_CONTAINER, "test", "-d", "/home/coder/workspace/todo-api")
@@ -155,9 +284,9 @@ def check_1_projects_exist():
             detail += "data-analyzer not found; "
         if rc2 != 0:
             detail += "todo-api not found; "
-        check("1. Project dirs exist in code-server", 1, both, detail.rstrip("; "))
+        check("1. Project dirs exist (diagnostic)", 0, both, detail.rstrip("; "))
     except Exception as e:
-        check("1. Project dirs exist in code-server", 1, False, f"exception: {e}")
+        check("1. Project dirs exist (diagnostic)", 0, False, f"exception: {e}")
 
 
 def check_2_baserow_db_exists():
@@ -178,6 +307,50 @@ def check_3_baserow_table_exists():
           "" if _br_table_id else "table not found")
 
 
+def _fmt_field(f: dict | None) -> str:
+    if f is None:
+        return "missing"
+    return (f"type={f.get('type')}, primary={f.get('primary')}, "
+            f"decimals={f.get('number_decimal_places')}")
+
+
+def check_s_field_schema():
+    """Verify the field schema of 'Test Execution Audit' (types/primary/options)."""
+    try:
+        if not _br_fields:
+            check("S. Baserow field schema", 2, False, "fields not loaded (table missing?)")
+            return
+        issues = []
+
+        f = _br_fields.get("Project")
+        if not f or f.get("type") != "text" or not f.get("primary"):
+            issues.append(f"Project: expected primary text, got {_fmt_field(f)}")
+
+        for name in ("Tests Passed", "Tests Failed"):
+            f = _br_fields.get(name)
+            if not f or f.get("type") != "number" or f.get("number_decimal_places") != 0:
+                issues.append(f"{name}: expected number with 0 decimals, got {_fmt_field(f)}")
+
+        f = _br_fields.get("Pass Rate")
+        if not f or f.get("type") != "number" or f.get("number_decimal_places") != 2:
+            issues.append(f"Pass Rate: expected number with 2 decimals, got {_fmt_field(f)}")
+
+        f = _br_fields.get("Pass/Fail")
+        opts = {o.get("value") for o in (f.get("select_options") or [])} if f else set()
+        if not f or f.get("type") != "single_select" or opts != {"Pass", "Fail"}:
+            issues.append(f"Pass/Fail: expected single_select with options {{Pass, Fail}}, "
+                          f"got {_fmt_field(f)}, options={sorted(str(o) for o in opts)}")
+
+        f = _br_fields.get("Captured At")
+        if not f or f.get("type") != "date":
+            issues.append(f"Captured At: expected date, got {_fmt_field(f)}")
+
+        check("S. Baserow field schema", 2, not issues,
+              "; ".join(issues) if issues else "all field types/options correct")
+    except Exception as e:
+        check("S. Baserow field schema", 2, False, f"exception: {e}")
+
+
 def check_4_exactly_two_rows():
     """Verify the table has exactly 2 rows."""
     n = len(_br_rows)
@@ -195,126 +368,120 @@ def _find_row(project_name: str) -> dict | None:
     return None
 
 
-def check_5_data_analyzer_counts():
-    """Verify data-analyzer row has integer Tests Passed and Tests Failed."""
+def _check_counts_vs_truth(num: int, proj: str) -> None:
+    """Row (Tests Passed, Tests Failed) must equal the recomputed truth (tolerance 0)."""
+    label = f"{num}. {proj} counts match recomputed truth"
     try:
-        row = _find_row("data-analyzer")
+        t = _get_truth()[proj]
+        if not t["ok"]:
+            check(label, 2, False, _truth_str(t))
+            return
+        row = _find_row(proj)
         if not row:
-            check("5. data-analyzer row has Tests Passed/Failed", 2, False, "row not found")
+            check(label, 2, False, f"row not found; {_truth_str(t)}")
             return
         tp = row.get("Tests Passed")
         tf = row.get("Tests Failed")
-        # Baserow may return as string or number
-        tp_ok = tp is not None and str(tp).replace("-", "").isdigit()
-        tf_ok = tf is not None and str(tf).replace("-", "").isdigit()
-        passed = tp_ok and tf_ok
-        detail = f"Tests Passed={tp}, Tests Failed={tf}"
-        check("5. data-analyzer row has Tests Passed/Failed", 2, passed, detail)
+        try:
+            tp_f = float(str(tp))
+            tf_f = float(str(tf))
+        except (ValueError, TypeError):
+            check(label, 2, False, f"non-numeric values (tp={tp}, tf={tf}); {_truth_str(t)}")
+            return
+        passed = tp_f == t["passed"] and tf_f == t["failed"]
+        detail = f"Tests Passed={tp}, Tests Failed={tf}; {_truth_str(t)}"
+        check(label, 2, passed, detail)
     except Exception as e:
-        check("5. data-analyzer row has Tests Passed/Failed", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
+
+
+def check_5_data_analyzer_counts():
+    """Verify data-analyzer row counts equal the verifier-recomputed truth."""
+    _check_counts_vs_truth(5, "data-analyzer")
 
 
 def check_6_todo_api_counts():
-    """Verify todo-api row has integer Tests Passed and Tests Failed."""
-    try:
-        row = _find_row("todo-api")
-        if not row:
-            check("6. todo-api row has Tests Passed/Failed", 2, False, "row not found")
-            return
-        tp = row.get("Tests Passed")
-        tf = row.get("Tests Failed")
-        tp_ok = tp is not None and str(tp).replace("-", "").isdigit()
-        tf_ok = tf is not None and str(tf).replace("-", "").isdigit()
-        passed = tp_ok and tf_ok
-        detail = f"Tests Passed={tp}, Tests Failed={tf}"
-        check("6. todo-api row has Tests Passed/Failed", 2, passed, detail)
-    except Exception as e:
-        check("6. todo-api row has Tests Passed/Failed", 2, False, f"exception: {e}")
+    """Verify todo-api row counts equal the verifier-recomputed truth."""
+    _check_counts_vs_truth(6, "todo-api")
 
 
 def check_7_pass_rate_correct():
-    """Verify Pass Rate is correctly computed as passed/(passed+failed)*100 rounded to 2 decimals."""
+    """Verify Pass Rate == round(truth_tp/(truth_tp+truth_tf)*100, 2) from recomputed truth."""
     try:
         all_ok = True
         details = []
         for proj in ["data-analyzer", "todo-api"]:
+            t = _get_truth()[proj]
+            if not t["ok"]:
+                all_ok = False
+                details.append(f"{proj}: {_truth_str(t)}")
+                continue
             row = _find_row(proj)
             if not row:
                 all_ok = False
                 details.append(f"{proj}: row not found")
                 continue
-            tp = row.get("Tests Passed")
-            tf = row.get("Tests Failed")
             pr = row.get("Pass Rate")
-            if tp is None or tf is None or pr is None:
+            if pr is None:
                 all_ok = False
-                details.append(f"{proj}: missing fields (tp={tp}, tf={tf}, pr={pr})")
+                details.append(f"{proj}: Pass Rate missing")
                 continue
             try:
-                tp_i = int(float(str(tp)))
-                tf_i = int(float(str(tf)))
                 pr_f = float(str(pr))
             except (ValueError, TypeError):
                 all_ok = False
-                details.append(f"{proj}: non-numeric values (tp={tp}, tf={tf}, pr={pr})")
+                details.append(f"{proj}: non-numeric Pass Rate {pr}")
                 continue
-            total = tp_i + tf_i
-            if total == 0:
-                all_ok = False
-                details.append(f"{proj}: total tests is 0")
-                continue
-            expected_rate = round(tp_i / total * 100, 2)
-            if abs(pr_f - expected_rate) > 0.01:
-                all_ok = False
-                details.append(f"{proj}: expected rate {expected_rate}, got {pr_f}")
+            expected_rate = round(t["passed"] / (t["passed"] + t["failed"]) * 100, 2)
+            if abs(pr_f - expected_rate) < 0.005:
+                details.append(f"{proj}: rate={pr_f} == truth {expected_rate}")
             else:
-                details.append(f"{proj}: rate={pr_f} correct")
-        check("7. Pass Rate correctly computed", 2, all_ok, "; ".join(details))
+                all_ok = False
+                details.append(f"{proj}: expected truth rate {expected_rate}, got {pr_f}")
+        check("7. Pass Rate matches recomputed truth", 2, all_ok, "; ".join(details))
     except Exception as e:
-        check("7. Pass Rate correctly computed", 2, False, f"exception: {e}")
+        check("7. Pass Rate matches recomputed truth", 2, False, f"exception: {e}")
 
 
 def check_8_pass_fail_threshold():
-    """Verify Pass/Fail is set correctly per 85.00 threshold."""
+    """Verify Pass/Fail equals the truth-derived verdict vs the 85.00 threshold."""
     try:
         all_ok = True
         details = []
         for proj in ["data-analyzer", "todo-api"]:
+            t = _get_truth()[proj]
+            if not t["ok"]:
+                all_ok = False
+                details.append(f"{proj}: {_truth_str(t)}")
+                continue
             row = _find_row(proj)
             if not row:
                 all_ok = False
                 details.append(f"{proj}: row not found")
                 continue
-            pr = row.get("Pass Rate")
             pf = row.get("Pass/Fail")
-            if pr is None or pf is None:
+            if pf is None:
                 all_ok = False
-                details.append(f"{proj}: missing fields (pr={pr}, pf={pf})")
-                continue
-            try:
-                pr_f = float(str(pr))
-            except (ValueError, TypeError):
-                all_ok = False
-                details.append(f"{proj}: non-numeric pass rate {pr}")
+                details.append(f"{proj}: Pass/Fail missing")
                 continue
             # Pass/Fail may be a dict (single_select) or string
             pf_val = pf
             if isinstance(pf, dict):
                 pf_val = pf.get("value", "")
             pf_str = str(pf_val).strip()
-            expected_pf = "Pass" if pr_f >= 85.00 else "Fail"
+            expected_pf = t["verdict"]
             if pf_str.lower() != expected_pf.lower():
                 all_ok = False
-                details.append(f"{proj}: rate={pr_f}, expected {expected_pf}, got {pf_str}")
+                details.append(f"{proj}: truth rate={t['rate']}, expected {expected_pf}, got {pf_str}")
             else:
-                details.append(f"{proj}: {pf_str} correct for rate {pr_f}")
-        check("8. Pass/Fail correct per 85.00 threshold", 2, all_ok, "; ".join(details))
+                details.append(f"{proj}: {pf_str} correct for truth rate {t['rate']}")
+        check("8. Pass/Fail matches truth verdict (85.00 threshold)", 2, all_ok, "; ".join(details))
     except Exception as e:
-        check("8. Pass/Fail correct per 85.00 threshold", 2, False, f"exception: {e}")
+        check("8. Pass/Fail matches truth verdict (85.00 threshold)", 2, False, f"exception: {e}")
 
 
 def check_9_captured_at():
-    """Verify Captured At date is populated for both rows."""
+    """Verify Captured At is populated and parses as a YYYY-MM-DD date."""
     try:
         all_ok = True
         details = []
@@ -325,21 +492,25 @@ def check_9_captured_at():
                 details.append(f"{proj}: row not found")
                 continue
             ca = row.get("Captured At")
-            if ca is None or str(ca).strip() == "":
+            ca_str = str(ca).strip() if ca is not None else ""
+            if not ca_str:
                 all_ok = False
                 details.append(f"{proj}: Captured At empty")
+            elif not re.match(r"^\d{4}-\d{2}-\d{2}", ca_str):
+                all_ok = False
+                details.append(f"{proj}: Captured At '{ca_str}' not YYYY-MM-DD")
             else:
-                details.append(f"{proj}: {ca}")
-        check("9. Captured At date populated", 1, all_ok, "; ".join(details))
+                details.append(f"{proj}: {ca_str}")
+        check("9. Captured At is a valid date", 1, all_ok, "; ".join(details))
     except Exception as e:
-        check("9. Captured At date populated", 1, False, f"exception: {e}")
+        check("9. Captured At is a valid date", 1, False, f"exception: {e}")
 
 
 def check_10_op_work_package_exists():
-    """Verify OpenProject has a Task WP 'Test Execution Audit Report' in 'product-catalog'."""
+    """Verify OpenProject has exactly one Task WP 'Test Execution Audit Report' in 'product-catalog'."""
     try:
         result = op_sql(
-            "SELECT wp.id, wp.subject, t.name AS type_name "
+            "SELECT count(*), COALESCE(string_agg(wp.id::text, ','), '') "
             "FROM work_packages wp "
             "JOIN projects p ON wp.project_id = p.id "
             "JOIN types t ON wp.type_id = t.id "
@@ -347,59 +518,91 @@ def check_10_op_work_package_exists():
             "AND wp.subject = 'Test Execution Audit Report' "
             "AND t.name = 'Task'"
         )
-        found = len(result.strip()) > 0 if result else False
-        check("10. OpenProject Task WP 'Test Execution Audit Report' exists", 2,
-              found,
-              f"query returned: {result[:100]}" if result else "not found")
+        parts = result.split("|")
+        count = int(parts[0]) if parts and parts[0].strip() else 0
+        ids = parts[1] if len(parts) > 1 else ""
+        check("10. Exactly one audit Task WP in product-catalog", 2,
+              count == 1,
+              f"count={count}, ids=[{ids}]")
     except Exception as e:
-        check("10. OpenProject Task WP 'Test Execution Audit Report' exists", 2, False, f"exception: {e}")
+        check("10. Exactly one audit Task WP in product-catalog", 2, False, f"exception: {e}")
+
+
+def _project_block(desc: str, proj: str) -> str:
+    """Line block for a project: from the line containing the project name to
+    the next line containing another project name (or end of description).
+    Falls back to the whole description when no per-project block is found."""
+    names = ["data-analyzer", "todo-api"]
+    lines = desc.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if proj in line.lower():
+            start = i
+            break
+    if start is None:
+        return desc
+    end = len(lines)
+    others = [n for n in names if n != proj]
+    for j in range(start + 1, len(lines)):
+        if any(n in lines[j].lower() for n in others):
+            end = j
+            break
+    return "\n".join(lines[start:end])
+
+
+def _check_desc_metrics(num: int, proj: str, require_threshold: bool) -> None:
+    """WP description block for the project must contain the truth-derived
+    passed/failed counts, pass rate, and verdict word (regexes built from truth)."""
+    label = f"{num}. WP description has {proj} truth metrics"
+    try:
+        result = op_sql(
+            "SELECT wp.description FROM work_packages wp "
+            "JOIN projects p ON wp.project_id = p.id "
+            "WHERE p.identifier = 'product-catalog' "
+            "AND wp.subject = 'Test Execution Audit Report'"
+        )
+        if not result:
+            check(label, 2, False, "WP not found")
+            return
+        t = _get_truth()[proj]
+        if not t["ok"]:
+            check(label, 2, False, _truth_str(t))
+            return
+        if proj not in result.lower():
+            check(label, 2, False,
+                  f"'{proj}' not mentioned; description: {_oneline(result)}")
+            return
+        block = _project_block(result, proj)
+        verdict_rx = r"\bpass(ed)?\b" if t["verdict"] == "Pass" else r"\bfail(ed)?\b"
+        required = {
+            f"passed count {t['passed']}": rf"\b{t['passed']}\b",
+            f"failed count {t['failed']}": rf"\b{t['failed']}\b",
+            f"rate {t['rate']}": _rate_regex(t["rate"]),
+            f"verdict word ({t['verdict']})": verdict_rx,
+        }
+        missing = [name for name, rx in required.items()
+                   if not re.search(rx, block, re.IGNORECASE)]
+        if require_threshold and not re.search(r"85(\.00?)?", result):
+            missing.append("threshold 85.00")
+        ok = not missing
+        if ok:
+            detail = f"all truth metrics present; {_truth_str(t)}"
+        else:
+            detail = (f"missing: {', '.join(missing)}; {_truth_str(t)}; "
+                      f"description: {_oneline(result)}")
+        check(label, 2, ok, detail)
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_11_op_desc_data_analyzer():
-    """Verify WP description mentions data-analyzer with pass rate and counts."""
-    try:
-        result = op_sql(
-            "SELECT wp.description FROM work_packages wp "
-            "JOIN projects p ON wp.project_id = p.id "
-            "WHERE p.identifier = 'product-catalog' "
-            "AND wp.subject = 'Test Execution Audit Report'"
-        )
-        if not result:
-            check("11. WP description has data-analyzer metrics", 2, False, "WP not found")
-            return
-        desc_lower = result.lower()
-        has_project = "data-analyzer" in desc_lower
-        # Look for numbers near data-analyzer mention — pass rate, passed, failed
-        has_numbers = bool(re.search(r'\d+', result))
-        passed = has_project and has_numbers
-        detail = f"has 'data-analyzer': {has_project}, has numbers: {has_numbers}"
-        check("11. WP description has data-analyzer metrics", 2, passed, detail)
-    except Exception as e:
-        check("11. WP description has data-analyzer metrics", 2, False, f"exception: {e}")
+    """Verify WP description block for data-analyzer carries truth metrics."""
+    _check_desc_metrics(11, "data-analyzer", require_threshold=False)
 
 
 def check_12_op_desc_todo_api():
-    """Verify WP description mentions todo-api with pass rate and counts."""
-    try:
-        result = op_sql(
-            "SELECT wp.description FROM work_packages wp "
-            "JOIN projects p ON wp.project_id = p.id "
-            "WHERE p.identifier = 'product-catalog' "
-            "AND wp.subject = 'Test Execution Audit Report'"
-        )
-        if not result:
-            check("12. WP description has todo-api metrics", 2, False, "WP not found")
-            return
-        desc_lower = result.lower()
-        has_project = "todo-api" in desc_lower
-        has_numbers = bool(re.search(r'\d+', result))
-        # Check for pass/fail outcome mention
-        has_outcome = "pass" in desc_lower or "fail" in desc_lower
-        passed = has_project and has_numbers and has_outcome
-        detail = f"has 'todo-api': {has_project}, has numbers: {has_numbers}, has pass/fail: {has_outcome}"
-        check("12. WP description has todo-api metrics", 2, passed, detail)
-    except Exception as e:
-        check("12. WP description has todo-api metrics", 2, False, f"exception: {e}")
+    """Verify WP description block for todo-api carries truth metrics + threshold."""
+    _check_desc_metrics(12, "todo-api", require_threshold=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -407,6 +610,7 @@ def main() -> None:
     check_1_projects_exist()
     check_2_baserow_db_exists()
     check_3_baserow_table_exists()
+    check_s_field_schema()
     check_4_exactly_two_rows()
     check_5_data_analyzer_counts()
     check_6_todo_api_counts()

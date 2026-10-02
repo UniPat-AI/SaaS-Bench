@@ -3,7 +3,8 @@
 Verifier for Business-023-I1: Process Expense Reimbursement for Mohammed Farooq
 Across HRMS, BigCapital, and Twenty CRM.
 
-Checks: 11 weighted checks (20 points total) across hrms, bigcapital, twenty.
+Checks: 13 checks (20 points total; check 2 is a 0pt seed-state precondition)
+across hrms, bigcapital, twenty.
 Strategy: docker exec MariaDB for HRMS and BigCapital, docker exec Postgres for Twenty.
 
 Required env vars:
@@ -13,9 +14,11 @@ Required env vars:
 """
 
 import os
+import re
 import sys
 import subprocess
 import json
+from datetime import datetime, timedelta
 
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
@@ -67,6 +70,58 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
     return r.returncode, r.stdout, r.stderr
 
 
+# NOTE: mysql -N -B prints SQL NULL as the literal string "NULL".
+def _is_null(field: str) -> bool:
+    return field is None or field.strip() == "" or field.strip() == "NULL"
+
+
+def _norm_ws(s: str) -> str:
+    """Collapse all whitespace runs to single spaces and strip."""
+    return " ".join(s.split())
+
+
+def _local_utc_offset() -> timedelta:
+    """UTC offset of the verifier host's local timezone (no hardcoded city)."""
+    off = datetime.now().astimezone().utcoffset()
+    return off if off is not None else timedelta(0)
+
+
+_TS_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?"
+    r"(?:([+-])(\d{2})(?::?(\d{2}))?)?$"
+)
+
+
+def date_matches_tz(stored: str, expected: str) -> bool:
+    """True if the stored date/timestamp denotes calendar date `expected`.
+
+    Semantics: dueAt::date == D  OR  (dueAt + local_utc_offset)::date == D.
+    Pure dates (exactly 10 chars) use equality; timestamps are parsed and
+    compared in UTC and in the verifier host's local timezone. No bare
+    substring matching.
+    """
+    s = (stored or "").strip()
+    if not s or s.upper() == "NULL":
+        return False
+    if len(s) == 10:
+        return s == expected
+    m = _TS_RE.match(s)
+    if not m:
+        return False
+    y, mo, d, hh, mi, ss = (int(m.group(i)) for i in range(1, 7))
+    dt = datetime(y, mo, d, hh, mi, ss)
+    # Normalize to UTC using any explicit offset suffix (psql prints '+00').
+    if m.group(7):
+        suffix = timedelta(hours=int(m.group(8)), minutes=int(m.group(9) or 0))
+        if m.group(7) == "+":
+            dt = dt - suffix
+        else:
+            dt = dt + suffix
+    if str(dt.date()) == expected:
+        return True
+    return str((dt + _local_utc_offset()).date()) == expected
+
+
 # ── HRMS DB helpers ───────────────────────────────────────────────────────────
 _hrms_db_name: str = ""
 _hrms_db_password: str = ""
@@ -97,7 +152,7 @@ def _discover_hrms_db() -> None:
 
 
 def hrms_query(sql: str) -> str:
-    """Run a MariaDB query on the HRMS database."""
+    """Run a MariaDB query on the HRMS database. Raises on mysql error."""
     if not _hrms_db_name:
         _discover_hrms_db()
     # Use the site-specific DB user (same as db_name in Frappe) with its password
@@ -142,10 +197,11 @@ def _discover_bc_tenant_db() -> None:
 
 
 def bc_query(sql: str) -> str:
-    """Run a MariaDB query on BigCapital's tenant database."""
+    """Run a MariaDB query on BigCapital's tenant database. Raises on error."""
     if not _bc_tenant_db:
         _discover_bc_tenant_db()
     # Try embedded DB first (BC_CONTAINER), then separate (BC_DB_CONTAINER)
+    err = ""
     for container in (BC_CONTAINER, BC_DB_CONTAINER):
         rc, out, err = docker_exec(
             container, "mysql",
@@ -163,7 +219,7 @@ _twenty_schema: str = ""
 
 
 def twenty_psql(sql: str) -> str:
-    """Run a Postgres query on the Twenty database."""
+    """Run a Postgres query on the Twenty database. Raises on psql error."""
     rc, out, err = docker_exec(
         TWENTY_DB_CONTAINER,
         "psql", "-U", "postgres", "-d", "default",
@@ -179,8 +235,13 @@ def get_twenty_schema() -> str:
     if _twenty_schema:
         return _twenty_schema
     result = twenty_psql(
-        "SELECT schema_name FROM information_schema.schemata "
-        "WHERE schema_name LIKE 'workspace_%' LIMIT 1;"
+        # The image seeds TWO workspaces (Apple/apple, YCombinator/yc). The app serves yc on the
+        # benchmark's subdomain-less localhost URL, so that is where the agent's writes land; an
+        # unordered LIMIT 1 only happened to agree, and ORDER BY schema_name picks Apple and
+        # silently finds nothing. core."dataSource" carries the authoritative schema mapping.
+        'SELECT ds.schema FROM core."dataSource" ds '
+        'JOIN core.workspace w ON w.id = ds."workspaceId" '
+        "WHERE w.subdomain = 'yc';"
     )
     if not result:
         raise RuntimeError("No workspace schema found in Twenty DB")
@@ -189,7 +250,7 @@ def get_twenty_schema() -> str:
 
 
 def twenty_ws(sql: str) -> str:
-    """Run a query in the Twenty workspace schema."""
+    """Run a query in the Twenty workspace schema. Raises on psql error."""
     schema = get_twenty_schema()
     rc, out, err = docker_exec(
         TWENTY_DB_CONTAINER,
@@ -206,81 +267,143 @@ def twenty_ws(sql: str) -> str:
     return "\n".join(filtered).strip()
 
 
+# ── Expected values (from task description) ──────────────────────────────────
+CLAIM_NAME = "HR-EXP-2026-00006"
+CLAIM_TOTAL = 10350.0
+EXPECTED_LINES = {"Travel": 8500.0, "Food": 1500.0, "Calls": 350.0}
+VENDOR_NAME = "Mohammed Farooq Reimbursement"
+VENDOR_EMAIL = "mohammed.farooq@gmail.com"
+BILL_DATE = "2026-03-20"
+PAYMENT_DATE = "2026-04-05"
+PAYMENT_ACCOUNT = "Bank Account"
+TASK_TITLE = "Expense reimbursement processed — Mohammed Farooq"
+TASK_DUE_DATE = "2026-04-05"
+TASK_BODY_SENTENCE = (
+    "Expense claim HR-EXP-2026-00006 approved and paid. "
+    "Total: ₹10,350.00. "
+    "Items: Travel (₹8,500.00), Food (₹1,500.00), Calls (₹350.00). "
+    "Payment made from Bank Account on 2026-04-05."
+)
+
+
 # ── Individual checks ─────────────────────────────────────────────────────────
 
 def check_1_hrms_claim_approved() -> None:
-    """Expense claim HR-EXP-2026-00006 is Approved with correct total (10350)."""
+    """Claim is Approved AND submitted (docstatus=1) with correct total 10350."""
     try:
         result = hrms_query(
-            "SELECT approval_status, total_claimed_amount "
-            "FROM `tabExpense Claim` WHERE name='HR-EXP-2026-00006';"
+            "SELECT approval_status, docstatus, total_claimed_amount "
+            f"FROM `tabExpense Claim` WHERE name='{CLAIM_NAME}';"
         )
         if not result:
             check("1. HRMS claim approved", 2, False, "claim not found")
             return
         parts = result.split("\t")
         status = parts[0].strip()
-        amount = float(parts[1]) if len(parts) > 1 else 0.0
-        ok = status == "Approved" and abs(amount - 10350.0) < 0.01
-        check("1. HRMS claim approved", 2, ok, f"status={status}, total={amount}")
+        docstatus = parts[1].strip() if len(parts) > 1 else ""
+        amount = float(parts[2]) if len(parts) > 2 and not _is_null(parts[2]) else 0.0
+        ok = (
+            status == "Approved"
+            and docstatus == "1"
+            and abs(amount - CLAIM_TOTAL) < 0.01
+        )
+        check("1. HRMS claim approved", 2, ok,
+              f"status={status}, docstatus={docstatus}, total={amount}")
     except Exception as e:
         check("1. HRMS claim approved", 2, False, f"exception: {e}")
 
 
 def check_2_hrms_claim_line_items() -> None:
-    """3 line items: Travel 8500, Food 1500, Calls 350."""
+    """[0pt precondition] 3 seeded line items: Travel 8500, Food 1500, Calls 350.
+
+    Pristine environments already satisfy this (seed data), so it carries no
+    weight; it is kept only as a diagnostic for downstream failures.
+    """
     try:
         result = hrms_query(
             "SELECT expense_type, amount FROM `tabExpense Claim Detail` "
-            "WHERE parent='HR-EXP-2026-00006' ORDER BY idx;"
+            f"WHERE parent='{CLAIM_NAME}' ORDER BY idx;"
         )
         if not result:
-            check("2. HRMS claim line items", 2, False, "no line items")
+            check("2. HRMS claim line items (precondition)", 0, False,
+                  "no line items")
             return
         found: dict[str, float] = {}
         for line in result.strip().split("\n"):
             parts = line.split("\t")
-            if len(parts) >= 2:
+            if len(parts) >= 2 and not _is_null(parts[1]):
                 found[parts[0].strip()] = float(parts[1])
-        expected = {"Travel": 8500.0, "Food": 1500.0, "Calls": 350.0}
         ok = len(found) == 3 and all(
-            abs(found.get(k, -1) - v) < 0.01 for k, v in expected.items()
+            abs(found.get(k, -1) - v) < 0.01 for k, v in EXPECTED_LINES.items()
         )
-        check("2. HRMS claim line items", 2, ok, f"found={found}")
+        check("2. HRMS claim line items (precondition)", 0, ok, f"found={found}")
     except Exception as e:
-        check("2. HRMS claim line items", 2, False, f"exception: {e}")
+        check("2. HRMS claim line items (precondition)", 0, False, f"exception: {e}")
+
+
+def check_2b_hrms_claim_unpaid_report_state() -> None:
+    """Claim is in the Unpaid Expense Claim report state.
+
+    Mirrors hrms unpaid_expense_claim report logic: docstatus=1 AND is_paid=0,
+    with sanctioned amount 10350 and nothing reimbursed.
+    """
+    try:
+        result = hrms_query(
+            "SELECT docstatus, is_paid, total_sanctioned_amount, "
+            "total_amount_reimbursed "
+            f"FROM `tabExpense Claim` WHERE name='{CLAIM_NAME}';"
+        )
+        if not result:
+            check("2b. HRMS claim unpaid report state", 1, False, "claim not found")
+            return
+        parts = result.split("\t")
+        docstatus = parts[0].strip()
+        is_paid = parts[1].strip() if len(parts) > 1 else ""
+        sanctioned = (
+            float(parts[2]) if len(parts) > 2 and not _is_null(parts[2]) else -1.0
+        )
+        reimbursed = (
+            float(parts[3]) if len(parts) > 3 and not _is_null(parts[3]) else -1.0
+        )
+        ok = (
+            docstatus == "1"
+            and is_paid == "0"
+            and abs(sanctioned - CLAIM_TOTAL) < 0.01
+            and abs(reimbursed) < 0.01
+        )
+        check("2b. HRMS claim unpaid report state", 1, ok,
+              f"docstatus={docstatus}, is_paid={is_paid}, "
+              f"sanctioned={sanctioned}, reimbursed={reimbursed}")
+    except Exception as e:
+        check("2b. HRMS claim unpaid report state", 1, False, f"exception: {e}")
 
 
 def check_3_bc_vendor_exists() -> None:
-    """Vendor 'Mohammed Farooq Reimbursement' exists with correct email."""
+    """Exactly one vendor 'Mohammed Farooq Reimbursement' with the exact email."""
     try:
         result = bc_query(
-            "SELECT DISPLAY_NAME, EMAIL FROM CONTACTS "
-            "WHERE DISPLAY_NAME = 'Mohammed Farooq Reimbursement' "
-            "AND CONTACT_SERVICE = 'vendor' LIMIT 1;"
+            "SELECT EMAIL FROM CONTACTS "
+            f"WHERE DISPLAY_NAME = '{VENDOR_NAME}' "
+            "AND CONTACT_SERVICE = 'vendor';"
         )
-        if not result:
-            # Try without service filter
-            result = bc_query(
-                "SELECT DISPLAY_NAME, EMAIL FROM CONTACTS "
-                "WHERE DISPLAY_NAME = 'Mohammed Farooq Reimbursement' LIMIT 1;"
-            )
-        ok = bool(result.strip())
-        if ok:
-            parts = result.split("\t")
-            email = parts[1].strip() if len(parts) > 1 else ""
-            check("3. BC vendor exists", 1, True, f"email={email}")
-        else:
-            check("3. BC vendor exists", 1, False, "vendor not found")
+        rows = [r for r in result.split("\n") if r.strip()] if result else []
+        if len(rows) != 1:
+            check("3. BC vendor exists", 1, False,
+                  f"expected exactly 1 vendor row, got {len(rows)}")
+            return
+        email = rows[0].strip()
+        ok = email == VENDOR_EMAIL
+        check("3. BC vendor exists", 1, ok, f"email={email}")
     except Exception as e:
         check("3. BC vendor exists", 1, False, f"exception: {e}")
 
 
 def check_4_bc_items_exist() -> None:
-    """Items 'Travel', 'Food', 'Calls' exist."""
+    """Active items 'Travel', 'Food', 'Calls' exist."""
     try:
         result = bc_query(
-            "SELECT NAME FROM ITEMS WHERE NAME IN ('Travel', 'Food', 'Calls');"
+            "SELECT NAME FROM ITEMS "
+            "WHERE NAME IN ('Travel', 'Food', 'Calls') AND ACTIVE = 1;"
         )
         found = {r.strip() for r in result.split("\n") if r.strip()} if result else set()
         required = {"Travel", "Food", "Calls"}
@@ -291,216 +414,238 @@ def check_4_bc_items_exist() -> None:
         check("4. BC items exist", 1, False, f"exception: {e}")
 
 
-def check_5_bc_bill_exists() -> None:
-    """Bill dated 2026-03-20 for vendor with total ~10350 exists."""
+def check_5_bc_bill_exists() -> tuple[str | None, str | None]:
+    """Exactly one bill for the vendor, dated 2026-03-20, amount 10350.
+
+    Returns (bill_id, opened_at) for reuse by checks 5b/6/7/8; bill_id is None
+    when the vendor has no unique bill (downstream checks then FAIL cleanly).
+    """
+    label = "5. BC bill exists"
     try:
         result = bc_query(
-            "SELECT b.ID, b.BILL_DATE, b.AMOUNT, b.STATUS, c.DISPLAY_NAME "
+            "SELECT b.ID, b.BILL_DATE, b.AMOUNT, b.OPENED_AT "
             "FROM BILLS b "
-            "LEFT JOIN CONTACTS c ON b.VENDOR_ID = c.ID "
-            "WHERE c.DISPLAY_NAME = 'Mohammed Farooq Reimbursement' "
-            "AND b.BILL_DATE = '2026-03-20' "
-            "LIMIT 1;"
+            "JOIN CONTACTS c ON b.VENDOR_ID = c.ID "
+            f"WHERE c.DISPLAY_NAME = '{VENDOR_NAME}' "
+            "AND c.CONTACT_SERVICE = 'vendor';"
         )
-        if not result:
-            # Broader search
-            result = bc_query(
-                "SELECT b.ID, b.BILL_DATE, b.AMOUNT, b.STATUS "
-                "FROM BILLS b WHERE ABS(b.AMOUNT - 10350) < 1 LIMIT 1;"
-            )
-        if not result:
-            check("5. BC bill exists", 2, False, "no matching bill")
-            return
-        parts = result.split("\t")
-        bill_date = parts[1].strip() if len(parts) > 1 else ""
-        amount = float(parts[2]) if len(parts) > 2 else 0.0
-        status = parts[3].strip() if len(parts) > 3 else ""
-        ok = "2026-03-20" in bill_date and abs(amount - 10350.0) < 1.0
-        check("5. BC bill exists", 2, ok,
-              f"date={bill_date}, amount={amount}, status={status}")
+        rows = [r for r in result.split("\n") if r.strip()] if result else []
+        if len(rows) != 1:
+            check(label, 2, False,
+                  f"expected exactly 1 bill for vendor, got {len(rows)}")
+            return None, None
+        parts = rows[0].split("\t")
+        bill_id = parts[0].strip()
+        bill_date = parts[1].strip().split(" ")[0] if len(parts) > 1 else ""
+        amount = float(parts[2]) if len(parts) > 2 and not _is_null(parts[2]) else 0.0
+        opened_at = parts[3].strip() if len(parts) > 3 else ""
+        ok = bill_date == BILL_DATE and abs(amount - CLAIM_TOTAL) < 0.01
+        check(label, 2, ok,
+              f"id={bill_id}, date={bill_date}, amount={amount}, "
+              f"opened_at={opened_at}")
+        return bill_id, opened_at
     except Exception as e:
-        check("5. BC bill exists", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
+        return None, None
 
 
-def _find_bc_bill_id() -> str | None:
-    """Find the ID of the target bill."""
-    result = bc_query(
-        "SELECT b.ID FROM BILLS b "
-        "LEFT JOIN CONTACTS c ON b.VENDOR_ID = c.ID "
-        "WHERE c.DISPLAY_NAME = 'Mohammed Farooq Reimbursement' "
-        "AND ABS(b.AMOUNT - 10350) < 1 LIMIT 1;"
-    )
-    if result and result.strip():
-        return result.strip().split("\n")[0].split("\t")[0].strip()
-    # Broader search
-    result = bc_query(
-        "SELECT ID FROM BILLS WHERE ABS(AMOUNT - 10350) < 1 LIMIT 1;"
-    )
-    if result and result.strip():
-        return result.strip().split("\n")[0].strip()
-    return None
+def check_5b_bc_bill_opened(bill_id: str | None, opened_at: str | None) -> None:
+    """Bill has been approved (opened): OPENED_AT is set."""
+    label = "5b. BC bill opened"
+    if bill_id is None:
+        check(label, 1, False, "bill not found (see check 5)")
+        return
+    ok = not _is_null(opened_at or "")
+    check(label, 1, ok, f"opened_at={opened_at}")
 
 
-def check_6_bc_bill_line_items() -> None:
-    """Bill has 3 entries: Travel 8500, Food 1500, Calls 350."""
+def check_6_bc_bill_line_items(bill_id: str | None) -> None:
+    """Bill has exactly 3 entries: Travel 8500, Food 1500, Calls 350."""
+    label = "6. BC bill line items"
+    if bill_id is None:
+        check(label, 2, False, "bill not found (see check 5)")
+        return
     try:
-        bill_id = _find_bc_bill_id()
-        if not bill_id:
-            check("6. BC bill line items", 2, False, "bill not found")
-            return
         result = bc_query(
-            f"SELECT i.NAME, ie.RATE, ie.QUANTITY "
-            f"FROM ITEMS_ENTRIES ie "
-            f"LEFT JOIN ITEMS i ON ie.ITEM_ID = i.ID "
-            f"WHERE ie.REFERENCE_TYPE = 'Bill' AND ie.REFERENCE_ID = '{bill_id}';"
+            "SELECT i.NAME, ie.RATE, ie.QUANTITY "
+            "FROM ITEMS_ENTRIES ie "
+            "JOIN ITEMS i ON ie.ITEM_ID = i.ID "
+            f"WHERE ie.REFERENCE_TYPE = 'Bill' AND ie.REFERENCE_ID = {bill_id};"
         )
-        if not result:
-            check("6. BC bill line items", 2, False, "no line items found")
+        rows = [r for r in result.split("\n") if r.strip()] if result else []
+        if not rows:
+            check(label, 2, False, "no line items found")
             return
-        expected = {"Travel": 8500.0, "Food": 1500.0, "Calls": 350.0}
         found: dict[str, float] = {}
-        for line in result.strip().split("\n"):
+        for line in rows:
             parts = line.split("\t")
-            if len(parts) >= 3:
-                name = parts[0].strip()
-                rate = float(parts[1])
-                qty = float(parts[2])
-                found[name] = rate * qty
-        ok = all(abs(found.get(k, -1) - v) < 1.0 for k, v in expected.items())
-        check("6. BC bill line items", 2, ok, f"found={found}")
-    except Exception as e:
-        check("6. BC bill line items", 2, False, f"exception: {e}")
-
-
-def check_7_bc_payment_recorded() -> None:
-    """Payment of 10350 from Bank Account dated 2026-04-05."""
-    try:
-        result = bc_query(
-            "SELECT bp.AMOUNT, bp.PAYMENT_DATE, a.NAME AS ACCT_NAME "
-            "FROM BILLS_PAYMENTS bp "
-            "LEFT JOIN ACCOUNTS a ON bp.PAYMENT_ACCOUNT_ID = a.ID "
-            "WHERE ABS(bp.AMOUNT - 10350) < 1 "
-            "AND bp.PAYMENT_DATE = '2026-04-05' "
-            "LIMIT 1;"
-        )
-        if not result:
-            check("7. BC payment recorded", 2, False, "payment not found")
-            return
-        parts = result.split("\t")
-        amount = float(parts[0]) if parts else 0.0
-        date = parts[1].strip() if len(parts) > 1 else ""
-        acct = parts[2].strip() if len(parts) > 2 else ""
-        ok = abs(amount - 10350.0) < 1.0 and "2026-04-05" in date
-        check("7. BC payment recorded", 2, ok,
-              f"amount={amount}, date={date}, account={acct}")
-    except Exception as e:
-        check("7. BC payment recorded", 2, False, f"exception: {e}")
-
-
-def check_8_bc_bill_fully_paid() -> None:
-    """Bill is fully paid — payment_amount matches amount (zero balance)."""
-    try:
-        result = bc_query(
-            "SELECT b.AMOUNT, b.PAYMENT_AMOUNT, b.STATUS "
-            "FROM BILLS b "
-            "LEFT JOIN CONTACTS c ON b.VENDOR_ID = c.ID "
-            "WHERE c.DISPLAY_NAME = 'Mohammed Farooq Reimbursement' "
-            "AND ABS(b.AMOUNT - 10350) < 1 LIMIT 1;"
-        )
-        if not result:
-            result = bc_query(
-                "SELECT AMOUNT, PAYMENT_AMOUNT, STATUS FROM BILLS "
-                "WHERE ABS(AMOUNT - 10350) < 1 LIMIT 1;"
+            if len(parts) >= 3 and not _is_null(parts[1]) and not _is_null(parts[2]):
+                found[parts[0].strip()] = float(parts[1]) * float(parts[2])
+        ok = (
+            len(rows) == 3
+            and len(found) == 3
+            and all(
+                abs(found.get(k, -1) - v) < 0.01 for k, v in EXPECTED_LINES.items()
             )
+        )
+        check(label, 2, ok, f"rows={len(rows)}, found={found}")
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
+def check_7_bc_payment_recorded(bill_id: str | None) -> None:
+    """Payment of 10350 from 'Bank Account' dated 2026-04-05, bound to the bill
+    via BILLS_PAYMENTS_ENTRIES (all conditions on the same row)."""
+    label = "7. BC payment recorded"
+    if bill_id is None:
+        check(label, 2, False, "bill not found (see check 5)")
+        return
+    try:
+        result = bc_query(
+            "SELECT bp.AMOUNT, bp.PAYMENT_DATE, a.NAME, bpe.PAYMENT_AMOUNT "
+            "FROM BILLS_PAYMENTS bp "
+            "JOIN BILLS_PAYMENTS_ENTRIES bpe ON bpe.BILL_PAYMENT_ID = bp.ID "
+            "JOIN ACCOUNTS a ON bp.PAYMENT_ACCOUNT_ID = a.ID "
+            f"WHERE bpe.BILL_ID = {bill_id};"
+        )
+        rows = [r for r in result.split("\n") if r.strip()] if result else []
+        if not rows:
+            check(label, 2, False, "no payment bound to the bill")
+            return
+        ok = False
+        details = []
+        for line in rows:
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            amount = float(parts[0]) if not _is_null(parts[0]) else -1.0
+            pay_date = parts[1].strip().split(" ")[0]
+            acct = parts[2].strip()
+            entry_amount = float(parts[3]) if not _is_null(parts[3]) else -1.0
+            details.append(
+                f"amount={amount}, date={pay_date}, account={acct}, "
+                f"entry_amount={entry_amount}"
+            )
+            if (
+                abs(amount - CLAIM_TOTAL) < 0.01
+                and pay_date == PAYMENT_DATE
+                and acct == PAYMENT_ACCOUNT
+                and abs(entry_amount - CLAIM_TOTAL) < 0.01
+            ):
+                ok = True
+        check(label, 2, ok, "; ".join(details)[:200])
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
+def check_8_bc_bill_fully_paid(bill_id: str | None) -> None:
+    """The target bill is fully paid: PAYMENT_AMOUNT equals AMOUNT (zero due).
+
+    DB proxy for the A/P Aging zero-balance verification (task step 8).
+    """
+    label = "8. BC bill fully paid"
+    if bill_id is None:
+        check(label, 3, False, "bill not found (see check 5)")
+        return
+    try:
+        result = bc_query(
+            f"SELECT AMOUNT, PAYMENT_AMOUNT FROM BILLS WHERE ID = {bill_id};"
+        )
         if not result:
-            check("8. BC bill fully paid", 3, False, "bill not found")
+            check(label, 3, False, "bill row not found")
             return
         parts = result.split("\t")
+        if len(parts) < 2 or _is_null(parts[0]) or _is_null(parts[1]):
+            check(label, 3, False, f"amount/payment_amount NULL: {result[:80]}")
+            return
         amount = float(parts[0])
-        paid = float(parts[1]) if len(parts) > 1 else 0.0
-        status = parts[2].strip() if len(parts) > 2 else ""
+        paid = float(parts[1])
         due = amount - paid
-        ok = abs(due) < 0.01 or status.lower() == "paid"
-        check("8. BC bill fully paid", 3, ok,
-              f"amount={amount}, paid={paid}, due={due:.2f}, status={status}")
+        ok = abs(due) < 0.01
+        check(label, 3, ok, f"amount={amount}, paid={paid}, due={due:.2f}")
     except Exception as e:
-        check("8. BC bill fully paid", 3, False, f"exception: {e}")
+        check(label, 3, False, f"exception: {e}")
 
 
 def check_9_twenty_task_exists() -> None:
-    """Task titled 'Expense reimbursement processed — Mohammed Farooq' exists."""
+    """Task with the exact title 'Expense reimbursement processed — Mohammed
+    Farooq' exists (not deleted)."""
     try:
         result = twenty_ws(
-            "SELECT id, title FROM task "
-            "WHERE \"deletedAt\" IS NULL "
-            "AND title LIKE '%Expense reimbursement processed%Mohammed Farooq%' "
+            "SELECT id FROM task "
+            'WHERE "deletedAt" IS NULL '
+            f"AND title = '{TASK_TITLE}' "
             "LIMIT 1;"
         )
         ok = bool(result.strip())
         check("9. Twenty task exists", 1, ok,
-              result.strip()[:120] if ok else "task not found")
+              f"id={result.strip()[:60]}" if ok else "task not found")
     except Exception as e:
         check("9. Twenty task exists", 1, False, f"exception: {e}")
 
 
 def check_10_twenty_task_completed() -> None:
-    """Task is completed (DONE) with due date 2026-04-05."""
+    """Task is completed (DONE) with due date 2026-04-05 (timezone-aware)."""
+    label = "10. Twenty task completed + due date"
     try:
-        result = twenty_ws(
-            "SELECT status, \"dueAt\"::text FROM task "
-            "WHERE \"deletedAt\" IS NULL "
-            "AND title LIKE '%Expense reimbursement processed%Mohammed Farooq%' "
+        status = twenty_ws(
+            "SELECT status FROM task "
+            'WHERE "deletedAt" IS NULL '
+            f"AND title = '{TASK_TITLE}' "
             "LIMIT 1;"
-        )
-        if not result.strip():
-            check("10. Twenty task completed + due date", 2, False, "task not found")
+        ).strip()
+        if not status:
+            check(label, 2, False, "task not found")
             return
-        parts = result.split("|")
-        status = parts[0].strip()
-        due_at = parts[1].strip() if len(parts) > 1 else ""
-        ok = status == "DONE" and "2026-04-05" in due_at
-        check("10. Twenty task completed + due date", 2, ok,
-              f"status={status}, dueAt={due_at}")
+        due_at = twenty_ws(
+            'SELECT "dueAt"::text FROM task '
+            'WHERE "deletedAt" IS NULL '
+            f"AND title = '{TASK_TITLE}' "
+            "LIMIT 1;"
+        ).strip()
+        ok = status == "DONE" and date_matches_tz(due_at, TASK_DUE_DATE)
+        check(label, 2, ok, f"status={status}, dueAt={due_at}")
     except Exception as e:
-        check("10. Twenty task completed + due date", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_11_twenty_task_body() -> None:
-    """Task body contains key expense reimbursement details."""
+    """Task body contains the full required sentence from the task description."""
+    label = "11. Twenty task body"
     try:
-        # Try bodyV2Markdown first, fall back to bodyV2Blocknote
         result = twenty_ws(
-            "SELECT COALESCE(\"bodyV2Markdown\", \"bodyV2Blocknote\"::text, '') FROM task "
-            "WHERE \"deletedAt\" IS NULL "
-            "AND title LIKE '%Expense reimbursement processed%Mohammed Farooq%' "
+            "SELECT regexp_replace("
+            "COALESCE(\"bodyV2Markdown\", \"bodyV2Blocknote\"::text, ''), "
+            "E'[\\n\\r]+', ' ', 'g') FROM task "
+            'WHERE "deletedAt" IS NULL '
+            f"AND title = '{TASK_TITLE}' "
             "LIMIT 1;"
         )
-        if not result.strip():
-            check("11. Twenty task body", 2, False, "task not found")
+        body = _norm_ws(result)
+        if not body:
+            check(label, 2, False, "task not found or body empty")
             return
-        body = result.lower()
-        required = ["hr-exp-2026-00006", "travel", "food", "calls", "bank account"]
-        has_amount = "10,350" in body or "10350" in body
-        missing = [f for f in required if f not in body]
-        if not has_amount:
-            missing.append("amount 10350")
-        ok = not missing
-        check("11. Twenty task body", 2, ok,
-              "all key details present" if ok else f"missing: {missing}")
+        expected = _norm_ws(TASK_BODY_SENTENCE)
+        ok = expected in body
+        check(label, 2, ok,
+              "full sentence present" if ok
+              else f"required sentence not found in body: {body[:160]}")
     except Exception as e:
-        check("11. Twenty task body", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     check_1_hrms_claim_approved()
     check_2_hrms_claim_line_items()
+    check_2b_hrms_claim_unpaid_report_state()
     check_3_bc_vendor_exists()
     check_4_bc_items_exist()
-    check_5_bc_bill_exists()
-    check_6_bc_bill_line_items()
-    check_7_bc_payment_recorded()
-    check_8_bc_bill_fully_paid()
+    bill_id, opened_at = check_5_bc_bill_exists()
+    check_5b_bc_bill_opened(bill_id, opened_at)
+    check_6_bc_bill_line_items(bill_id)
+    check_7_bc_payment_recorded(bill_id)
+    check_8_bc_bill_fully_paid(bill_id)
     check_9_twenty_task_exists()
     check_10_twenty_task_completed()
     check_11_twenty_task_body()

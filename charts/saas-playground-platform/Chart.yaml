@@ -1,0 +1,6 @@
+apiVersion: v2
+name: saas-playground-platform
+description: Standing SaaS-Bench Target Playground — the prepare/grade/release service + shared GKE Gateway + TTL janitor, in the saas-playground namespace.
+type: application
+version: 0.2.0
+appVersion: "0.1.0"

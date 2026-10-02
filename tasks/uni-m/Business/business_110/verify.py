@@ -2,7 +2,7 @@
 """
 Verifier for Business-110-I5: New Employee Onboarding (HRMS + BigCapital + Twenty)
 
-Checks: 19 weighted checks across hrms, bigcapital, twenty.
+Checks: 20 weighted checks across hrms, bigcapital, twenty.
 Strategy: docker exec MariaDB (HRMS), REST API (BigCapital), docker exec Postgres (Twenty)
 
 Required env vars:
@@ -10,8 +10,11 @@ Required env vars:
 """
 
 import os
+import re
 import sys
 import subprocess
+from datetime import datetime, timezone
+
 import requests
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
@@ -97,8 +100,13 @@ def ws_schema() -> str:
     global _ws
     if _ws is None:
         r = twenty_sql(
-            "SELECT schema_name FROM information_schema.schemata "
-            "WHERE schema_name LIKE 'workspace_%' LIMIT 1;"
+            # The image seeds TWO workspaces (Apple/apple, YCombinator/yc). The app serves yc on the
+            # benchmark's subdomain-less localhost URL, so that is where the agent's writes land; an
+            # unordered LIMIT 1 only happened to agree, and ORDER BY schema_name picks Apple and
+            # silently finds nothing. core."dataSource" carries the authoritative schema mapping.
+            'SELECT ds.schema FROM core."dataSource" ds '
+            'JOIN core.workspace w ON w.id = ds."workspaceId" '
+            "WHERE w.subdomain = 'yc';"
         )
         if not r:
             raise RuntimeError("no workspace schema found")
@@ -172,6 +180,36 @@ def bc_account_name(account_id) -> str:
     return ""
 
 
+def norm_text(s: str) -> str:
+    """Normalize dashes (em/en/double) to '-' and collapse whitespace."""
+    s = s.replace("—", "-").replace("–", "-").replace("--", "-")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def date_matches_tz(stored: str, expected: str) -> bool:
+    """True if a stored date/timestamp equals expected (YYYY-MM-DD).
+
+    Pure dates (exactly 10 chars) compare by equality. Timestamps are
+    interpreted (naive => UTC) and converted to the verifier host's local
+    timezone (computed by Python, no hardcoded zone name) before comparing
+    the calendar date.
+    """
+    s = stored.strip()
+    if not s:
+        return False
+    if len(s) == 10:
+        return s == expected
+    # Postgres text offsets like '+00' -> '+00:00' for fromisoformat
+    s2 = re.sub(r"([+-]\d{2})$", r"\1:00", s)
+    try:
+        dt = datetime.fromisoformat(s2)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().date().isoformat() == expected
+
+
 # ── HRMS Checks ───────────────────────────────────────────────────────────────
 
 def check_1_department() -> None:
@@ -186,15 +224,19 @@ def check_1_department() -> None:
             return
         parent_ok = "All Departments" in dept
         la = hrms_sql(
-            "SELECT approver FROM `tabDepartment Approver` "
-            "WHERE parent='Machine Learning - TVS' AND parentfield='leave_approvers';"
+            "SELECT COUNT(*) FROM `tabDepartment Approver` "
+            "WHERE parent='Machine Learning - TVS' "
+            "AND parentfield='leave_approvers' "
+            "AND approver='pooja.malhotra@techvista.com';"
         )
         ea = hrms_sql(
-            "SELECT approver FROM `tabDepartment Approver` "
-            "WHERE parent='Machine Learning - TVS' AND parentfield='expense_approvers';"
+            "SELECT COUNT(*) FROM `tabDepartment Approver` "
+            "WHERE parent='Machine Learning - TVS' "
+            "AND parentfield='expense_approvers' "
+            "AND approver='rajesh.kumar@techvista.com';"
         )
-        la_ok = "pooja.malhotra@techvista.com" in la
-        ea_ok = "rajesh.kumar@techvista.com" in ea
+        la_ok = int(la or 0) >= 1
+        ea_ok = int(ea or 0) >= 1
         ok = parent_ok and la_ok and ea_ok
         check("1. Department", 2, ok,
               f"parent={parent_ok}, leave_appr={la_ok}, expense_appr={ea_ok}")
@@ -245,7 +287,8 @@ def check_4_emergency_contact() -> None:
     """Employee emergency contact."""
     try:
         r = hrms_sql(
-            "SELECT person_to_be_contacted, emergency_phone_number "
+            "SELECT person_to_be_contacted, emergency_phone_number, "
+            "INSTR(IFNULL(emergency_phone_number, ''), '+91-9922334455') "
             "FROM `tabEmployee` WHERE name='HR-EMP-00020';"
         )
         if not r:
@@ -253,8 +296,8 @@ def check_4_emergency_contact() -> None:
             return
         f = r.split("\t")
         name_ok = len(f) >= 1 and "Ramesh Krishnamurthy" in f[0]
-        phone_ok = len(f) >= 2 and "9922334455" in f[1]
-        check("4. Emergency contact", 1, name_ok and phone_ok, f"raw={f}")
+        phone_ok = len(f) >= 3 and f[2].strip().isdigit() and int(f[2]) > 0
+        check("4. Emergency contact", 1, name_ok and phone_ok, f"raw={f[:2]}")
     except Exception as e:
         check("4. Emergency contact", 1, False, f"exception: {e}")
 
@@ -282,8 +325,11 @@ def check_5_holiday_list() -> None:
         ]
         rows = [line.split("\t") for line in holidays.split("\n") if line.strip()]
         count_ok = len(rows) == 4
+        # full-name INSTR-style match on description (may be HTML-wrapped),
+        # exact equality on the holiday date
         content_ok = all(
-            any(name in r[0] and date in r[1] for r in rows if len(r) >= 2)
+            any(name in r[0] and r[1].strip() == date
+                for r in rows if len(r) >= 2)
             for name, date in expected
         )
         ok = dates_ok and count_ok and content_ok
@@ -358,42 +404,65 @@ def check_8_leave_period() -> None:
 
 
 def check_9_leave_policy_assignment() -> None:
-    """Leave Policy Assignment submitted for HR-EMP-00020."""
+    """Leave Policy Assignment submitted for HR-EMP-00020 (same-row SQL)."""
     try:
         r = hrms_sql(
-            "SELECT leave_policy, effective_from, leave_period, docstatus "
-            "FROM `tabLeave Policy Assignment` "
+            "SELECT COUNT(*) FROM `tabLeave Policy Assignment` "
             "WHERE employee='HR-EMP-00020' "
-            "AND leave_policy='ML Engineering Leave Policy 2026';"
+            "AND leave_policy='ML Engineering Leave Policy 2026' "
+            "AND effective_from='2026-09-01' "
+            "AND leave_period='ML Engineering Leave Period 2026' "
+            "AND docstatus=1;"
         )
-        if not r:
-            check("9. Leave Policy Assignment", 2, False, "not found")
-            return
-        f = r.split("\t")
-        policy_ok = len(f) >= 1 and "ML Engineering Leave Policy 2026" in f[0]
-        date_ok = len(f) >= 2 and "2026-09-01" in f[1]
-        period_ok = len(f) >= 3 and "ML Engineering Leave Period 2026" in f[2]
-        submitted = len(f) >= 4 and f[3].strip() == "1"
-        ok = policy_ok and date_ok and period_ok and submitted
-        check("9. Leave Policy Assignment", 2, ok,
-              f"policy={policy_ok}, date={date_ok}, period={period_ok}, submitted={submitted}")
+        n = int(r or 0)
+        check("9. Leave Policy Assignment", 1, n >= 1, f"matching rows={n}")
     except Exception as e:
-        check("9. Leave Policy Assignment", 2, False, f"exception: {e}")
+        check("9. Leave Policy Assignment", 1, False, f"exception: {e}")
+
+
+def check_9b_leave_allocations() -> None:
+    """Auto-created Leave Allocations: exactly Innovation=7 and Sick=7."""
+    try:
+        r = hrms_sql(
+            "SELECT leave_type, total_leaves_allocated "
+            "FROM `tabLeave Allocation` "
+            "WHERE employee='HR-EMP-00020' "
+            "AND leave_policy='ML Engineering Leave Policy 2026' "
+            "AND docstatus=1;"
+        )
+        rows = [line.split("\t") for line in r.split("\n") if line.strip()]
+        alloc: dict[str, float] = {}
+        for row in rows:
+            if len(row) >= 2:
+                try:
+                    alloc[row[0].strip()] = float(row[1].strip())
+                except ValueError:
+                    pass
+        count_ok = len(rows) == 2
+        innov_ok = abs(alloc.get("Innovation Leave", -1) - 7) < 0.01
+        sick_ok = abs(alloc.get("Sick Leave", -1) - 7) < 0.01
+        check("9b. Leave Allocations (balance 7+7)", 1,
+              count_ok and innov_ok and sick_ok,
+              f"rows={len(rows)}, alloc={alloc}")
+    except Exception as e:
+        check("9b. Leave Allocations (balance 7+7)", 1, False, f"exception: {e}")
 
 
 def check_10_salary_component() -> None:
     """Salary Component 'ML Research Allowance' of type Earning."""
     try:
         r = hrms_sql(
-            "SELECT type, description FROM `tabSalary Component` "
-            "WHERE name='ML Research Allowance';"
+            "SELECT type, INSTR(IFNULL(description, ''), "
+            "'Monthly allowance for ML research tools, GPU compute credits, "
+            "and dataset subscriptions') "
+            "FROM `tabSalary Component` WHERE name='ML Research Allowance';"
         )
         if not r:
             check("10. Salary Component", 1, False, "not found")
             return
         f = r.split("\t")
         type_ok = len(f) >= 1 and "Earning" in f[0]
-        desc_ok = len(f) >= 2 and "ML research tools" in f[1]
+        desc_ok = len(f) >= 2 and f[1].strip().isdigit() and int(f[1]) > 0
         check("10. Salary Component", 1, type_ok and desc_ok,
               f"type={f[0] if f else ''}, desc_match={desc_ok}")
     except Exception as e:
@@ -424,7 +493,10 @@ def check_11_salary_structure() -> None:
         basic = comp.get("Basic", ("", ""))
         basic_ok = "base * 0.57" in basic[0] or "base*0.57" in basic[0]
         mra = comp.get("ML Research Allowance", ("", ""))
-        mra_ok = mra[1].startswith("9000")
+        try:
+            mra_ok = abs(float(mra[1]) - 9000) < 0.01
+        except ValueError:
+            mra_ok = False
         ok = freq_ok and company_ok and basic_ok and mra_ok
         check("11. Salary Structure", 2, ok,
               f"freq={freq_ok}, co={company_ok}, basic_formula={basic[0]!r}, mra_amt={mra[1]!r}")
@@ -530,8 +602,13 @@ def check_15_bc_payable_account() -> None:
         check("15. BC Payable Account", 1, False, f"exception: {e}")
 
 
-def _verify_bc_journal(date_str: str, memo_substr: str) -> tuple[bool, str]:
-    """Verify a BigCapital journal entry by date. Returns (passed, detail)."""
+def _verify_bc_journal(date_str: str, memo_full: str) -> tuple[bool, str]:
+    """Verify a published BigCapital journal matching date AND full memo.
+
+    Requires: date match, full memo equality (whitespace/dash normalized),
+    published_at non-empty, exactly 2 entries, debit(ML Engineer Salary
+    Expense)==95000 and credit(ML Engineer Salary Payable)==95000 (+-0.01).
+    """
     base, s = bc()
     r = s.get(f"{base}/api/manual-journals", timeout=15)
     r.raise_for_status()
@@ -554,19 +631,18 @@ def _verify_bc_journal(date_str: str, memo_substr: str) -> tuple[bool, str]:
                 if journals:
                     break
 
+    memo_want = norm_text(memo_full)
     target = None
     for j in journals:
         jdate = str(j.get("date") or j.get("journal_date") or "")
         jdesc = str(j.get("description") or j.get("memo") or j.get("reference") or "")
-        if date_str in jdate:
-            if memo_substr in jdesc:
-                target = j
-                break
-            if target is None:
-                target = j  # fallback: match by date alone
+        if date_str in jdate and norm_text(jdesc) == memo_want:
+            target = j
+            break
 
     if not target:
-        return False, f"journal for {date_str} not found among {len(journals)} journals"
+        return False, (f"journal for {date_str} with required memo not found "
+                       f"among {len(journals)} journals")
 
     # Check published
     published = target.get("published_at") or target.get("publishedAt")
@@ -597,6 +673,8 @@ def _verify_bc_journal(date_str: str, memo_substr: str) -> tuple[bool, str]:
 
     if not entries:
         return False, f"no entries found for journal {jid}"
+    if len(entries) != 2:
+        return False, f"journal {jid} has {len(entries)} entries (want exactly 2)"
 
     expense_acct = bc_find_account("ML Engineer Salary Expense")
     payable_acct = bc_find_account("ML Engineer Salary Payable")
@@ -609,28 +687,32 @@ def _verify_bc_journal(date_str: str, memo_substr: str) -> tuple[bool, str]:
         acct_id = e.get("account_id") or e.get("accountId")
         debit = float(e.get("debit") or 0)
         credit = float(e.get("credit") or 0)
-        if acct_id == expense_id and abs(debit - 95000) < 1:
+        if acct_id == expense_id and abs(debit - 95000) < 0.01:
             debit_ok = True
-        if acct_id == payable_id and abs(credit - 95000) < 1:
+        if acct_id == payable_id and abs(credit - 95000) < 0.01:
             credit_ok = True
 
     ok = debit_ok and credit_ok
-    return ok, f"debit_expense={debit_ok}, credit_payable={credit_ok}"
+    return ok, f"entries=2, debit_expense={debit_ok}, credit_payable={credit_ok}"
+
+
+_MEMO_TPL = ("Monthly salary accrual - Divya Krishnamurthy - Machine Learning "
+             "- Machine Learning Engineer - month {n} of employment")
 
 
 def check_16_bc_journal_sept() -> None:
-    """Published journal entry dated 2026-09-30 with correct entries."""
+    """Published journal 2026-09-30, full memo, 2 entries, 95000/95000."""
     try:
-        ok, detail = _verify_bc_journal("2026-09-30", "month 1")
+        ok, detail = _verify_bc_journal("2026-09-30", _MEMO_TPL.format(n=1))
         check("16. BC Journal Sept", 2, ok, detail)
     except Exception as e:
         check("16. BC Journal Sept", 2, False, f"exception: {e}")
 
 
 def check_17_bc_journal_oct() -> None:
-    """Published journal entry dated 2026-10-31 with correct entries."""
+    """Published journal 2026-10-31, full memo, 2 entries, 95000/95000."""
     try:
-        ok, detail = _verify_bc_journal("2026-10-31", "month 2")
+        ok, detail = _verify_bc_journal("2026-10-31", _MEMO_TPL.format(n=2))
         check("17. BC Journal Oct", 2, ok, detail)
     except Exception as e:
         check("17. BC Journal Oct", 2, False, f"exception: {e}")
@@ -639,28 +721,45 @@ def check_17_bc_journal_oct() -> None:
 # ── Twenty Checks (docker exec Postgres) ─────────────────────────────────────
 
 def check_18_twenty_tasks() -> None:
-    """Three onboarding tasks in Twenty CRM."""
+    """Three onboarding tasks in Twenty CRM: title, due date (tz-aware), body."""
     try:
         schema = ws_schema()
         tasks_expected = [
-            ("IT equipment provisioning - Divya Krishnamurthy", "2026-08-28"),
-            ("Schedule orientation meeting - Divya Krishnamurthy", "2026-09-05"),
-            ("Verify payroll setup - Divya Krishnamurthy", "2026-09-15"),
+            ("IT equipment provisioning - Divya Krishnamurthy", "2026-08-28",
+             ["2026-09-01", "Machine Learning Engineer",
+              "laptop, email account, and software licenses"]),
+            ("Schedule orientation meeting - Divya Krishnamurthy", "2026-09-05",
+             ["HR-EMP-00001", "ML Engineering Leave Policy 2026",
+              "ML Engineering Team 2026", "ML Engineer Monthly Structure"]),
+            ("Verify payroll setup - Divya Krishnamurthy", "2026-09-15",
+             ["95000", "ML Engineer Salary Expense",
+              "ML Engineer Salary Payable", "months 1 and 2"]),
         ]
         issues = []
-        for title, due in tasks_expected:
+        for title, due, body_kws in tasks_expected:
             safe_title = title.replace("'", "''")
-            r = twenty_sql(
-                f"SELECT title, \"dueAt\"::text FROM \"{schema}\".task "
+            due_raw = twenty_sql(
+                f"SELECT \"dueAt\"::text FROM \"{schema}\".task "
                 f"WHERE \"deletedAt\" IS NULL AND title = '{safe_title}';"
             )
-            if not r:
+            if not due_raw:
                 issues.append(f"missing: {title[:40]}")
-            elif due not in r:
+                continue
+            if not any(date_matches_tz(line, due)
+                       for line in due_raw.split("\n") if line.strip()):
                 issues.append(f"wrong due date: {title[:40]}")
+            body_raw = twenty_sql(
+                f"SELECT \"bodyV2Markdown\" FROM \"{schema}\".task "
+                f"WHERE \"deletedAt\" IS NULL AND title = '{safe_title}';"
+            )
+            body_norm = norm_text(body_raw)
+            missing_kws = [kw for kw in body_kws
+                           if norm_text(kw) not in body_norm]
+            if missing_kws:
+                issues.append(f"body missing {missing_kws} in: {title[:40]}")
         ok = not issues
         check("18. Twenty Tasks", 2, ok,
-              "all 3 found" if ok else f"issues={issues}")
+              "all 3 found (title/due/body)" if ok else f"issues={issues}")
     except Exception as e:
         check("18. Twenty Tasks", 2, False, f"exception: {e}")
 
@@ -677,13 +776,28 @@ def check_19_twenty_note() -> None:
         if not r:
             check("19. Twenty Note", 2, False, "not found")
             return
+        # Full coverage of the note body from the task statement. Note the
+        # body says 'Department: Machine Learning' (no '- TVS' suffix).
         keywords = [
-            "HR-EMP-00020", "Machine Learning - TVS",
-            "Machine Learning Engineer", "Full-time",
+            "Divya Krishnamurthy (HR-EMP-00020)",
+            "Department: Machine Learning",
+            "Designation: Machine Learning Engineer",
+            "Employment type: Full-time",
+            "Date of joining: 2026-09-01",
+            "Reporting to: HR-EMP-00001",
             "ML Engineering Leave Policy 2026",
-            "ML Engineer Monthly Structure", "95000",
+            "Innovation Leave (7 days)",
+            "Sick Leave (7 days)",
+            "ML Engineering Team 2026 (4 holidays)",
+            "ML Engineer Monthly Structure",
+            "base 95000 INR",
+            "Monthly accrual: 95000 INR",
+            "ML Engineer Salary Expense",
+            "ML Engineer Salary Payable",
+            "Onboarding activities: 4 tasks assigned",
         ]
-        missing = [kw for kw in keywords if kw not in r]
+        r_norm = norm_text(r)
+        missing = [kw for kw in keywords if norm_text(kw) not in r_norm]
         ok = not missing
         check("19. Twenty Note", 2, ok,
               "all keywords found" if ok else f"missing={missing}")
@@ -702,6 +816,7 @@ def main() -> None:
     check_7_leave_policy()
     check_8_leave_period()
     check_9_leave_policy_assignment()
+    check_9b_leave_allocations()
     check_10_salary_component()
     check_11_salary_structure()
     check_12_salary_structure_assignment()

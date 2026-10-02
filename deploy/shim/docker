@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# `docker`-compatible shim that maps a verifier's docker calls to kubectl, so upstream verify.py
+# scripts (which shell out to `docker exec` / `docker cp`) run UNMODIFIED inside the playground
+# service against a per-run pod. Put this dir first on PATH for grading; the pod is named by
+# `<APP>_CONTAINER` (set in verify_context) and the namespace by SAAS_PLAYGROUND_NAMESPACE.
+#
+# Supported: `docker exec [-i|-t|-it] <pod> <cmd...>` and `docker cp` (container refs get the
+# namespace prepended). Anything else exits non-zero (loudly), to surface unported verifier needs.
+set -euo pipefail
+
+ns="${SAAS_PLAYGROUND_NAMESPACE:-saas-playground}"
+sub="${1:-}"
+shift || true
+
+case "$sub" in
+  exec)
+    # Translate the docker-exec flags used by bundled verifiers. kubectl exec has no ``-e``;
+    # inject those assignments through ``env`` after the container target instead. Silently
+    # dropping only ``-e`` used to shift its value into the pod position ("pods PGPASSWORD=... not
+    # found") across nine OpenProject/Mattermost verifiers.
+    env_args=()
+    kube_flags=()
+    while [[ "${1:-}" == -* ]]; do
+      case "$1" in
+        # -i must be FORWARDED, not dropped. Four verifiers pipe SQL in on stdin
+        # (software_012/023/039/040: `docker exec -i <c> psql ...` with `input=query`). Without -i,
+        # kubectl exec hands the remote process a closed stdin and psql returns an empty result set,
+        # so the check failed as a *data mismatch* instead of a plumbing error. -t stays dropped:
+        # there is no TTY during grading and `kubectl exec -t` only garbles piped output.
+        -i)      kube_flags+=("-i"); shift ;;
+        -it|-ti) kube_flags+=("-i"); shift ;;
+        -t)      shift ;;
+        -e|--env)
+          shift
+          env_args+=("${1:?docker-shim exec: $sub requires KEY=VALUE}")
+          shift
+          ;;
+        --env=*) env_args+=("${1#*=}"); shift ;;
+        --) shift; break ;;
+        *) echo "docker-shim exec: unsupported flag '$1'" >&2; exit 2 ;;
+      esac
+    done
+    target="${1:?docker-shim exec: missing container/pod}"
+    shift || true
+    pod="${target%%::*}"
+    command=("$@")
+    if [[ ${#env_args[@]} -gt 0 ]]; then
+      command=(env "${env_args[@]}" "${command[@]}")
+    fi
+    # `<pod>::<container>` (a sidecar in a multi-container compose pod) -> kubectl exec ... -c <container>
+    if [[ "$target" == *::* ]]; then
+      exec kubectl exec "${kube_flags[@]+"${kube_flags[@]}"}" -n "$ns" "$pod" \
+        -c "${target#*::}" -- "${command[@]}"
+    fi
+    exec kubectl exec "${kube_flags[@]+"${kube_flags[@]}"}" -n "$ns" "$pod" -- "${command[@]}"
+    ;;
+  cp)
+    # docker cp <src> <dst>, where one side is `<container>:<path>`. kubectl wants `<ns>/<pod>:<path>`.
+    args=()
+    cflag=()
+    for a in "$@"; do
+      if [[ "$a" == *::*:* ]]; then              # <pod>::<container>:<path> (compose sidecar)
+        p="${a%%::*}"; rest="${a#*::}"; c="${rest%%:*}"; path="${rest#*:}"
+        args+=("${ns}/${p}:${path}"); cflag=(-c "$c")
+      elif [[ "$a" == *:* && "$a" != /* && "$a" != .* ]]; then
+        args+=("${ns}/${a}")   # <pod>:<path> — prepend namespace to the container ref
+      else
+        args+=("$a")
+      fi
+    done
+    if [[ ${#cflag[@]} -gt 0 ]]; then
+      exec kubectl cp "${args[@]}" "${cflag[@]}"
+    fi
+    exec kubectl cp "${args[@]}"
+    ;;
+  *)
+    echo "docker-shim: unsupported subcommand '$sub' (only exec/cp are mapped to kubectl)" >&2
+    exit 2
+    ;;
+esac

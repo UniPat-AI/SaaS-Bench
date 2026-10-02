@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "run.fullname" . }}
+  labels:
+    {{- include "run.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "run.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: {{ .Values.webContainerPort }}

@@ -1,19 +1,45 @@
 **Task Requirements:**
-In FarmOS, create an activity log on 'Vineyard Block 1' for spring plowing, upload the provided field photo as an attachment to the log, and record the batch number 'VINO-2025-001' in the notes. In Grocy, create a new product 'Organic Estate Wine 2025' and set its batch number (in the description or custom field) to exactly 'VINO-2025-001'. In e-label, draft a new wine record for 'Organic Estate Wine 2025' and set its batch number to 'VINO-2025-001'. The batch number must be character-for-character identical across all three systems.
+Build a three-system traceability chain from a supplied field photo. One photo of the plowing operation is supplied with this task. Inspect it and classify it using exactly one label from this rubric:
+
+| Label | Visual criterion |
+|---|---|
+| `Manual` | No aerial drone and no tractor or other self-propelled field machine is visible. |
+| `Tractor-only` | A tractor or other self-propelled field machine is visible, but no aerial drone is visible. |
+| `Drone-assisted` | An aerial drone is visibly part of the field operation. |
+
+Use the label exactly as displayed above, including capitalization and hyphenation, wherever `<field_method>` appears below. Do not use a field-method label until you have examined the supplied photo.
+
+In FarmOS, create one land asset named exactly `Vineyard Block 1`. Locate the existing Harvest log named exactly `Spring Plowing Complete`, link it to that asset, and attach the supplied photo to it as its only image.
+
+In that same FarmOS record, set the notes to exactly these two lines and nothing else:
+
+`TRACEABILITY BATCH: VINO-2025-081`
+
+`FIELD METHOD: <field_method>`
+
+In Grocy, create exactly one product named `<field_method> Estate Wine 2025`. Set its description to the following three lines:
+
+`TRACEABILITY BATCH: VINO-2025-081`
+
+`FIELD METHOD: <field_method>`
+
+`FARMOS SOURCE: Spring Plowing Complete | Vineyard Block 1`
+
+In e-label, create exactly one wine record with these values:
+
+- Name: `<field_method> Estate Wine 2025`
+- Brand: `<field_method> Estate`
+- SKU / batch number: `VINO-2025-081`
+- Vintage: `2025`
+- Additional information: `FIELD METHOD: <field_method>; FARMOS SOURCE: Spring Plowing Complete; Vineyard Block 1`
+
+The exact batch number, image-derived field method, product name, and FarmOS source must agree across all three systems.
 
 **Steps:**
-1. Log the spring plowing activity in FarmOS with the batch number and upload the field photo as an attachment.
-2. Create the corresponding wine product in Grocy, ensuring the batch number is included.
-3. Draft the compliance label in e-label using the exact same batch number.
-
-**Input files:**
-- **File 1:** `tasks/multi-m/inputs/farmos_crop_021.jpg`
-  - Type: image/jpeg
-  - Source app: farmos
-  - Metadata:
-    - log_name: Spring Plowing Complete
-    - asset_name: Vineyard Block 1
-    - notes: Plowed 120 acres. Soil conditions excellent. Ready for planting.
+1. Inspect the supplied photo and classify it with the controlled rubric.
+2. Create the `Vineyard Block 1` land asset, link the `Spring Plowing Complete` Harvest log to it, attach the supplied photo, and set the two traceability lines as its notes.
+3. Create the exact Grocy product and description from the classified field-method label.
+4. Create the exact e-label wine record with the same generated traceability values.
 
 **Login Credentials:**
 
