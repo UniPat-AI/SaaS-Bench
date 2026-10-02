@@ -7,15 +7,19 @@ name = "saas-bench"
 version = "0.1.0"
 description = "SaaS-Bench: a benchmark for evaluating LLM agents on real SaaS applications."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "SaaS-Bench Authors"},
 ]
 dependencies = [
-    "browser-use",
+    # Pinned: agent.py's xterm.js CDP patches reach into browser-use private internals
+    # (Element.fill, DefaultActionWatchdog, CDP session attrs) that are not stable across
+    # versions. Bump deliberately and re-test the code-server terminal path.
+    "browser-use==0.13.8",
     "playwright>=1.40",
     "pyyaml>=6.0",
+    "requests>=2.31",
 ]
 
 [project.scripts]

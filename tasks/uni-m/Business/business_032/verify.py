@@ -13,8 +13,10 @@ Required env vars:
 """
 
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime, timedelta
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
 HOST = os.getenv("SERVER_HOSTNAME", "localhost")
@@ -54,7 +56,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -117,17 +119,46 @@ def pretix_sql(query: str) -> str:
 
 def get_twenty_workspace_schema() -> str:
     result = twenty_sql(
-        "SELECT schema_name FROM information_schema.schemata "
-        "WHERE schema_name LIKE 'workspace_%' LIMIT 1;"
+        # The image seeds TWO workspaces (Apple/apple, YCombinator/yc). The app serves yc on the
+        # benchmark's subdomain-less localhost URL, so that is where the agent's writes land; an
+        # unordered LIMIT 1 only happened to agree, and ORDER BY schema_name picks Apple and
+        # silently finds nothing. core."dataSource" carries the authoritative schema mapping.
+        'SELECT ds.schema FROM core."dataSource" ds '
+        'JOIN core.workspace w ON w.id = ds."workspaceId" '
+        "WHERE w.subdomain = 'yc';"
     )
     if not result:
         raise RuntimeError("No workspace schema found in Twenty DB")
     return result.split("\n")[0].strip()
 
 
+def _local_utc_offset() -> timedelta:
+    """UTC offset of the verifier host's local timezone (deployment tz)."""
+    return datetime.now().astimezone().utcoffset() or timedelta(0)
+
+
+def date_matches_tz(stored: str, exp_date: str) -> bool:
+    """True if a stored timestamp/date corresponds to calendar date exp_date.
+
+    Twenty stores date fields as UTC timestamps; a local date D entered in the
+    UI on a UTC+N deployment is stored as (D-1)T(24-N):00:00Z. Accept only
+    stored::date == exp_date or (stored + local_utc_offset)::date == exp_date.
+    A pure 10-char date must match exactly.
+    """
+    stored = (stored or "").strip()
+    if len(stored) == 10:
+        return stored == exp_date
+    try:
+        dt = datetime.strptime(stored[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    if dt.strftime("%Y-%m-%d") == exp_date:
+        return True
+    return (dt + _local_utc_offset()).strftime("%Y-%m-%d") == exp_date
+
+
 # Cross-check IDs populated by earlier checks
 _twenty_company_id: str = ""
-_twenty_person_id: str = ""
 
 
 # ── Twenty checks ────────────────────────────────────────────────────────────
@@ -165,39 +196,39 @@ def check_1_twenty_company() -> None:
 
 def check_2_twenty_person() -> None:
     """Person 'Elena Vasquez' with email, title, phone, linked to Arcturus Digital."""
-    global _twenty_person_id
     try:
         ws = get_twenty_workspace_schema()
         row = twenty_sql(
-            f'SELECT id, "nameFirstName", "nameLastName", "emailsPrimaryEmail", '
-            f'"jobTitle", "phonesPrimaryPhoneNumber", "companyId" '
-            f'FROM "{ws}".person '
-            f"WHERE \"emailsPrimaryEmail\" = 'elena.vasquez@arcturusdigital.com' "
-            f"AND \"deletedAt\" IS NULL "
+            f'SELECT p."nameFirstName", p."nameLastName", p."emailsPrimaryEmail", '
+            f'p."jobTitle", p."phonesPrimaryPhoneNumber" '
+            f'FROM "{ws}".person p '
+            f'JOIN "{ws}".company c ON p."companyId" = c.id '
+            f"AND c.name = 'Arcturus Digital' AND c.\"deletedAt\" IS NULL "
+            f"WHERE p.\"emailsPrimaryEmail\" = 'elena.vasquez@arcturusdigital.com' "
+            f"AND p.\"deletedAt\" IS NULL "
             f"LIMIT 1;"
         )
         if not row:
-            check("2. Twenty person Elena Vasquez", 2, False, "not found")
+            check("2. Twenty person Elena Vasquez", 2, False,
+                  "not found (or not linked to company Arcturus Digital)")
             return
         parts = row.split("|")
-        pid = parts[0].strip()
-        first = parts[1].strip() if len(parts) > 1 else ""
-        last = parts[2].strip() if len(parts) > 2 else ""
-        email = parts[3].strip() if len(parts) > 3 else ""
-        title = parts[4].strip() if len(parts) > 4 else ""
-        phone = parts[5].strip() if len(parts) > 5 else ""
-        company_id = parts[6].strip() if len(parts) > 6 else ""
-        _twenty_person_id = pid
+        first = parts[0].strip()
+        last = parts[1].strip() if len(parts) > 1 else ""
+        email = parts[2].strip() if len(parts) > 2 else ""
+        title = parts[3].strip() if len(parts) > 3 else ""
+        phone = parts[4].strip() if len(parts) > 4 else ""
+        digits = re.sub(r"\D", "", phone)
+        phone_ok = digits.endswith("15036214480") or digits == "5036214480"
         ok = (
             first == "Elena" and last == "Vasquez"
             and email == "elena.vasquez@arcturusdigital.com"
             and "Director of Engineering" in title
-            and "503" in phone and "4480" in phone
-            and (not _twenty_company_id or company_id == _twenty_company_id)
+            and phone_ok
         )
         check("2. Twenty person Elena Vasquez", 2, ok,
               f"name={first} {last}, title={title}, phone={phone}, "
-              f"company_linked={'yes' if company_id == _twenty_company_id else 'no'}")
+              f"phone_ok={phone_ok}, company_linked=yes")
     except Exception as e:
         check("2. Twenty person Elena Vasquez", 2, False, f"exception: {e}")
 
@@ -207,23 +238,26 @@ def check_3_twenty_opportunity() -> None:
     try:
         ws = get_twenty_workspace_schema()
         row = twenty_sql(
-            f'SELECT name, "amountAmountMicros", stage, "closeDate", '
-            f'"companyId", "pointOfContactId" '
-            f'FROM "{ws}".opportunity '
-            f"WHERE name LIKE '%Arcturus Digital%Enterprise Software Modernization%' "
-            f"AND \"deletedAt\" IS NULL "
+            f'SELECT o.name, o."amountAmountMicros", o.stage, o."closeDate"::text '
+            f'FROM "{ws}".opportunity o '
+            f'JOIN "{ws}".company c ON o."companyId" = c.id '
+            f"AND c.name = 'Arcturus Digital' AND c.\"deletedAt\" IS NULL "
+            f'JOIN "{ws}".person p ON o."pointOfContactId" = p.id '
+            f"AND p.\"emailsPrimaryEmail\" = 'elena.vasquez@arcturusdigital.com' "
+            f"AND p.\"deletedAt\" IS NULL "
+            f"WHERE o.name LIKE '%Arcturus Digital%Enterprise Software Modernization%' "
+            f"AND o.\"deletedAt\" IS NULL "
             f"LIMIT 1;"
         )
         if not row:
-            check("3. Twenty opportunity", 2, False, "not found")
+            check("3. Twenty opportunity", 2, False,
+                  "not found (or not linked to company + point of contact)")
             return
         parts = row.split("|")
         name = parts[0].strip()
         amount_raw = parts[1].strip() if len(parts) > 1 else "0"
         stage = parts[2].strip() if len(parts) > 2 else ""
         close_date = parts[3].strip() if len(parts) > 3 else ""
-        company_id = parts[4].strip() if len(parts) > 4 else ""
-        poc_id = parts[5].strip() if len(parts) > 5 else ""
 
         try:
             amount = int(amount_raw) / 1_000_000
@@ -231,14 +265,12 @@ def check_3_twenty_opportunity() -> None:
             amount = float(amount_raw or 0)
         amount_ok = abs(amount - 100000.0) < 1.0
         stage_ok = stage.upper() == "WON"
-        date_ok = "2026-01-31" in close_date
-        company_ok = not _twenty_company_id or company_id == _twenty_company_id
-        poc_ok = not _twenty_person_id or poc_id == _twenty_person_id
+        date_ok = date_matches_tz(close_date, "2026-01-31")
 
-        ok = amount_ok and stage_ok and date_ok and company_ok and poc_ok
+        ok = amount_ok and stage_ok and date_ok
         check("3. Twenty opportunity", 2, ok,
               f"amount={amount}, stage={stage}, closeDate={close_date}, "
-              f"company={'ok' if company_ok else 'wrong'}, poc={'ok' if poc_ok else 'wrong'}")
+              f"date_ok={date_ok}, links=ok")
     except Exception as e:
         check("3. Twenty opportunity", 2, False, f"exception: {e}")
 
@@ -263,36 +295,51 @@ def check_4_twenty_favorite() -> None:
         check("4. Twenty company is favorite", 1, False, f"exception: {e}")
 
 
+def _twenty_task_on_opportunity(ws: str, title_like: str) -> str:
+    """Fetch a task by title, required to be linked to the Arcturus opportunity."""
+    return twenty_sql(
+        f'SELECT t.title, t."dueAt"::text, '
+        f"regexp_replace(t.\"bodyV2Markdown\", E'[\\n\\r]+', ' ', 'g') "
+        f'FROM "{ws}".task t '
+        f'JOIN "{ws}"."taskTarget" tt ON tt."taskId" = t.id '
+        f"AND tt.\"deletedAt\" IS NULL "
+        f'JOIN "{ws}".opportunity o ON tt."targetOpportunityId" = o.id '
+        f"AND o.name LIKE '%Arcturus Digital%Enterprise Software Modernization%' "
+        f"AND o.\"deletedAt\" IS NULL "
+        f"WHERE t.title LIKE '{title_like}' "
+        f"AND t.\"deletedAt\" IS NULL "
+        f"LIMIT 1;"
+    )
+
+
 def check_5_twenty_task_milestone2() -> None:
     """Task 'Milestone 2 collection — Arcturus Digital' with due 2026-02-04 and body keywords."""
     try:
         ws = get_twenty_workspace_schema()
-        row = twenty_sql(
-            f'SELECT title, "dueAt"::text, "bodyV2Markdown" '
-            f'FROM "{ws}".task '
-            f"WHERE title LIKE '%Milestone 2 collection%Arcturus Digital%' "
-            f"AND \"deletedAt\" IS NULL "
-            f"LIMIT 1;"
-        )
+        row = _twenty_task_on_opportunity(ws, "%Milestone 2 collection%Arcturus Digital%")
         if not row:
-            check("5. Twenty task Milestone 2 collection", 2, False, "not found")
+            check("5. Twenty task Milestone 2 collection", 2, False,
+                  "not found (or not linked to the Arcturus opportunity)")
             return
         parts = row.split("|", 2)
         title = parts[0].strip()
         due_at = parts[1].strip() if len(parts) > 1 else ""
         body = parts[2] if len(parts) > 2 else ""
 
-        date_ok = "2026-02-04" in due_at
-        body_ok = (
-            "55000" in body
-            and "ARCTURUS100VIP" in body
-            and "elena" in body.lower()
-        )
+        date_ok = date_matches_tz(due_at, "2026-02-04")
+        kw = {
+            "55000": "55000" in body,
+            "ARCTURUS100VIP": "ARCTURUS100VIP" in body,
+            "elena": "elena" in body.lower(),
+            "2026-02-04": "2026-02-04" in body,
+            "2026-03-10": "2026-03-10" in body,
+            "Phase 2": "Phase 2" in body or "Development & Go-Live" in body,
+        }
+        body_ok = all(kw.values())
+        missing = ",".join(k for k, v in kw.items() if not v) or "none"
         ok = date_ok and body_ok
         check("5. Twenty task Milestone 2 collection", 2, ok,
-              f"dueAt={'ok' if date_ok else due_at}, "
-              f"body_amount={'yes' if '55000' in body else 'no'}, "
-              f"body_voucher={'yes' if 'ARCTURUS100VIP' in body else 'no'}")
+              f"dueAt={'ok' if date_ok else due_at}, body_missing={missing}")
     except Exception as e:
         check("5. Twenty task Milestone 2 collection", 2, False, f"exception: {e}")
 
@@ -301,31 +348,30 @@ def check_6_twenty_task_celebration() -> None:
     """Task 'Send celebration invite — Arcturus Digital' with due 2026-02-25 and body keywords."""
     try:
         ws = get_twenty_workspace_schema()
-        row = twenty_sql(
-            f'SELECT title, "dueAt"::text, "bodyV2Markdown" '
-            f'FROM "{ws}".task '
-            f"WHERE title LIKE '%Send celebration invite%Arcturus Digital%' "
-            f"AND \"deletedAt\" IS NULL "
-            f"LIMIT 1;"
-        )
+        row = _twenty_task_on_opportunity(ws, "%Send celebration invite%Arcturus Digital%")
         if not row:
-            check("6. Twenty task Send celebration invite", 2, False, "not found")
+            check("6. Twenty task Send celebration invite", 2, False,
+                  "not found (or not linked to the Arcturus opportunity)")
             return
         parts = row.split("|", 2)
         title = parts[0].strip()
         due_at = parts[1].strip() if len(parts) > 1 else ""
         body = parts[2] if len(parts) > 2 else ""
 
-        date_ok = "2026-02-25" in due_at
-        body_ok = (
-            "ARCTURUS100VIP" in body
-            and "elena" in body.lower()
-            and ("100%" in body or "100 %" in body)
-        )
+        date_ok = date_matches_tz(due_at, "2026-02-25")
+        bl = body.lower()
+        kw = {
+            "ARCTURUS100VIP": "ARCTURUS100VIP" in body,
+            "elena": "elena" in bl,
+            "100%": "100%" in body or "100 %" in body,
+            "event_name": "Arcturus Digital Milestone Celebration" in body,
+            "max 3": "max 3" in bl or "max usages 3" in bl,
+        }
+        body_ok = all(kw.values())
+        missing = ",".join(k for k, v in kw.items() if not v) or "none"
         ok = date_ok and body_ok
         check("6. Twenty task Send celebration invite", 2, ok,
-              f"dueAt={'ok' if date_ok else due_at}, "
-              f"body_voucher={'yes' if 'ARCTURUS100VIP' in body else 'no'}")
+              f"dueAt={'ok' if date_ok else due_at}, body_missing={missing}")
     except Exception as e:
         check("6. Twenty task Send celebration invite", 2, False, f"exception: {e}")
 
@@ -377,11 +423,14 @@ def check_8_bc_items() -> None:
             if len(parts) < 3:
                 continue
             name = parts[0].strip()
-            price = float(parts[2].strip() or 0)
+            type_ok = parts[1].strip().lower() == "service"
+            price_raw = parts[2].strip()
+            # mysql -N -B renders SQL NULL as the literal string "NULL"
+            price = float(price_raw) if price_raw not in ("", "NULL") else 0.0
             if "Requirements" in name and "Solution Design" in name:
-                p1_ok = abs(price - 45000.0) < 1.0
+                p1_ok = type_ok and abs(price - 45000.0) < 1.0
             elif "Development" in name and "Go-Live" in name:
-                p2_ok = abs(price - 55000.0) < 1.0
+                p2_ok = type_ok and abs(price - 55000.0) < 1.0
 
         ok = p1_ok and p2_ok
         check("8. BigCapital items Phase 1 & 2", 2, ok,
@@ -414,142 +463,116 @@ def check_9_bc_account() -> None:
         check("9. BigCapital deferred revenue account", 1, False, f"exception: {e}")
 
 
-def check_10_bc_invoice1() -> None:
-    """Milestone 1 invoice dated 2025-10-15 for Arcturus Digital, amount 45000, delivered."""
+def _bc_milestone_invoice(label: str, weight: int, inv_date: str,
+                          item_like: str, rate: int, due_date: str) -> None:
+    """Invoice identified by date + customer + line item; gate DUE_DATE + DELIVERED_AT."""
     try:
         row = bigcapital_sql(
-            "SELECT si.ID, si.INVOICE_DATE, si.DELIVERED_AT, si.BALANCE + si.PAYMENT_AMOUNT AS TOTAL "
+            "SELECT si.ID, si.DUE_DATE, si.DELIVERED_AT "
             "FROM SALES_INVOICES si "
             "JOIN CONTACTS c ON si.CUSTOMER_ID = c.ID "
-            "WHERE c.DISPLAY_NAME = 'Arcturus Digital' "
-            "AND si.INVOICE_DATE = '2025-10-15' "
+            "AND c.DISPLAY_NAME = 'Arcturus Digital' "
+            "JOIN ITEMS_ENTRIES ie ON ie.REFERENCE_TYPE = 'SaleInvoice' "
+            "AND ie.REFERENCE_ID = si.ID "
+            "JOIN ITEMS i ON ie.ITEM_ID = i.ID "
+            f"WHERE si.INVOICE_DATE = '{inv_date}' "
+            f"AND i.NAME LIKE '{item_like}' "
+            f"AND ie.QUANTITY = 1 AND ABS(ie.RATE - {rate}) < 1 "
             "LIMIT 1;"
         )
         if not row:
-            check("10. BigCapital Milestone 1 invoice", 2, False, "not found")
+            check(label, weight, False,
+                  f"no invoice dated {inv_date} with line item {item_like} qty 1 @ {rate}")
             return
         parts = row.split("\t")
-        inv_date = parts[1].strip() if len(parts) > 1 else ""
+        due = parts[1].strip() if len(parts) > 1 else ""
         delivered = parts[2].strip() if len(parts) > 2 else ""
-        amount = float(parts[3].strip() or 0) if len(parts) > 3 else 0.0
 
-        date_ok = "2025-10-15" in inv_date
+        due_ok = due_date in due
         delivered_ok = delivered not in ("", "NULL", "None", "null", "0000-00-00")
-        amount_ok = abs(amount - 45000.0) < 1.0
 
-        ok = date_ok and delivered_ok and amount_ok
-        check("10. BigCapital Milestone 1 invoice", 2, ok,
-              f"date={inv_date}, delivered={'yes' if delivered_ok else 'no'}, amount={amount}")
+        ok = due_ok and delivered_ok
+        check(label, weight, ok,
+              f"line_item=ok, due={due}, delivered={'yes' if delivered_ok else 'no'}")
     except Exception as e:
-        check("10. BigCapital Milestone 1 invoice", 2, False, f"exception: {e}")
+        check(label, weight, False, f"exception: {e}")
+
+
+def check_10_bc_invoice1() -> None:
+    """Milestone 1 invoice: 2025-10-15, Phase 1 line item qty 1 @ 45000, due 2025-11-14, delivered."""
+    _bc_milestone_invoice("10. BigCapital Milestone 1 invoice", 2,
+                          "2025-10-15", "Phase 1%", 45000, "2025-11-14")
 
 
 def check_11_bc_invoice2() -> None:
-    """Milestone 2 invoice dated 2026-01-05 for Arcturus Digital, amount 55000, delivered."""
-    try:
-        row = bigcapital_sql(
-            "SELECT si.ID, si.INVOICE_DATE, si.DELIVERED_AT, si.BALANCE + si.PAYMENT_AMOUNT AS TOTAL "
-            "FROM SALES_INVOICES si "
-            "JOIN CONTACTS c ON si.CUSTOMER_ID = c.ID "
-            "WHERE c.DISPLAY_NAME = 'Arcturus Digital' "
-            "AND si.INVOICE_DATE = '2026-01-05' "
-            "LIMIT 1;"
-        )
-        if not row:
-            check("11. BigCapital Milestone 2 invoice", 2, False, "not found")
-            return
-        parts = row.split("\t")
-        inv_date = parts[1].strip() if len(parts) > 1 else ""
-        delivered = parts[2].strip() if len(parts) > 2 else ""
-        amount = float(parts[3].strip() or 0) if len(parts) > 3 else 0.0
-
-        date_ok = "2026-01-05" in inv_date
-        delivered_ok = delivered not in ("", "NULL", "None", "null", "0000-00-00")
-        amount_ok = abs(amount - 55000.0) < 1.0
-
-        ok = date_ok and delivered_ok and amount_ok
-        check("11. BigCapital Milestone 2 invoice", 2, ok,
-              f"date={inv_date}, delivered={'yes' if delivered_ok else 'no'}, amount={amount}")
-    except Exception as e:
-        check("11. BigCapital Milestone 2 invoice", 2, False, f"exception: {e}")
+    """Milestone 2 invoice: 2026-01-05, Phase 2 line item qty 1 @ 55000, due 2026-02-04, delivered."""
+    _bc_milestone_invoice("11. BigCapital Milestone 2 invoice", 2,
+                          "2026-01-05", "Phase 2%", 55000, "2026-02-04")
 
 
 def check_12_bc_payment() -> None:
-    """Payment of 45000 dated 2025-11-20 deposited to Petty Cash."""
+    """Payment of 45000 dated 2025-11-20, applied to the Milestone 1 invoice, into Petty Cash."""
     try:
         row = bigcapital_sql(
             "SELECT pr.PAYMENT_DATE, pr.AMOUNT, a.NAME "
             "FROM PAYMENT_RECEIVES pr "
+            "JOIN PAYMENT_RECEIVES_ENTRIES pre ON pre.PAYMENT_RECEIVE_ID = pr.ID "
+            "JOIN SALES_INVOICES si ON pre.INVOICE_ID = si.ID "
+            "AND si.INVOICE_DATE = '2025-10-15' "
             "JOIN CONTACTS c ON pr.CUSTOMER_ID = c.ID "
+            "AND c.DISPLAY_NAME = 'Arcturus Digital' "
             "JOIN ACCOUNTS a ON pr.DEPOSIT_ACCOUNT_ID = a.ID "
-            "WHERE c.DISPLAY_NAME = 'Arcturus Digital' "
+            "WHERE pr.PAYMENT_DATE = '2025-11-20' "
+            "AND ABS(pr.AMOUNT - 45000) < 1 "
+            "AND ABS(pre.PAYMENT_AMOUNT - 45000) < 1 "
+            "AND a.NAME LIKE '%Petty Cash%' "
             "LIMIT 1;"
         )
         if not row:
-            check("12. BigCapital payment received", 2, False, "not found")
+            check("12. BigCapital payment received", 2, False,
+                  "no 45000 payment dated 2025-11-20 into Petty Cash applied to the 2025-10-15 invoice")
             return
         parts = row.split("\t")
         pay_date = parts[0].strip()
         amount = float(parts[1].strip() or 0) if len(parts) > 1 else 0.0
         account = parts[2].strip() if len(parts) > 2 else ""
 
-        date_ok = "2025-11-20" in pay_date
-        amount_ok = abs(amount - 45000.0) < 1.0
         account_ok = "Petty Cash" in account
 
-        ok = date_ok and amount_ok and account_ok
+        ok = account_ok
         check("12. BigCapital payment received", 2, ok,
-              f"date={pay_date}, amount={amount}, account={account}")
+              f"date={pay_date}, amount={amount}, applied_to=Milestone1, account={account}")
     except Exception as e:
         check("12. BigCapital payment received", 2, False, f"exception: {e}")
 
 
 def check_13_bc_journal() -> None:
-    """Journal entry dated 2025-11-20: debit Deferred Revenue 45000, credit Uncategorized Income 45000."""
+    """Published journal dated 2025-11-20: debit Deferred Revenue 45000, credit
+    Uncategorized Income 45000 — all conditions scoped to the same journal."""
     try:
-        rows = bigcapital_sql(
-            "SELECT mj.DATE, mj.DESCRIPTION, mje.DEBIT, mje.CREDIT, a.NAME "
+        row = bigcapital_sql(
+            "SELECT mj.ID "
             "FROM MANUAL_JOURNALS mj "
-            "JOIN MANUAL_JOURNALS_ENTRIES mje ON mje.MANUAL_JOURNAL_ID = mj.ID "
-            "JOIN ACCOUNTS a ON mje.ACCOUNT_ID = a.ID "
-            "WHERE mj.DESCRIPTION LIKE '%Revenue recognition%Milestone 1%Arcturus Digital%' "
-            "ORDER BY mje.DEBIT DESC;"
+            "WHERE mj.DATE = '2025-11-20' "
+            "AND mj.DESCRIPTION LIKE '%Revenue recognition%Milestone 1%Arcturus Digital%' "
+            "AND mj.PUBLISHED_AT IS NOT NULL "
+            "AND EXISTS(SELECT 1 FROM MANUAL_JOURNALS_ENTRIES e "
+            "JOIN ACCOUNTS a ON e.ACCOUNT_ID = a.ID "
+            "WHERE e.MANUAL_JOURNAL_ID = mj.ID "
+            "AND a.NAME LIKE '%Deferred Revenue%Enterprise Engagements%' "
+            "AND ABS(e.DEBIT - 45000) < 1) "
+            "AND EXISTS(SELECT 1 FROM MANUAL_JOURNALS_ENTRIES e "
+            "JOIN ACCOUNTS a ON e.ACCOUNT_ID = a.ID "
+            "WHERE e.MANUAL_JOURNAL_ID = mj.ID "
+            "AND a.NAME LIKE '%Uncategorized Income%' "
+            "AND ABS(e.CREDIT - 45000) < 1) "
+            "LIMIT 1;"
         )
-        if not rows:
-            check("13. BigCapital journal entry", 3, False, "not found")
-            return
-
-        date_ok = False
-        memo_ok = False
-        debit_ok = False
-        credit_ok = False
-
-        for line in rows.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 5:
-                continue
-            jdate = parts[0].strip()
-            desc = parts[1].strip()
-            debit = float(parts[2].strip() or 0)
-            credit = float(parts[3].strip() or 0)
-            acct = parts[4].strip()
-
-            if "2025-11-20" in jdate:
-                date_ok = True
-            if "Revenue recognition" in desc and "Milestone 1" in desc:
-                memo_ok = True
-            if abs(debit - 45000.0) < 1.0 and "Deferred Revenue" in acct:
-                debit_ok = True
-            if abs(credit - 45000.0) < 1.0 and "Uncategorized Income" in acct:
-                credit_ok = True
-
-        ok = date_ok and memo_ok and debit_ok and credit_ok
+        ok = bool(row)
         check("13. BigCapital journal entry", 3, ok,
-              f"date={'ok' if date_ok else 'wrong'}, memo={'ok' if memo_ok else 'wrong'}, "
-              f"debit={'ok' if debit_ok else 'wrong'}, credit={'ok' if credit_ok else 'wrong'}")
+              f"journal_id={row}" if ok else
+              "no single published journal dated 2025-11-20 with matching memo, "
+              "debit and credit lines")
     except Exception as e:
         check("13. BigCapital journal entry", 3, False, f"exception: {e}")
 
@@ -577,7 +600,12 @@ def check_15_pretix_event() -> None:
     """Event 'Arcturus Digital Milestone Celebration' live, slug, dates, currency."""
     try:
         row = pretix_sql(
-            "SELECT e.slug, e.name::text, e.date_from::text, e.currency, e.live "
+            "SELECT e.slug, e.name::text, "
+            "(e.date_from AT TIME ZONE COALESCE("
+            "(SELECT s.value FROM pretixbase_event_settingsstore s "
+            "WHERE s.object_id = e.id AND s.key = 'timezone' LIMIT 1), "
+            "'UTC'))::date::text, "
+            "e.currency, e.live "
             "FROM pretixbase_event e "
             "JOIN pretixbase_organizer o ON e.organizer_id = o.id "
             "WHERE o.slug = 'culinary-arts' "
@@ -595,7 +623,7 @@ def check_15_pretix_event() -> None:
         live = parts[4].strip() if len(parts) > 4 else ""
 
         name_ok = "Arcturus Digital Milestone Celebration" in name
-        date_ok = "2026-03-10" in date_from
+        date_ok = date_from == "2026-03-10"
         currency_ok = currency == "USD"
         live_ok = live in ("t", "true", "True", "1")
 
@@ -631,42 +659,48 @@ def check_16_pretix_product() -> None:
 
 
 def check_17_pretix_quota() -> None:
-    """Quota 'Gala Ticket Quota' with size 40."""
+    """Quota 'Gala Ticket Quota' with size 40, linked to 'Celebration Gala Ticket'."""
     try:
         row = pretix_sql(
-            "SELECT q.name, q.size "
+            "SELECT count(*) "
             "FROM pretixbase_quota q "
             "JOIN pretixbase_event e ON q.event_id = e.id "
-            "WHERE e.slug = 'arcturus-milestone-celebration' "
-            "AND q.name LIKE '%Gala Ticket Quota%' "
-            "LIMIT 1;"
+            "AND e.slug = 'arcturus-milestone-celebration' "
+            "JOIN pretixbase_quota_items qi ON qi.quota_id = q.id "
+            "JOIN pretixbase_item i ON i.id = qi.item_id "
+            "WHERE q.name LIKE '%Gala Ticket Quota%' "
+            "AND q.size = 40 "
+            "AND i.name::text LIKE '%Celebration Gala Ticket%';"
         )
-        if not row:
-            check("17. Pretix quota Gala Ticket Quota", 1, False, "not found")
-            return
-        parts = row.split("|")
-        name = parts[0].strip()
-        size = int(parts[1].strip() or 0) if len(parts) > 1 else 0
-        ok = "Gala Ticket Quota" in name and size == 40
+        count = int(row.strip() or 0) if row else 0
+        ok = count >= 1
         check("17. Pretix quota Gala Ticket Quota", 1, ok,
-              f"name={name}, size={size}")
+              f"quota(size=40)->item links={count}")
     except Exception as e:
         check("17. Pretix quota Gala Ticket Quota", 1, False, f"exception: {e}")
 
 
 def check_18_pretix_voucher() -> None:
-    """Voucher ARCTURUS100VIP with 100% discount, max 3, valid until 2026-03-10."""
+    """Voucher ARCTURUS100VIP: 100% discount, max 3, linked to 'Celebration Gala
+    Ticket', valid until 2026-03-10 (event-timezone calendar date)."""
     try:
         row = pretix_sql(
-            "SELECT v.code, v.price_mode, v.value, v.max_usages, v.valid_until::text "
+            "SELECT v.code, v.price_mode, v.value, v.max_usages, "
+            "(v.valid_until AT TIME ZONE COALESCE("
+            "(SELECT s.value FROM pretixbase_event_settingsstore s "
+            "WHERE s.object_id = e.id AND s.key = 'timezone' LIMIT 1), "
+            "'UTC'))::date::text "
             "FROM pretixbase_voucher v "
             "JOIN pretixbase_event e ON v.event_id = e.id "
-            "WHERE e.slug = 'arcturus-milestone-celebration' "
-            "AND v.code = 'ARCTURUS100VIP' "
+            "AND e.slug = 'arcturus-milestone-celebration' "
+            "JOIN pretixbase_item i ON v.item_id = i.id "
+            "AND i.name::text LIKE '%Celebration Gala Ticket%' "
+            "WHERE v.code = 'ARCTURUS100VIP' "
             "LIMIT 1;"
         )
         if not row:
-            check("18. Pretix voucher ARCTURUS100VIP", 2, False, "not found")
+            check("18. Pretix voucher ARCTURUS100VIP", 2, False,
+                  "not found (or not linked to product Celebration Gala Ticket)")
             return
         parts = row.split("|")
         code = parts[0].strip()
@@ -678,11 +712,12 @@ def check_18_pretix_voucher() -> None:
         code_ok = code == "ARCTURUS100VIP"
         discount_ok = price_mode == "percent" and abs(value - 100.0) < 0.01
         max_ok = max_usages == 3
-        valid_ok = "2026-03-10" in valid_until
+        valid_ok = valid_until == "2026-03-10"
 
         ok = code_ok and discount_ok and max_ok and valid_ok
         check("18. Pretix voucher ARCTURUS100VIP", 2, ok,
-              f"mode={price_mode}, value={value}, max={max_usages}, valid_until={valid_until}")
+              f"mode={price_mode}, value={value}, max={max_usages}, "
+              f"item_linked=yes, valid_until={valid_until}")
     except Exception as e:
         check("18. Pretix voucher ARCTURUS100VIP", 2, False, f"exception: {e}")
 

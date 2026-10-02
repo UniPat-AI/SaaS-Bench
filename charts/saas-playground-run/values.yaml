@@ -1,0 +1,34 @@
+# Set per run by the playground service: `helm upgrade --install run-<id> charts/saas-playground-run \
+#   --set runId=<id> --set image=<ref> --set containerPort=<n> --set host=<id>.playground.<domain>`
+runId: ""                 # required — unique per eval run; names the release's objects + labels
+image: ""                 # required — full ref, e.g. us-central1-docker.pkg.dev/your-gcp-project/infra/mw-farmos:latest
+containerPort: 80         # the port the app listens on inside the container (apps.yaml container_port)
+healthPath: "/"           # legacy; readiness is a TCP probe now (apps 403 on "/" unauthenticated)
+imagePullPolicy: IfNotPresent
+command: []               # optional container command/args (e.g. compose services); from apps.yaml
+
+host: ""                  # public hostname retained for app environment rendering; routing is platform-owned
+
+resources:
+  requests:
+    cpu: "2"
+    memory: "2Gi"
+    # Autopilot defaults ephemeral storage to 1Gi, which the seeded mw-* images (baked data + logs/
+    # temp) blow past at runtime -> the pod is evicted, never goes Ready, and prepare times out
+    # (observed: siyuan, openemr). 4Gi headroom; apps.yaml ephemeral_storage overrides for heavier ones.
+    ephemeral-storage: "4Gi"
+  limits:
+    cpu: "4"
+    memory: "4Gi"
+    # Autopilot normalizes ephemeral-storage limits to the request; keep the rendered spec stable.
+    ephemeral-storage: "4Gi"
+
+# securityContext is intentionally minimal/overridable — the mw-* images are trusted and some
+# need root (e.g. code-server). Set these per-app from the catalog when an app supports hardening.
+podSecurityContext: {}
+securityContext: {}
+
+extraEnv: []              # [{name: FOO, value: bar}] — e.g. an app's SERVER_URL pinned to `host`
+
+# Propagated from the platform chart; needed when the mw-* images are in a private registry.
+imagePullSecrets: []

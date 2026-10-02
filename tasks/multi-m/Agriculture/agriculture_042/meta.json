@@ -8,5 +8,12 @@
       "e-label"
     ],
     "require_login": true
-  }
+  },
+  "multimodal_input": [
+    {
+      "file": "tasks/multi-m/inputs/farmos_crop_021.jpg",
+      "type": "image",
+      "role": "field_operation_photo_for_method_classification"
+    }
+  ]
 }

@@ -47,7 +47,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -65,7 +65,7 @@ def recipya_query(sql: str) -> list[dict]:
         result = subprocess.run(
             ["docker", "cp", f"{RECIPYA_CONTAINER}:{RECIPYA_DB}", _recipya_db_copy],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=30,
         )
         if result.returncode != 0:
@@ -75,7 +75,7 @@ def recipya_query(sql: str) -> list[dict]:
                 ["docker", "cp", f"{RECIPYA_CONTAINER}:{RECIPYA_DB}{suffix}",
                  _recipya_db_copy + suffix],
                 capture_output=True,
-                text=True,
+                text=True, errors="replace",
                 timeout=30,
             )
     connection = sqlite3.connect(_recipya_db_copy)
@@ -180,7 +180,7 @@ def llm_compare_images(
         f"Recipe summary: {recipe_summary}\nAnswer only YES or NO."
     )
     payload = {
-        "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+        "model": os.getenv("JUDGE_MODEL", ""),
         "messages": [{
             "role": "user",
             "content": [
@@ -197,11 +197,11 @@ def llm_compare_images(
     }
     try:
         request = urllib.request.Request(
-            os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
+            os.getenv("JUDGE_BASE_URL", "")
             + "/chat/completions",
             data=json.dumps(payload).encode(),
             headers={
-                "Authorization": f"Bearer {os.getenv('MINDRA_API_KEY', '')}",
+                "Authorization": f"Bearer {os.getenv('JUDGE_API_KEY', '')}",
                 "Content-Type": "application/json",
             },
             method="POST",

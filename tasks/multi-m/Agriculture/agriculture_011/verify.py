@@ -65,7 +65,7 @@ def docker_exec(container: str, *args: str, timeout: int = 30) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -115,9 +115,16 @@ def strip_html(value: str) -> str:
 
 def exact_log(name: str, log_type: str) -> dict:
     safe = name.replace("'", "''")
+    # COLLATE BINARY is mandatory here. log_field_data.name is declared with Drupal's custom
+    # NOCASE_UTF8 collation, which only exists inside a Drupal-managed connection; comparing
+    # that column over a plain PDO handle aborts the whole query with
+    #   PDOException: no such collation sequence: NOCASE_UTF8
+    # so every log lookup in this task failed on every run no matter what the agent did.
+    # BINARY additionally gives the character-for-character match the task asks for.
+    # agriculture_016 / _031 already query log names this way.
     rows = farmos_query(
         "SELECT id,name,type,timestamp,notes__value FROM log_field_data "
-        f"WHERE name='{safe}' AND type='{log_type}' ORDER BY id"
+        f"WHERE name COLLATE BINARY='{safe}' AND type='{log_type}' ORDER BY id"
     )
     return rows[0] if len(rows) == 1 else {}
 
@@ -170,14 +177,23 @@ def read_farmos_uri(uri: str) -> bytes:
 
 
 def emergency_attachments(log_id: int) -> list[dict]:
-    return farmos_query(
+    # UNION ALL, never UNION. Plain UNION deduplicates rows, which makes SQLite compare
+    # file_managed.filename / .uri — columns Drupal declares with its custom NOCASE_UTF8
+    # collation. That collation exists only inside a Drupal-managed connection, so over a
+    # plain PDO handle the whole query aborts with
+    #   PDOException: no such collation sequence: NOCASE_UTF8
+    # Since this runs outside load_context's try/except, that killed the verifier before it
+    # printed a single check line, so the task scored 0 no matter what the agent did.
+    # UNION ALL skips the comparison; the fid dedupe below restores UNION's semantics.
+    rows = farmos_query(
         "SELECT fm.fid,fm.filename,fm.uri,fm.filemime FROM log__image li "
         "JOIN file_managed fm ON fm.fid=li.image_target_id "
         f"WHERE li.entity_id={log_id} AND li.deleted=0 "
-        "UNION SELECT fm.fid,fm.filename,fm.uri,fm.filemime FROM log__file lf "
+        "UNION ALL SELECT fm.fid,fm.filename,fm.uri,fm.filemime FROM log__file lf "
         "JOIN file_managed fm ON fm.fid=lf.file_target_id "
         f"WHERE lf.entity_id={log_id} AND lf.deleted=0 ORDER BY fid"
     )
+    return list({str(row.get("fid")): row for row in rows}.values())
 
 
 def vision_high(notes: str) -> tuple[bool, str]:
@@ -202,16 +218,16 @@ def vision_high(notes: str) -> tuple[bool, str]:
         ),
     })
     payload = {
-        "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+        "model": os.getenv("JUDGE_MODEL", ""),
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 32,
     }
     try:
         request = urllib.request.Request(
-            os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1") + "/chat/completions",
+            os.getenv("JUDGE_BASE_URL", "") + "/chat/completions",
             data=json.dumps(payload).encode(),
             headers={
-                "Authorization": f"Bearer {os.getenv('MINDRA_API_KEY', '')}",
+                "Authorization": f"Bearer {os.getenv('JUDGE_API_KEY', '')}",
                 "Content-Type": "application/json",
             },
             method="POST",
@@ -250,11 +266,19 @@ def check_1_exact_emergency_and_actual_files() -> None:
         problems.append("exact corn asset missing")
     if not _emergency:
         problems.append("expected exactly one emergency observation")
-    if _emergency and linked_asset_ids(int(_emergency["id"])) != [_corn_id]:
-        problems.append("emergency log is not linked only to the corn asset")
+    # These queries run outside load_context's try/except. Report a failure the same way
+    # every other check does instead of letting the exception exit before any check line is
+    # printed — a silent exit yields "verifier produced no checks" with no diagnosable cause.
+    try:
+        if _emergency and linked_asset_ids(int(_emergency["id"])) != [_corn_id]:
+            problems.append("emergency log is not linked only to the corn asset")
+        rows = emergency_attachments(int(_emergency["id"])) if _emergency else []
+    except Exception as exc:
+        check("1. exact emergency log carries both actual image bytes", 3, False,
+              f"exception: {exc}"[:400])
+        return
     if _emergency and local_date(_emergency.get("timestamp")) != dt.date.today():
         problems.append("emergency log is not dated today")
-    rows = emergency_attachments(int(_emergency["id"])) if _emergency else []
     if len(rows) != 2:
         problems.append(f"expected exactly two attached files, found {len(rows)}")
     _attached_images = [read_farmos_uri(row.get("uri") or "") for row in rows]

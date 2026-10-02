@@ -1,0 +1,117 @@
+{{- if .Values.janitor.enabled }}
+# Backstop GC for orphaned per-run envs. The service deletes a release on /release; this reaps any
+# left behind by crashes or aborted runs. Uses `helm uninstall` so it cleans up the helm release
+# record AND every templated resource (Deployment/Service), then removes
+# expired durable run ConfigMaps only when no releases remain.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pg.name" . }}-janitor
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.janitor.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: {{ .Values.janitor.activeDeadlineSeconds | default 900 }}
+      ttlSecondsAfterFinished: {{ .Values.janitor.ttlSecondsAfterFinished | default 3600 }}
+      template:
+        spec:
+          serviceAccountName: {{ .Values.serviceAccount.name }}
+          restartPolicy: Never
+          containers:
+            - name: janitor
+              # Defaults to the service image, which has helm + kubectl + python3 already.
+              image: {{ .Values.janitor.image | default (printf "%s:%s" .Values.image.repository .Values.image.tag) }}
+              env:
+                - name: NAMESPACE
+                  value: {{ .Release.Namespace }}
+                - name: TTL_MINUTES
+                  value: {{ .Values.janitor.ttlMinutes | quote }}
+              command: ["python3", "-c"]
+              resources:
+                {{- toYaml .Values.janitor.resources | nindent 16 }}
+              args:
+                - |
+                  import datetime as dt, json, os, re, subprocess, time
+                  ns  = os.environ["NAMESPACE"]
+                  ttl = int(os.environ["TTL_MINUTES"]) * 60
+                  now = int(time.time())
+                  def helm_updated_epoch(value):
+                      # Helm emits strings like:
+                      #   2026-05-29 17:34:53.912123934 +0000 UTC
+                      # Python accepts the numeric offset, but only up to
+                      # microsecond precision, so trim nanoseconds.
+                      m = re.match(
+                          r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d+))? ([+-]\d{4})",
+                          value,
+                      )
+                      if not m:
+                          raise ValueError(value)
+                      frac = ((m.group(2) or "")[:6]).ljust(6, "0")
+                      stamp = f"{m.group(1)}.{frac} {m.group(3)}"
+                      return int(dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S.%f %z").timestamp())
+                  def rfc3339_epoch(value):
+                      return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+                  # --all picks up failed/pending-* releases too (the very ones we want to reap).
+                  out = subprocess.run(
+                      ["helm", "list", "--all", "-n", ns, "-o", "json", "--filter", "^run-"],
+                      capture_output=True, text=True, check=True,
+                  )
+                  releases = json.loads(out.stdout or "[]")
+                  for r in releases:
+                      name = r["name"]
+                      try:
+                          updated = helm_updated_epoch(r["updated"])
+                      except ValueError:
+                          print(f"skip {name}: cannot parse updated={r['updated']!r}", flush=True)
+                          continue
+                      age = now - updated
+                      if age > ttl:
+                          print(f"reaping {name} (age {age}s, status={r.get('status')})", flush=True)
+                          subprocess.run(["helm", "uninstall", name, "-n", ns,
+                                          "--ignore-not-found"], check=False)
+                      else:
+                          print(f"keeping {name} (age {age}s)", flush=True)
+                  # Durable run records are intentionally outside the per-app Helm releases. Reap
+                  # an expired record only after every release for its root run is gone; a failed
+                  # Helm uninstall keeps the record available for a later /release retry.
+                  cm_out = subprocess.run(
+                      ["kubectl", "get", "configmaps", "-n", ns,
+                       "-l", "saas-playground.run-registry=true", "-o", "json"],
+                      capture_output=True, text=True, check=True,
+                  )
+                  for cm in json.loads(cm_out.stdout or "{}").get("items", []):
+                      meta = cm.get("metadata") or {}
+                      name = meta.get("name", "")
+                      run_id = (meta.get("labels") or {}).get("saas-playground.root-run-id", "")
+                      try:
+                          age = now - rfc3339_epoch(meta["creationTimestamp"])
+                      except (KeyError, TypeError, ValueError):
+                          print(f"skip {name}: invalid creationTimestamp", flush=True)
+                          continue
+                      if age <= ttl:
+                          print(f"keeping run record {name} (age {age}s)", flush=True)
+                          continue
+                      remaining_out = subprocess.run(
+                          ["helm", "list", "--all", "-n", ns, "-o", "json",
+                           "--filter", f"^run-{re.escape(run_id)}(-.*)?$"],
+                          capture_output=True, text=True, check=True,
+                      )
+                      remaining = [
+                          r for r in json.loads(remaining_out.stdout or "[]")
+                          if r.get("status") != "uninstalled"
+                      ]
+                      if remaining:
+                          print(f"keeping run record {name}: releases remain", flush=True)
+                          continue
+                      print(f"reaping run record {name} (age {age}s)", flush=True)
+                      subprocess.run(
+                          ["kubectl", "delete", "configmap", name, "-n", ns,
+                           "--ignore-not-found=true"], check=False,
+                      )
+{{- end }}

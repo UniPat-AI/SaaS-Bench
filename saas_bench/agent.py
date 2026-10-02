@@ -3,24 +3,18 @@
 import asyncio
 import json
 import os
-import random
 import re
 import shutil
-import signal
-import socket
-import subprocess
 import tempfile
 import time
-import urllib.request
 from contextvars import ContextVar
 from dataclasses import dataclass as _dataclass
 from pathlib import Path
 
 import httpx
-from browser_use import Agent, Browser, ChatOpenAI
+from browser_use import Agent, Browser, ChatAnthropic, ChatOpenAI
 from browser_use.tools.service import Tools
 from browser_use.llm.views import ChatInvokeCompletion
-from playwright.async_api import async_playwright
 from typing import Any
 
 
@@ -80,9 +74,6 @@ def _patch_xterm_fill() -> None:
             await original_fill(self, value, clear)
 
     Element.fill = _xterm_aware_fill  # type: ignore[method-assign]
-
-
-_patch_xterm_fill()
 
 
 def _patch_xterm_send_keys() -> None:
@@ -170,7 +161,28 @@ def _patch_xterm_send_keys() -> None:
     DefaultActionWatchdog.on_SendKeysEvent = on_SendKeysEvent  # type: ignore[assignment]
 
 
-_patch_xterm_send_keys()
+def _apply_xterm_patches() -> None:
+    """Apply the code-server/xterm.js CDP patches, tolerating browser-use API drift.
+
+    Both patches reach into browser-use private internals (``Element.fill`` and its CDP
+    session attributes; ``DefaultActionWatchdog.on_SendKeysEvent``) that are NOT stable
+    across versions. browser-use is pinned in pyproject for the patched behavior; this guard
+    is the safety net so anyone on a different version degrades to possible double-typing
+    inside code-server terminals rather than a hard import failure of the whole harness.
+    """
+    for name, fn in (("input/fill", _patch_xterm_fill), ("send_keys", _patch_xterm_send_keys)):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 — never let a patch break import
+            print(
+                f"[saas_bench.agent] WARNING: xterm.js patch '{name}' not applied "
+                f"({type(e).__name__}: {e}). code-server terminal tasks may double-type. "
+                f"Likely an installed browser-use version different from the pinned 0.13.8.",
+                flush=True,
+            )
+
+
+_apply_xterm_patches()
 
 
 def _strip_tool_call_wrapper(content: str) -> str:
@@ -379,11 +391,21 @@ class _CleanOutputChatOpenAI(ChatOpenAI):
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL")
 LLM_API_KEY  = os.environ.get("LLM_API_KEY")
-if not (LLM_BASE_URL and LLM_API_KEY):
+# Provider: "openai" (OpenAI-compatible endpoint) or "anthropic" (native Claude / Messages API).
+# MUST be set explicitly to select anthropic; defaults to openai. No model-name guessing — a Claude
+# model served behind an OpenAI-compatible gateway must use openai, not the native /v1/messages path.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").strip().lower()
+if not LLM_API_KEY:
     raise RuntimeError(
-        "LLM_BASE_URL and LLM_API_KEY must be set in the environment "
-        "(see .env.example for the expected variables)."
+        "LLM_API_KEY must be set in the environment (see .env.example). "
+        "For the openai provider also set LLM_BASE_URL; for anthropic, LLM_BASE_URL is "
+        "optional (defaults to the Anthropic API) and LLM_PROVIDER=anthropic selects it."
     )
+
+
+def _resolve_provider(model_name: str) -> str:
+    # Explicit LLM_PROVIDER only; default openai. (model_name kept for signature stability.)
+    return LLM_PROVIDER if LLM_PROVIDER in ("openai", "anthropic") else "openai"
 
 
 TASK_G_RULES = """\
@@ -510,14 +532,53 @@ This bypasses Shadow DOM entirely via Frappe's client-side API.
 """
 
 
-def _build_llm(model_name: str) -> _CleanOutputChatOpenAI:
+def _build_llm(model_name: str):
+    """Build the browser-use LLM for the resolved provider.
+
+    openai    -> _CleanOutputChatOpenAI against LLM_BASE_URL (OpenAI-compatible).
+    anthropic -> ChatAnthropic (native Messages API). base_url optional (proxy); the model's
+                 `:effort` suffix is OpenAI-only and is ignored for Anthropic.
+    """
     reasoning_effort = None
     if ":" in model_name:
         base, suffix = model_name.rsplit(":", 1)
         if suffix in {"minimal", "low", "medium", "high"}:
             model_name = base
             reasoning_effort = suffix
-    kwargs: dict = {}
+
+    if _resolve_provider(model_name) == "anthropic":
+        kwargs: dict = {}
+        if LLM_BASE_URL:                       # optional Anthropic-compatible proxy
+            kwargs["base_url"] = LLM_BASE_URL
+        return ChatAnthropic(
+            model=model_name,
+            api_key=LLM_API_KEY,
+            timeout=600,
+            max_retries=5,
+            **kwargs,
+        )
+
+    # openai (default)
+    if not LLM_BASE_URL:
+        raise RuntimeError("LLM_BASE_URL must be set for the openai provider.")
+    kwargs = {}
+    # Sampling-parameter overrides. browser-use sends temperature=0.2 and frequency_penalty=0.1
+    # by default, and a strict gateway rejects the whole request rather than clamping: kimi-k3
+    # answers 400 "invalid temperature: only 1 is allowed for this model", then — once that is
+    # fixed — 400 "invalid frequency_penalty: only 0 is allowed". Each failure kills the step,
+    # browser-use stops after 5 consecutive ones, and the task lands as `completed` with a 6-step
+    # empty trajectory. 29 of 29 tasks scored 0 that way on 2026-09-05 before this was found.
+    #
+    # browser-use only sends a parameter when it is not None, so "" means "omit it entirely".
+    #   kimi-k3:  SAAS_LLM_TEMPERATURE=1 SAAS_LLM_FREQUENCY_PENALTY=
+    # Unset variables keep browser-use's own defaults, so the already-finished columns are
+    # unaffected and stay comparable.
+    for _var, _field in (("SAAS_LLM_TEMPERATURE", "temperature"),
+                         ("SAAS_LLM_FREQUENCY_PENALTY", "frequency_penalty"),
+                         ("SAAS_LLM_TOP_P", "top_p")):
+        if _var in os.environ:
+            _raw = os.environ[_var].strip()
+            kwargs[_field] = float(_raw) if _raw else None
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
     return _CleanOutputChatOpenAI(
@@ -530,69 +591,6 @@ def _build_llm(model_name: str) -> _CleanOutputChatOpenAI:
         add_schema_to_system_prompt=True,
         **kwargs,
     )
-
-
-def _free_port() -> int:
-    """Pick a random port in 40000-59999 that is not currently in use."""
-    for _ in range(100):
-        port = random.randint(40000, 59999)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", port)) != 0:
-                return port
-    raise RuntimeError("Could not find a free port for Chrome CDP")
-
-
-_CHROME_TMP_BASE = os.path.join(_TMP_BASE, "chrome")
-
-
-def _start_chrome(executable_path: str, port: int) -> tuple[subprocess.Popen, str]:
-    user_data = f"{_CHROME_TMP_BASE}_{port}_{int(time.time())}"
-    os.makedirs(user_data, exist_ok=True)
-    proc = subprocess.Popen(
-        [
-            executable_path,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={user_data}",
-            "--headless",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "about:blank",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid,
-    )
-    # Poll until Chrome CDP is ready (up to 120s)
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1)
-            return proc, user_data
-        except Exception:
-            time.sleep(0.5)
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except Exception:
-        proc.kill()
-    shutil.rmtree(user_data, ignore_errors=True)
-    raise RuntimeError(f"Chrome CDP port {port} not ready after 120s")
-
-
-async def _kill(proc, browser) -> None:
-    if proc:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    if browser:
-        try:
-            await asyncio.wait_for(browser.close(), timeout=2)
-        except Exception:
-            pass
 
 
 def _extract_trajectory(history, request_ids: list[str | None] | None = None) -> list[dict]:
@@ -662,27 +660,27 @@ async def run_task(
     task_id = task["task_id"]
     run_suffix = f"_r{run_idx}" if run_idx is not None else ""
     tag = f"[slot {slot_id}][{task_id}{run_suffix}]" if slot_id is not None else f"[{task_id}{run_suffix}]"
-    port = _free_port()
-    chrome_proc = None
-    chrome_user_data = None
     browser = None
 
     # Per-task working dir for browser-use file system (todo.md, results.md, etc.)
-    workdir = Path(_TMP_BASE) / f"fs_{task_id}_{port}_{int(time.time())}"
+    workdir = Path(_TMP_BASE) / f"fs_{task_id}_{os.getpid()}_{int(time.time())}"
     workdir.mkdir(parents=True, exist_ok=True)
     if todo_md:
         (workdir / "todo.md").write_text(todo_md, encoding="utf-8")
 
     try:
-        async with async_playwright() as p:
-            executable_path = p.chromium.executable_path
-
-        chrome_proc, chrome_user_data = _start_chrome(executable_path, port)
         llm = _build_llm(model_name)
+        # Let browser-use launch and OWN Chrome. Connecting to a manually-started Chrome via
+        # cdp_url triggers a browser-use navigation race that flakily aborts requests as
+        # net::ERR_BLOCKED_BY_CLIENT — reliably for higher-latency (public) URLs, which is why
+        # localhost worked but hosted k8s run URLs did not. Owning the launch avoids it.
+        # chromium_sandbox=False + --disable-dev-shm-usage reproduce the old _start_chrome flags
+        # so it still runs headless as root / in Docker.
         browser = Browser(
-            cdp_url=f"http://127.0.0.1:{port}",
-            keep_alive=True,
+            headless=True,
             disable_security=True,
+            chromium_sandbox=False,
+            args=["--disable-dev-shm-usage"],
         )
 
         tools = Tools(exclude_actions=["evaluate"])
@@ -699,14 +697,40 @@ async def run_task(
             file_system_path=str(workdir),
             extend_system_message=TASK_G_RULES,
             available_file_paths=input_files or [],
-            llm_timeout=150,
+            llm_timeout=int(os.environ.get("SAAS_LLM_TIMEOUT", "150")),
         )
 
-        history = await agent.run(max_steps=max_steps)
+        # Budget in TOOL CALLS, not LLM steps. browser-use bundles 1-5 actions into one step
+        # (measured over 106 tasks: 52% one, 27% two, the rest three-to-five, mean 1.82), so
+        # `max_steps=400` handed it ~728 actions while codex and claude-code — strictly one
+        # action per step — got 400. Recounting the existing browser-use run by tool calls puts
+        # 33 of 106 tasks over the 400 line, i.e. a third of that column was scored on a budget
+        # the other harnesses never had. `budget_calls` counts what the agent actually did to the
+        # app, which is the quantity the cap is meant to bound.
+        budget_calls = [0]
+
+        async def _cap_on_calls(agent_ref) -> None:
+            hist = getattr(agent_ref, "history", None)
+            steps = getattr(hist, "history", None) if hist is not None else None
+            if not steps:
+                return
+            out = getattr(steps[-1], "model_output", None)
+            budget_calls[0] += len(getattr(out, "action", None) or []) if out else 0
+            if max_steps > 0 and budget_calls[0] >= max_steps:
+                # Same meaning as the other harnesses' budget stop: the work so far is real and
+                # gets graded; only the agent's own final report is missing.
+                print(f"  {tag} browser-use: tool-call budget spent "
+                      f"({budget_calls[0]}/{max_steps}), stopping", flush=True)
+                agent_ref.stop()
+
+        # max_steps is also passed through as a hard ceiling on LLM steps: a step can carry
+        # several actions but never fewer than one, so the call budget always binds first.
+        history = await agent.run(max_steps=max_steps, on_step_end=_cap_on_calls)
         raw = history.final_result() or ""
         output = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
-        trajectory = _extract_trajectory(history, request_ids=llm.request_ids)
+        # request-id capture is OpenAI-wrapper-only; ChatAnthropic has no such attribute.
+        trajectory = _extract_trajectory(history, request_ids=getattr(llm, "request_ids", None))
 
         result = {
             "task_id": task_id,
@@ -725,9 +749,11 @@ async def run_task(
         }
 
     finally:
-        await _kill(chrome_proc, browser)
-        if chrome_user_data:
-            shutil.rmtree(chrome_user_data, ignore_errors=True)
+        if browser is not None:
+            try:
+                await asyncio.wait_for(browser.kill(), timeout=10)
+            except Exception:
+                pass
         shutil.rmtree(workdir, ignore_errors=True)
 
     Path(result_dir).mkdir(parents=True, exist_ok=True)

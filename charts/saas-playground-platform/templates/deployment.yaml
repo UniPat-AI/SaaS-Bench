@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg.name" . }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Run records survive restarts in per-run ConfigMaps, but mutations are coordinated by the
+  # single service process (no multi-writer leader election). Keep one replica; Recreate makes a
+  # deliberate rollout boundary deterministic. The pod annotation below requests Autopilot's
+  # extended runtime so a GKE-initiated eviction does not kill an in-flight prepare.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.labels" . | nindent 8 }}
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["uvicorn", "saas_bench.deploy_entry:make_app", "--factory", "--host", "0.0.0.0", "--port", "{{ .Values.service.targetPort }}"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          env:
+            - name: SAAS_PLAYGROUND_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: SAAS_PLAYGROUND_DOMAIN
+              value: {{ .Values.config.domain | quote }}
+            - name: SAAS_PLAYGROUND_PUBLIC_SCHEME
+              value: {{ .Values.config.publicScheme | quote }}
+            - name: SAAS_PLAYGROUND_RUN_CHART
+              value: {{ .Values.config.runChartPath | quote }}
+            - name: SAAS_PLAYGROUND_SHIM_DIR
+              value: {{ .Values.config.shimDir | quote }}
+            # Where the per-run app images (mw-*) are pulled from. Without this the service falls
+            # back to a placeholder GCP path baked into deploy_entry.py, and every prepare dies as
+            # ImagePullBackOff -> `helm --wait` timeout, with nothing in the error naming the image.
+            - name: SAAS_PLAYGROUND_REGISTRY
+              value: {{ required "config.registry is required: the registry/namespace holding the mw-* app images" .Values.config.registry | quote }}
+            {{- if .Values.imagePullSecrets }}
+            # Propagated to every per-run app pod by the provisioner (the run charts are installed
+            # by the service at runtime, so they cannot read these values themselves).
+            {{- $names := list }}
+            {{- range .Values.imagePullSecrets }}{{ $names = append $names .name }}{{- end }}
+            - name: SAAS_PLAYGROUND_IMAGE_PULL_SECRETS
+              value: {{ join "," $names | quote }}
+            {{- end }}
+            - name: SAAS_PLAYGROUND_ALLOW_PRIVILEGED_APPS
+              value: {{ .Values.config.allowPrivilegedApps | quote }}
+            - name: SAAS_PLAYGROUND_PREPARE_WORKERS
+              value: {{ .Values.config.prepareWorkers | quote }}
+            - name: SAAS_PLAYGROUND_GRADE_WORKERS
+              value: {{ .Values.config.gradeWorkers | quote }}
+            - name: SAAS_PLAYGROUND_MAX_ACTIVE_RUNS
+              value: {{ .Values.config.maxActiveRuns | quote }}
+            {{- if .Values.config.taskIds }}
+            - name: SAAS_PLAYGROUND_TASKS
+              value: {{ .Values.config.taskIds | quote }}
+            {{- end }}
+            {{- if .Values.externalSecret.enabled }}
+            - name: PLAYGROUND_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecret.k8sSecretName }}
+                  key: {{ .Values.externalSecret.apiKeyKey }}
+            {{- end }}
+            {{- if .Values.verifierJudge.enabled }}
+            - name: JUDGE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.verifierJudge.k8sSecretName }}
+                  key: {{ .Values.verifierJudge.apiKeyKey }}
+            - name: JUDGE_BASE_URL
+              value: {{ .Values.verifierJudge.baseUrl | quote }}
+            - name: JUDGE_MODEL
+              value: {{ .Values.verifierJudge.model | quote }}
+            - name: JUDGE_REASONING_EFFORT
+              value: {{ .Values.verifierJudge.reasoningEffort | quote }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

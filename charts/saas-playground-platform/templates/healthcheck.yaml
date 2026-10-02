@@ -1,0 +1,39 @@
+{{- if .Values.gateway.enabled }}
+# GKE Gateway derives a backend health check that defaults to "GET /". FastAPI 404s on "/", so the
+# backend is marked UNHEALTHY -> the LB returns 503. Point the check at /healthz explicitly.
+# USE_SERVING_PORT targets the NEG endpoint (the container targetPort), so no port is hardcoded.
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: {{ include "pg.name" . }}-hc
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck:
+        requestPath: /healthz
+        portSpecification: USE_SERVING_PORT
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "pg.name" . }}
+---
+# /prepare provisions a per-run preview env (helm install + image pull + pod ready) and is slow; the
+# default 30s LB backend timeout would 504. Raise it. (Cloudflare still caps the edge at ~100s, so
+# prepare must stay under that when driven through the proxy — see the playground client.)
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: {{ include "pg.name" . }}-backend
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  default:
+    timeoutSec: {{ .Values.gateway.backendTimeoutSec | default 300 }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "pg.name" . }}
+{{- end }}

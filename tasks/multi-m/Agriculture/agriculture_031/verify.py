@@ -71,7 +71,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -87,7 +87,7 @@ def sqlite_copy_query(container: str, db_path: str, sql: str) -> list[dict]:
         result = subprocess.run(
             ["docker", "cp", f"{container}:{db_path}", local_db],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=30,
         )
         if result.returncode != 0:
@@ -96,7 +96,7 @@ def sqlite_copy_query(container: str, db_path: str, sql: str) -> list[dict]:
             subprocess.run(
                 ["docker", "cp", f"{container}:{db_path}{suffix}", local_db + suffix],
                 capture_output=True,
-                text=True,
+                text=True, errors="replace",
                 timeout=30,
             )
         _db_copies[key] = local_db
@@ -176,7 +176,7 @@ def compare_attached_image(source: bytes, actual: bytes, summary: str) -> tuple[
         f"Recipe summary: {summary}\nAnswer only YES or NO."
     )
     payload = {
-        "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+        "model": os.getenv("JUDGE_MODEL", ""),
         "messages": [{
             "role": "user",
             "content": [
@@ -191,11 +191,11 @@ def compare_attached_image(source: bytes, actual: bytes, summary: str) -> tuple[
     }
     try:
         request = urllib.request.Request(
-            os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
+            os.getenv("JUDGE_BASE_URL", "")
             + "/chat/completions",
             data=json.dumps(payload).encode(),
             headers={
-                "Authorization": f"Bearer {os.getenv('MINDRA_API_KEY', '')}",
+                "Authorization": f"Bearer {os.getenv('JUDGE_API_KEY', '')}",
                 "Content-Type": "application/json",
             },
             method="POST",

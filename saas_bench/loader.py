@@ -96,9 +96,12 @@ def _build_todo_md(task_id: str, steps: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _build_url_block(port_map: dict[str, int], hostname: str) -> str:
-    """Generate the Application Access URLs section (with strong-constraint wording)."""
-    if not port_map:
+def _build_url_block(url_map: dict[str, str]) -> str:
+    """Generate the Application Access URLs section (with strong-constraint wording).
+
+    ``url_map`` maps each app key to its full base URL (e.g. ``http://localhost:30001``).
+    """
+    if not url_map:
         return ""
     lines = [
         "## Application Access URLs",
@@ -108,8 +111,8 @@ def _build_url_block(port_map: dict[str, int], hostname: str) -> str:
         "After landing on an app, navigate within it via UI clicks only.",
         "",
     ]
-    for app, port in sorted(port_map.items()):
-        lines.append(f"- {app}: http://{hostname}:{port}")
+    for app, url in sorted(url_map.items()):
+        lines.append(f"- {app}: {url}")
     lines.append("")
     return "\n".join(lines)
 
@@ -119,8 +122,13 @@ def build_prompt(
     port_map: dict[str, int] | None = None,
     hostname: str = "localhost",
     tasks_root: str | None = None,
+    url_map: dict[str, str] | None = None,
 ) -> tuple[str, str, list[str]]:
     """Build the agent's task prompt, the pre-filled todo.md, and the list of absolute paths to multimodal input files.
+
+    URL resolution: an explicit ``url_map`` (app key -> full base URL) wins — used by the
+    hosted playground to emit exact staging URLs. Absent, URLs are derived from
+    ``port_map`` + ``hostname`` (``http://{hostname}:{port}``), preserving local-docker behavior.
 
     Returns:
         (full_prompt, todo_md, input_files)
@@ -129,8 +137,12 @@ def build_prompt(
     description = task["description_md"]
     steps = _extract_steps(description)
 
+    resolved_urls = url_map or {
+        app: f"http://{hostname}:{port}" for app, port in (port_map or {}).items()
+    }
+
     parts: list[str] = []
-    url_block = _build_url_block(port_map or {}, hostname)
+    url_block = _build_url_block(resolved_urls)
     if url_block:
         parts.append(url_block)
     parts.append(description)

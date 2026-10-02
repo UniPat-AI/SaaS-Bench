@@ -1,0 +1,140 @@
+# Defaults; override per env in values-staging.yaml. The service runs in this namespace and creates
+# per-run preview-env Helm releases (the saas-playground-run chart) here too.
+nameOverride: saas-playground
+
+image:
+  repository: us-central1-docker.pkg.dev/your-gcp-project/saas-bench/saas-playground
+  tag: latest                 # pin a real <name>-<git-sha> in values-staging.yaml; never latest in staging
+  pullPolicy: IfNotPresent
+
+# Applied to the service pod AND, via the run charts, to every per-run app pod. Needed for any
+# private registry (ghcr.io / ECR / ACR / Harbor); a missing pull secret surfaces only as an
+# opaque `helm --wait` timeout during prepare.
+imagePullSecrets: []
+#  - name: my-registry-creds
+
+replicaCount: 1
+
+resources:
+  requests: {cpu: "2", memory: "2Gi"}
+  limits: {cpu: "4", memory: "4Gi"}
+
+service:
+  port: 80
+  targetPort: 8080            # uvicorn
+  # Empty -> ClusterIP; front it with your own Ingress/Gateway. Set LoadBalancer (or NodePort) to
+  # expose the API directly on a cluster with no ingress controller.
+  type: ""
+
+serviceAccount:
+  name: saas-playground
+  gcpServiceAccount: ""       # set in values-staging: saas-playground@your-gcp-project.iam.gserviceaccount.com (Workload Identity)
+
+# The service config (env)
+config:
+  # REQUIRED. Registry + namespace holding the mw-* SaaS app images (see docs/kubernetes.md §2).
+  # Not the same as image.repository above, which is only the platform image. Left unset, the
+  # service falls back to a placeholder GCP path and every prepare dies as ImagePullBackOff.
+  registry: ""                                 # e.g. ghcr.io/acme, registry.example.com/saas
+  domain: saas-playground.example.com     # per-run host = <run_id>.<domain>
+  publicScheme: https                         # authoritative browser origin at the external edge
+  runChartPath: /app/charts/saas-playground-run
+  shimDir: /app/deploy/shim                   # docker->kubectl exec shim baked into the image
+  taskIds: ""                                  # optional allowlist; blank auto-discovers all loadable bundled tasks
+  allowPrivilegedApps: false                   # reserved for future privileged apps; rootless OnlyOffice does not need it
+  prepareWorkers: 4                            # max concurrent async prepare jobs inside the single service pod
+  gradeWorkers: 4                              # max concurrent verifier subprocesses; excess /grade calls return retryable 429
+  maxActiveRuns: 110                           # concurrency gate (111th /runs -> 429); matches the client --workers cap.
+                                               # prepare/grade still fan out at prepareWorkers/gradeWorkers below —
+                                               # raise those (+ pod cpu/memory) if provisioning throughput is too low.
+
+# One permanent external backend for every per-run hostname. The router validates the host label
+# and forwards only to `run-<label>` Services in this release namespace, keeping runs isolated while
+# avoiding a multi-minute global GKE Gateway reconciliation for every prepare/release.
+runRouter:
+  enabled: true
+  replicaCount: 2
+  servicePort: 80
+  targetPort: 8080
+  dnsResolver: kube-dns.kube-system.svc.cluster.local
+  dnsValid: 5s
+  dnsTimeout: 2s
+  connectTimeout: 10s
+  readTimeout: 3600s
+  sendTimeout: 3600s
+  backendTimeoutSec: 3600
+  resources:
+    requests: {cpu: "250m", memory: "256Mi"}
+    limits: {cpu: "1", memory: "512Mi"}
+
+# External Secrets (the API key the service validates / the client sends)
+externalSecret:
+  enabled: true
+  secretStoreName: saas-playground-store
+  gcpProject: your-gcp-project
+  remoteKey: saas-playground-api-key
+  k8sSecretName: saas-playground-api-key
+  apiKeyKey: api-key
+
+# LLM judge used by 23 of the 106 verifiers: those cannot decide their result from a database query
+# alone (they judge free text or an image), so they call a model as a judge. Grading runs
+# server-side, which is why the endpoint, model and key are injected into the service pod rather
+# than configured on the client. Only the API key is secret material.
+#
+# While `enabled: false`, JUDGE_* is never injected and those 23 tasks report judge errors instead
+# of scores — set this before trusting a full-corpus run.
+#
+# `model` has deliberately no default: it must name a model that the `baseUrl` endpoint actually
+# serves AND that accepts images (several checks are vision checks). A name that works on one
+# provider 404s on every other.
+verifierJudge:
+  enabled: false
+  remoteApiKey: ""
+  k8sSecretName: saas-playground-verifier-judge
+  apiKeyKey: api-key
+  baseUrl: https://api.openai.com/v1
+  model: ""
+  reasoningEffort: high
+
+# Shared GKE Gateway: the per-run *.<domain> wildcard + the service's own api host
+# KNOWN LIMITATION (not yet fixed): the whole run-router — its ConfigMap, Deployment and Service —
+# is gated on `gateway.enabled` in templates/run-router.yaml, and the router is the only component
+# that maps <run_id>.<domain> to the per-run Service. templates/{networking,healthcheck}.yaml and
+# run-router.yaml also emit GKE-only objects (gateway.networking.k8s.io Gateway with
+# gatewayClassName gke-l7-global-external-managed and a NamedAddress, plus networking.gke.io
+# HealthCheckPolicy / GCPBackendPolicy) under the same flag. So on a non-GKE cluster:
+#   gateway.enabled: true  -> `helm install` aborts with "no matches for kind HealthCheckPolicy"
+#   gateway.enabled: false -> installs, but per-run URLs are unroutable (no router)
+# Until the router is split onto its own flag, non-GKE users must delete
+# templates/{networking,healthcheck}.yaml, drop the two policy objects at the tail of
+# run-router.yaml, and change its outer `if` to `.Values.runRouter.enabled` alone.
+gateway:
+  enabled: true
+  className: gke-l7-global-external-managed
+  name: saas-playground-gateway
+  apiHost: api.saas-playground.example.com
+  wildcardHost: "*.saas-playground.example.com"
+  addressName: saas-playground-ip            # provisioned global static IP
+  certMap: saas-playground-cert-map          # Certificate Manager map (DNS-auth set up out-of-band), or:
+  tlsSecretName: ""                          # ...a Cloudflare Origin Secret instead of certMap
+  backendTimeoutSec: 300                     # LB backend timeout (GCPBackendPolicy); /prepare is slow
+
+# TTL janitor: reap orphaned per-run helm releases past the TTL (the service deletes on release;
+# this is a backstop for crashed runs). Uses `helm uninstall` so it cleans up the helm release
+# record + every templated resource (Deployment/Service) in one go.
+#
+# IMPORTANT: ttlMinutes MUST be longer than the maximum reasonable single-run duration. The janitor
+# does not treat a durable run record as an activity heartbeat, so any release older than
+# ttlMinutes will be reaped — even if /grade is still expecting it. 240min (4h) gives
+# generous headroom for any single agent run; tasks with `startup_wait: 1200s` plus a multi-step
+# agent loop should still finish well inside that.
+janitor:
+  enabled: true
+  schedule: "*/5 * * * *"
+  ttlMinutes: 240
+  image: ""                # default empty -> use the platform service image (has helm+kubectl+python)
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600
+  resources:
+    requests: {cpu: "250m", memory: "256Mi"}
+    limits: {cpu: "1", memory: "512Mi"}

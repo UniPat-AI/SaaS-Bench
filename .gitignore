@@ -26,3 +26,14 @@ docker/images/*.tar.gz
 .idea/
 .vscode/
 *.swp
+
+# Internal image-build recipes (fixtures baked into distributed tars; not shipped in the open-source repo)
+image-build/
+
+# Internal-only docs (team runbooks; not part of the open-source release)
+docs/internal/
+IIA/
+
+# Internal working notes and deployment write-ups, kept out of the published repo.
+# These are tracked in git history; run `git rm -r --cached backup` once to stop tracking them.
+/backup/

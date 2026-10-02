@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "run.fullname" . }}
+  labels:
+    {{- include "run.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "run.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "run.labels" . | nindent 8 }}
+      annotations:
+        # Benchmark state currently lives in the container writable layer. On Autopilot this
+        # requests extended runtime for the whole benchmark window. If replacement still occurs,
+        # the grader rejects the reset environment instead of scoring it.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      # Per-run pods don't talk to the K8s API; no SA token reduces the blast radius if any of
+      # the seeded mw-* images is compromised. The shim grader execs in from the service pod,
+      # which has its own (separate) SA — it doesn't need a token mounted inside the app.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      # The mw-* app images normally sit in a private registry. Without this the run pod cannot
+      # pull them and prepare fails as an opaque `helm --wait` timeout that never names the image.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: app
+          image: {{ .Values.image | required "image is required" }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # TCP, not httpGet: the mw-* apps return 401/403/3xx on "/" unauthenticated (upstream
+          # treats those as "up"). A k8s httpGet probe counts 403 as failure, so the pod would
+          # never go Ready. Port-open is the robust readiness signal across all 23 apps.
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.containerPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 120        # apps boot slowly (apps.yaml startup_wait up to 1200s)
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

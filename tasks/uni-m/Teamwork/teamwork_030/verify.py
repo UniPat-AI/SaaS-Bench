@@ -1,8 +1,10 @@
 """
 Verifier for Teamwork-030-I2: Cross-Team Status Report across Mattermost, OnlyOffice, ownCloud, Roundcube
 
-Checks: 14 weighted checks across 4 sites.
-Strategy: DB (Mattermost, Roundcube prefs), API (OnlyOffice, ownCloud), maildir (Roundcube email)
+Checks: 12 weighted checks across 4 sites (total weight 15; one 0-weight informational check).
+Strategy: DB (Mattermost, Roundcube prefs, OnlyOffice MySQL), API (OnlyOffice, ownCloud),
+          docx content probes (OnlyOffice data dir via docker exec + API download fallback),
+          Sent-maildir header/body parsing (Roundcube, python email stdlib).
 
 Required env vars:
   SERVER_HOSTNAME,
@@ -12,6 +14,9 @@ Required env vars:
   ROUNDCUBEMAIL_PORT, ROUNDCUBEMAIL_CONTAINER, ROUNDCUBEMAIL_DB_CONTAINER
 """
 
+import email
+import email.utils
+import io
 import json
 import os
 import re
@@ -20,6 +25,8 @@ import sys
 import urllib.request
 import urllib.error
 import urllib.parse
+import zipfile
+from email.header import decode_header, make_header
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
 HOST = os.getenv("SERVER_HOSTNAME", "localhost")
@@ -52,6 +59,11 @@ RC_PORT = _env["ROUNDCUBEMAIL_PORT"]
 RC_CONTAINER = _env["ROUNDCUBEMAIL_CONTAINER"]
 RC_DB = _env["ROUNDCUBEMAIL_DB_CONTAINER"]
 
+REPORT_TITLE = "Cross-Team Bi-Weekly Status Report - W26-W27 2026"
+REPORT_SUBJECT = "Bi-Weekly Cross-Team Status Report - June 22 to July 3, 2026"
+SENDER_ADDR = "james.whitfield@mail.local"
+SENDER_LOCALPART = "james.whitfield"
+
 # ── Result accumulator ────────────────────────────────────────────────────────
 _checks: list[tuple[str, int, bool, str]] = []
 
@@ -67,9 +79,17 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
+
+
+def docker_exec_bytes(container: str, *args: str, timeout: int = 30) -> bytes:
+    r = subprocess.run(
+        ["docker", "exec", container, *args],
+        capture_output=True, timeout=timeout,
+    )
+    return r.stdout if r.returncode == 0 else b""
 
 
 def mm_db_query(sql: str) -> str:
@@ -77,15 +97,32 @@ def mm_db_query(sql: str) -> str:
     rc, out, err = docker_exec(
         MM_DB, "psql", "-U", "mmuser", "-d", "mattermost", "-t", "-A", "-c", sql
     )
+    if rc != 0:
+        raise RuntimeError(f"mattermost psql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
     return out.strip()
 
 
 def oc_db_query(sql: str) -> str:
     """Query ownCloud MariaDB."""
+    # -h 127.0.0.1: the ownCloud MariaDB image ships anonymous ''@'localhost'
+    # users that shadow 'owncloud'@'%' over the unix socket.
     rc, out, err = docker_exec(
-        OC_DB, "mysql", "-u", "owncloud", "-powncloud", "owncloud",
+        OC_DB, "mysql", "-h", "127.0.0.1", "-u", "owncloud", "-powncloud", "owncloud",
         "--default-character-set=utf8mb4", "-N", "-B", "-e", sql
     )
+    if rc != 0:
+        raise RuntimeError(f"owncloud mysql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
+    return out.strip()
+
+
+def oo_db_query(sql: str) -> str:
+    """Query OnlyOffice MySQL DB."""
+    rc, out, err = docker_exec(
+        OO_DB, "mysql", "-u", "onlyoffice_user", "-ponlyoffice_pass",
+        "--default-character-set=utf8mb4", "-N", "-B", "-e", sql, "onlyoffice"
+    )
+    if rc != 0:
+        raise RuntimeError(f"onlyoffice mysql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
     return out.strip()
 
 
@@ -95,6 +132,8 @@ def rc_db_query(sql: str) -> str:
         RC_DB, "mysql", "-u", "roundcube", "-proundcube123", "roundcubemail",
         "--default-character-set=utf8mb4", "-N", "-B", "-e", sql
     )
+    if rc != 0:
+        raise RuntimeError(f"roundcube mysql query failed (rc={rc}): {' '.join(err.split())[-300:]}")
     return out.strip()
 
 
@@ -111,6 +150,18 @@ def http_request(url: str, method: str = "GET", data: bytes | None = None,
         return e.code, body, dict(e.headers) if e.headers else {}
     except Exception as e:
         return 0, str(e), {}
+
+
+def http_get_bytes(url: str, headers: dict | None = None, timeout: int = 30) -> tuple[int, bytes]:
+    """Binary GET (for docx downloads)."""
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read() if e.fp else b""
+    except Exception:
+        return 0, b""
 
 
 def oo_api_get_token() -> str | None:
@@ -134,6 +185,169 @@ def oo_api(endpoint: str, token: str) -> tuple[int, dict]:
         return status, {}
 
 
+def _norm(s: str) -> str:
+    """Normalize whitespace for text comparisons."""
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ── OnlyOffice docx probe helpers (approach B) ────────────────────────────────
+def _xml_unescape(s: str) -> str:
+    s = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), s)
+    s = re.sub(r"&#x([0-9a-fA-F]+);", lambda m: chr(int(m.group(1), 16)), s)
+    for ent, ch in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&amp;", "&")):
+        s = s.replace(ent, ch)
+    return s
+
+
+def _oo_docx_fetch(title: str) -> tuple[bytes | None, str]:
+    """Fetch the docx bytes for the given exact title (with/without .docx).
+
+    Chain: files_file latest id -> data-dir content.docx (highest version dir)
+    via docker exec -> API download fallback."""
+    notes: list[str] = []
+    fid = None
+    try:
+        out = oo_db_query(
+            f"SELECT id FROM files_file WHERE title IN ('{title}', '{title}.docx') "
+            "ORDER BY id DESC LIMIT 1;"
+        )
+        if out.strip():
+            fid = out.strip().splitlines()[0].strip()
+    except Exception as e:
+        notes.append(f"db id lookup failed: {e}")
+
+    if fid:
+        try:
+            rc, out, _ = docker_exec(
+                OO_CONTAINER, "bash", "-c",
+                f"find /var/www/onlyoffice/Data -type f -path '*file_{fid}/*content.docx' "
+                "2>/dev/null || true",
+                timeout=20,
+            )
+            paths = [p.strip() for p in out.splitlines() if p.strip()]
+            if paths:
+                def _vkey(p: str) -> list[int]:
+                    tail = p.split(f"file_{fid}/", 1)[-1]
+                    nums = re.findall(r"\d+", tail)
+                    return [int(n) for n in nums] if nums else [0]
+
+                path = max(paths, key=_vkey)
+                data = docker_exec_bytes(OO_CONTAINER, "cat", path, timeout=30)
+                if data[:2] == b"PK":
+                    return data, f"fs {path}"
+                notes.append("fs cat failed or not a zip")
+            else:
+                notes.append("fs content.docx not found")
+        except Exception as e:
+            notes.append(f"fs read failed: {e}")
+
+    # API download fallback
+    try:
+        token = oo_api_get_token()
+        if not token:
+            notes.append("api auth failed")
+            return None, "; ".join(notes)
+        if not fid:
+            did = _oo_get_doc_id(token)
+            fid = str(did) if did else None
+        if not fid:
+            notes.append("file id not found via api")
+            return None, "; ".join(notes)
+        status, data = http_get_bytes(
+            f"http://{HOST}:{OO_PORT}/api/2.0/files/file/{fid}/download",
+            {"Authorization": token},
+        )
+        if status == 200 and data[:2] == b"PK":
+            return data, "api download"
+        status, data = http_get_bytes(
+            f"http://{HOST}:{OO_PORT}/products/files/httphandlers/filehandler.ashx"
+            f"?action=download&fileid={fid}",
+            {"Cookie": f"asc_auth_key={token}"},
+        )
+        if status == 200 and data[:2] == b"PK":
+            return data, "api filehandler download"
+        notes.append(f"api download failed (HTTP {status})")
+    except Exception as e:
+        notes.append(f"api download failed: {e}")
+    return None, "; ".join(notes)
+
+
+def _docx_document_xml(data: bytes) -> str | None:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        return zf.read("word/document.xml").decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _docx_plain_text(xml: str) -> str:
+    """Concatenate all <w:t> runs (per paragraph), strip tags, normalize whitespace.
+    OnlyOffice splits sentences across runs -- never grep the raw XML for sentences."""
+    chunks: list[str] = []
+    for para in xml.split("</w:p>"):
+        runs = re.findall(r"<w:t[^>]*>(.*?)</w:t>", para, flags=re.S)
+        if runs:
+            chunks.append("".join(runs))
+    return _norm(_xml_unescape(" ".join(chunks)))
+
+
+# ── Roundcube Sent-maildir helpers (approach C) ───────────────────────────────
+def _sent_candidate_paths() -> list[str]:
+    """Candidate mail files: ONLY the sender's Sent Maildir (cur + new)."""
+    cmd = (
+        f"find /var/mail/mail.local/{SENDER_LOCALPART}/.Sent/cur "
+        f"/var/mail/mail.local/{SENDER_LOCALPART}/.Sent/new "
+        "-type f 2>/dev/null || true"
+    )
+    rc, out, _ = docker_exec(RC_CONTAINER, "bash", "-c", cmd, timeout=20)
+    return [p.strip() for p in out.splitlines() if p.strip()]
+
+
+def _hdr_decoded(msg, name: str) -> str:
+    raw = msg.get(name)
+    if raw is None:
+        return ""
+    try:
+        return _norm(str(make_header(decode_header(str(raw)))))
+    except Exception:
+        parts = []
+        for part, enc in decode_header(str(raw)):
+            parts.append(part.decode(enc or "utf-8", "replace")
+                         if isinstance(part, bytes) else part)
+        return _norm("".join(parts))
+
+
+def _addr_set(msg, name: str) -> set[str]:
+    vals = [str(v) for v in (msg.get_all(name) or [])]
+    return {addr.lower() for _, addr in email.utils.getaddresses(vals) if addr}
+
+
+_sent_msg = None
+_sent_path = ""
+_sent_searched = False
+
+
+def _get_report_email():
+    """Locate + parse the Sent copy with the exact report subject (cached)."""
+    global _sent_msg, _sent_path, _sent_searched
+    if _sent_searched:
+        return _sent_msg, _sent_path
+    _sent_searched = True
+    want = _norm(REPORT_SUBJECT)
+    for path in _sent_candidate_paths():
+        raw = docker_exec_bytes(RC_CONTAINER, "cat", path, timeout=15)
+        if not raw:
+            continue
+        try:
+            msg = email.message_from_bytes(raw)
+        except Exception:
+            continue
+        if _hdr_decoded(msg, "Subject") == want:
+            _sent_msg, _sent_path = msg, path
+            break
+    return _sent_msg, _sent_path
+
+
 # ── Individual checks ─────────────────────────────────────────────────────────
 
 def check_3_oo_document_exists() -> None:
@@ -141,84 +355,149 @@ def check_3_oo_document_exists() -> None:
     try:
         token = oo_api_get_token()
         if not token:
-            check("3. OO document exists", 2, False, "auth failed")
+            check("3. OO document exists", 1, False, "auth failed")
             return
         # List common documents
         status, data = oo_api("files/@common", token)
         files = data.get("response", {}).get("files", [])
-        title = "Cross-Team Bi-Weekly Status Report - W26-W27 2026"
-        found = any(f.get("title", "") == title for f in files)
-        check("3. OO document exists", 2, found,
+        # OnlyOffice reports titles WITH the file extension (e.g. '<title>.docx')
+        found = any(
+            f.get("title", "") == REPORT_TITLE or f.get("title", "").startswith(REPORT_TITLE + ".")
+            for f in files
+        )
+        check("3. OO document exists", 1, found,
               f"not found among {len(files)} files" if not found else "")
     except Exception as e:
-        check("3. OO document exists", 2, False, f"exception: {e}")
+        check("3. OO document exists", 1, False, f"exception: {e}")
+
+
+def check_3b_oo_document_content() -> None:
+    """Docx content probes for the status report (approach B): headings, 3 tables, risks section."""
+    label = "3b. OO document content (docx probes)"
+    try:
+        data, source = _oo_docx_fetch(REPORT_TITLE)
+        if not data:
+            check(label, 2, False, f"could not fetch docx: {source}")
+            return
+        xml = _docx_document_xml(data)
+        if xml is None:
+            check(label, 2, False, f"word/document.xml unreadable (source: {source})")
+            return
+        text = _docx_plain_text(xml)
+        probes = [
+            "Cross-Team Bi-Weekly Status Report",
+            "Bi-Weekly Period: June 22 – July 3, 2026",  # en dash, exact per task text
+            "Engineering Updates",
+            "Marketing Updates",
+            "Product Updates",
+            "Author",
+            "Update",
+            "Date",
+            "Cross-Team Risks",
+            "recurring incident postmortem findings not being actioned within SLA",
+            "delayed brand asset approvals impacting campaign timelines",
+            "too late in the sprint cycle to influence design decisions",
+        ]
+        missing = [p for p in probes if _norm(p) not in text]
+        tbl_count = len(re.findall(r"<w:tbl[ >]", xml))
+        tables_ok = tbl_count >= 3
+        passed = (not missing) and tables_ok
+        check(label, 2, passed,
+              f"missing_probes={missing[:4]}, table_count={tbl_count} want >=3, source={source}")
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
 
 
 def _oo_get_doc_id(token: str) -> int | None:
     """Find the document ID for the status report."""
     status, data = oo_api("files/@common", token)
     files = data.get("response", {}).get("files", [])
-    title = "Cross-Team Bi-Weekly Status Report - W26-W27 2026"
+    # OnlyOffice reports titles WITH the file extension (e.g. '<title>.docx')
     for f in files:
-        if f.get("title", "") == title:
+        t = f.get("title", "")
+        if t == REPORT_TITLE or t.startswith(REPORT_TITLE + "."):
             return f.get("id")
     return None
 
 
+def _oo_shares_via_api() -> list | None:
+    """Return the share list for the report document via API, or None if unavailable."""
+    token = oo_api_get_token()
+    if not token:
+        return None
+    doc_id = _oo_get_doc_id(token)
+    if not doc_id:
+        return None
+    status, data = oo_api(f"files/file/{doc_id}/share", token)
+    resp = data.get("response")
+    if status == 200 and isinstance(resp, list):
+        return resp
+    return None
+
+
+def _oo_share_db_fallback(username: str, security: int) -> bool:
+    """Strict approach A DB check: subject GUID joined to core_user, entry_id bound
+    to the target file, exact username and exact security level."""
+    sql = (
+        "SELECT 1 FROM files_security fs "
+        "JOIN core_user cu ON fs.subject = cu.id "
+        "WHERE fs.entry_type = 2 "
+        "AND fs.entry_id = (SELECT CAST(id AS CHAR) FROM files_file "
+        f"WHERE title IN ('{REPORT_TITLE}', '{REPORT_TITLE}.docx') "
+        "ORDER BY id DESC LIMIT 1) "
+        f"AND cu.username = '{username}' AND fs.security = {security};"
+    )
+    return bool(oo_db_query(sql).strip())
+
+
+def _judge_share(shares: list, username: str, access_want: int) -> bool:
+    """Exact userName equality + exact access level (1=edit, 2=view only)."""
+    for s in shares:
+        user = s.get("sharedTo", {}) or {}
+        uname = user.get("userName", "")
+        try:
+            access = int(s.get("access", -1))
+        except (TypeError, ValueError):
+            access = -1
+        if uname == username and access == access_want:
+            return True
+    return False
+
+
 def check_4_oo_shared_junchen() -> None:
-    """Verify document shared with jun.chen for viewing."""
+    """Verify document shared with jun.chen for viewing (access == 2 ONLY)."""
+    label = "4. OO shared with jun.chen (view, access==2)"
     try:
-        token = oo_api_get_token()
-        if not token:
-            check("4. OO shared with jun.chen (view)", 2, False, "auth failed")
+        shares = _oo_shares_via_api()
+        if shares is not None:
+            found = _judge_share(shares, "jun.chen", 2)
+            check(label, 2, found,
+                  f"api shares={len(shares)}; require userName=='jun.chen' AND access==2 view only")
             return
-        doc_id = _oo_get_doc_id(token)
-        if not doc_id:
-            check("4. OO shared with jun.chen (view)", 2, False, "document not found")
-            return
-        status, data = oo_api(f"files/file/{doc_id}/share", token)
-        shares = data.get("response", [])
-        found = False
-        for s in shares:
-            user = s.get("sharedTo", {})
-            uname = user.get("userName", "") or user.get("id", "")
-            access = s.get("access", -1)
-            # access 2 = read-only in OnlyOffice
-            if "jun.chen" in str(uname) and access in (1, 2):
-                found = True
-                break
-        check("4. OO shared with jun.chen (view)", 2, found,
-              f"shares={len(shares)}" if not found else "")
+        # DB fallback (strict approach A)
+        found = _oo_share_db_fallback("jun.chen", 2)
+        check(label, 2, found,
+              "db fallback: files_security join core_user, entry_id bound, security==2")
     except Exception as e:
-        check("4. OO shared with jun.chen (view)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_5_oo_shared_amitsingh() -> None:
-    """Verify document shared with amit.singh for editing."""
+    """Verify document shared with amit.singh for editing (access == 1, exact username)."""
+    label = "5. OO shared with amit.singh (edit, access==1)"
     try:
-        token = oo_api_get_token()
-        if not token:
-            check("5. OO shared with amit.singh (edit)", 2, False, "auth failed")
+        shares = _oo_shares_via_api()
+        if shares is not None:
+            found = _judge_share(shares, "amit.singh", 1)
+            check(label, 2, found,
+                  f"api shares={len(shares)}; require userName=='amit.singh' AND access==1 edit")
             return
-        doc_id = _oo_get_doc_id(token)
-        if not doc_id:
-            check("5. OO shared with amit.singh (edit)", 2, False, "document not found")
-            return
-        status, data = oo_api(f"files/file/{doc_id}/share", token)
-        shares = data.get("response", [])
-        found = False
-        for s in shares:
-            user = s.get("sharedTo", {})
-            uname = user.get("userName", "") or user.get("id", "")
-            access = s.get("access", -1)
-            # access 1 = read-write in OnlyOffice
-            if "amit.singh" in str(uname) and access == 1:
-                found = True
-                break
-        check("5. OO shared with amit.singh (edit)", 2, found,
-              f"shares={len(shares)}" if not found else "")
+        # DB fallback (strict approach A)
+        found = _oo_share_db_fallback("amit.singh", 1)
+        check(label, 2, found,
+              "db fallback: files_security join core_user, entry_id bound, security==1")
     except Exception as e:
-        check("5. OO shared with amit.singh (edit)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 def check_6_oc_folder_structure() -> None:
@@ -239,7 +518,7 @@ def check_6_oc_folder_structure() -> None:
 
 
 def check_7_oc_exec_summary_content() -> None:
-    """Verify exec_summary.txt exists with correct content."""
+    """Verify exec_summary.txt exists with the department findings (probed, not prefix-only)."""
     try:
         url = f"http://{HOST}:{OC_PORT}/remote.php/dav/files/admin/Leadership_BiWeekly_Reports/2026-P13-P14/exec_summary.txt"
         import base64
@@ -250,23 +529,34 @@ def check_7_oc_exec_summary_content() -> None:
         if status != 200:
             check("7. OC exec_summary.txt content", 2, False, f"HTTP {status}")
             return
-        expected_fragment = "Executive Summary - Bi-Weekly Period June 22"
-        passed = expected_fragment in body
-        check("7. OC exec_summary.txt content", 2, passed,
-              f"content mismatch, got {body[:80]}..." if not passed else "")
+        probes = [
+            "Executive Summary - Bi-Weekly Period June 22",
+            "4 P1 incidents",
+            "refreshed logo system",
+            "3 rounds of user interviews",
+            "onboarding redesign",
+            "brand asset handoff cadence",
+        ]
+        body_norm = _norm(body)
+        missing = [p for p in probes if _norm(p) not in body_norm]
+        check("7. OC exec_summary.txt content", 2, not missing,
+              f"missing_probes={missing}" if missing else "all probes present")
     except Exception as e:
         check("7. OC exec_summary.txt content", 2, False, f"exception: {e}")
 
 
 def check_10_oc_tag() -> None:
-    """Verify tag 'biweekly-leadership' applied to Leadership_BiWeekly_Reports."""
+    """Verify tag 'biweekly-leadership' applied to admin's Leadership_BiWeekly_Reports folder."""
     try:
-        # Use ownCloud DB to check tags
+        # home::admin storage join + exact path guard against same-named objects
         sql = (
             "SELECT t.name FROM oc_systemtag t "
             "JOIN oc_systemtag_object_mapping m ON t.id = m.systemtagid "
+            "AND m.objecttype = 'files' "
             "JOIN oc_filecache f ON m.objectid = f.fileid "
-            "WHERE f.name = 'Leadership_BiWeekly_Reports' "
+            "JOIN oc_storages s ON f.storage = s.numeric_id "
+            "WHERE s.id = 'home::admin' "
+            "AND f.path = 'files/Leadership_BiWeekly_Reports' "
             "AND t.name = 'biweekly-leadership'"
         )
         out = oc_db_query(sql)
@@ -278,108 +568,90 @@ def check_10_oc_tag() -> None:
 
 
 def check_11_rc_email_subject_in_sent() -> None:
-    """Verify email with correct subject exists in sent folder."""
+    """Verify email with the exact subject exists in james.whitfield's Sent Maildir."""
     try:
-        expected_subject = "Bi-Weekly Cross-Team Status Report - June 22 to July 3, 2026"
-        # Search in Dovecot maildir for the sent email
-        rc_code, out, err = docker_exec(
-            RC_CONTAINER,
-            "grep", "-rl", f"Subject: {expected_subject}",
-            "/var/mail/", timeout=20,
-        )
-        # Also check in /var/vmail/ if /var/mail/ doesn't have it
-        if not out.strip():
-            rc_code, out, err = docker_exec(
-                RC_CONTAINER,
-                "find", "/", "-path", "*/Sent*", "-name", "*.eml",
-                timeout=20,
-            )
-            if not out.strip():
-                rc_code, out, err = docker_exec(
-                    RC_CONTAINER,
-                    "bash", "-c",
-                    f"find /var -type f 2>/dev/null | head -500 | xargs grep -l 'Subject: {expected_subject}' 2>/dev/null || true",
-                    timeout=30,
-                )
-        passed = bool(out.strip())
-        check("11. RC email with correct subject in sent", 2, passed,
-              f"no matching email found" if not passed else "")
+        msg, path = _get_report_email()
+        passed = msg is not None
+        check("11. RC email with correct subject in sent", 1, passed,
+              f"found {path}" if passed
+              else "no mail with exact subject in james.whitfield/.Sent Maildir")
     except Exception as e:
-        check("11. RC email with correct subject in sent", 2, False, f"exception: {e}")
+        check("11. RC email with correct subject in sent", 1, False, f"exception: {e}")
 
 
 def check_12_rc_email_recipients() -> None:
-    """Verify email was sent to correct To recipients."""
+    """Verify To recipient set equality (parsed headers, not raw grep)."""
     try:
-        expected_to = ["jun.chen@onlyoffice.local", "amit.singh@onlyoffice.local", "laura.brown@onlyoffice.local"]
-        # Find the email file and check To header
-        rc_code, out, err = docker_exec(
-            RC_CONTAINER,
-            "bash", "-c",
-            "grep -rl 'Bi-Weekly Cross-Team Status Report' /var/mail/ 2>/dev/null || "
-            "grep -rl 'Bi-Weekly Cross-Team Status Report' /var/vmail/ 2>/dev/null || "
-            "grep -rl 'Bi-Weekly Cross-Team Status Report' /home/ 2>/dev/null || true",
-            timeout=20,
-        )
-        if not out.strip():
-            check("12. RC email recipients correct", 1, False, "email file not found")
+        expected_to = {
+            "jun.chen@onlyoffice.local",
+            "amit.singh@onlyoffice.local",
+            "laura.brown@onlyoffice.local",
+        }
+        msg, _ = _get_report_email()
+        if msg is None:
+            check("12. RC email To recipients exact set", 1, False, "sent email not found")
             return
-        email_file = out.strip().splitlines()[0]
-        rc_code, content, err = docker_exec(RC_CONTAINER, "cat", email_file, timeout=10)
-        found_all = all(addr in content for addr in expected_to)
-        missing = [a for a in expected_to if a not in content]
-        check("12. RC email recipients correct", 1, found_all,
-              f"missing: {missing}" if missing else "")
+        to_set = _addr_set(msg, "To")
+        passed = to_set == expected_to
+        check("12. RC email To recipients exact set", 1, passed,
+              f"got To={sorted(to_set)}")
     except Exception as e:
-        check("12. RC email recipients correct", 1, False, f"exception: {e}")
+        check("12. RC email To recipients exact set", 1, False, f"exception: {e}")
+
+
+def check_12b_rc_email_bcc() -> None:
+    """Verify Bcc set == {records@onlyoffice.local} on the sent copy."""
+    try:
+        msg, _ = _get_report_email()
+        if msg is None:
+            check("12b. RC email Bcc records@onlyoffice.local", 1, False, "sent email not found")
+            return
+        bcc_set = _addr_set(msg, "Bcc")
+        passed = bcc_set == {"records@onlyoffice.local"}
+        check("12b. RC email Bcc records@onlyoffice.local", 1, passed,
+              f"got Bcc={sorted(bcc_set)}")
+    except Exception as e:
+        check("12b. RC email Bcc records@onlyoffice.local", 1, False, f"exception: {e}")
 
 
 def check_13_rc_mdn_requested() -> None:
-    """Verify read receipt (MDN) was requested on the email."""
+    """Verify read receipt (MDN): Disposition-Notification-To parsed value == sender address."""
     try:
-        rc_code, out, err = docker_exec(
-            RC_CONTAINER,
-            "bash", "-c",
-            "grep -rl 'Bi-Weekly Cross-Team Status Report' /var/mail/ 2>/dev/null || "
-            "grep -rl 'Bi-Weekly Cross-Team Status Report' /var/vmail/ 2>/dev/null || true",
-            timeout=20,
-        )
-        if not out.strip():
-            check("13. RC read receipt (MDN) requested", 1, False, "email file not found")
+        msg, _ = _get_report_email()
+        if msg is None:
+            check("13. RC read receipt (MDN) requested", 1, False, "sent email not found")
             return
-        email_file = out.strip().splitlines()[0]
-        rc_code, content, err = docker_exec(RC_CONTAINER, "cat", email_file, timeout=10)
-        # MDN is indicated by Disposition-Notification-To header
-        passed = "Disposition-Notification-To" in content
+        mdn_set = _addr_set(msg, "Disposition-Notification-To")
+        passed = mdn_set == {SENDER_ADDR}
         check("13. RC read receipt (MDN) requested", 1, passed,
-              "no Disposition-Notification-To header" if not passed else "")
+              f"Disposition-Notification-To={sorted(mdn_set)} want [{SENDER_ADDR}]")
     except Exception as e:
         check("13. RC read receipt (MDN) requested", 1, False, f"exception: {e}")
 
 
 def check_14_rc_draft_interval() -> None:
-    """Verify auto-save draft interval set to 5 minutes."""
+    """Auto-save draft interval '5 minutes': structurally undecidable, kept at weight 0."""
+    label = "14. RC draft interval set to 5 min (not judged, weight 0)"
+    detail_base = (
+        "structurally undecidable: the image default draft_autosave is already 300s = 5 min "
+        "and Roundcube drops prefs equal to the server default, so a correct explicit setting "
+        "never persists to the DB while an absent pref is also the zero-action state"
+    )
     try:
-        sql = (
-            "SELECT preferences FROM users "
-            "WHERE username = 'james.whitfield@mail.local'"
+        out = rc_db_query(
+            "SELECT preferences FROM users WHERE username = 'james.whitfield@mail.local'"
         )
-        out = rc_db_query(sql)
-        if not out:
-            check("14. RC draft interval set to 5 min", 1, False, "user prefs not found")
-            return
-        # Roundcube stores prefs as serialized PHP. Check for draft_autosave value.
-        # The value for 5 minutes is typically 300 (seconds)
-        passed = ("draft_autosave" in out and ("300" in out or "5min" in out or '"5"' in out))
-        check("14. RC draft interval set to 5 min", 1, passed,
-              f"prefs snippet: ...{out[max(0,out.find('draft_autosave')-10):out.find('draft_autosave')+50]}..." if "draft_autosave" in out else "draft_autosave not in prefs")
+        m = re.search(r'"draft_autosave";(?:i:(\d+)|s:\d+:"(\d+)")', out or "")
+        val = (m.group(1) or m.group(2)) if m else None
+        check(label, 0, True, f"{detail_base}; observed draft_autosave={val!r}")
     except Exception as e:
-        check("14. RC draft interval set to 5 min", 1, False, f"exception: {e}")
+        check(label, 0, True, f"{detail_base}; prefs read failed: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     check_3_oo_document_exists()
+    check_3b_oo_document_content()
     check_4_oo_shared_junchen()
     check_5_oo_shared_amitsingh()
     check_6_oc_folder_structure()
@@ -387,6 +659,7 @@ def main() -> None:
     check_10_oc_tag()
     check_11_rc_email_subject_in_sent()
     check_12_rc_email_recipients()
+    check_12b_rc_email_bcc()
     check_13_rc_mdn_requested()
     check_14_rc_draft_interval()
 

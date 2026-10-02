@@ -36,6 +36,7 @@ for _var_name, _var_val in [
 
 FARMOS_SQLITE = "/opt/drupal/web/sites/default/files/.ht.sqlite"
 FARMOS_FILES_ROOT = "/opt/drupal/web/sites/default/files"
+FARMOS_PRIVATE_ROOT = "/opt/drupal/private"
 GROCY_DB_CANDIDATES = [
     "/config/data/grocy.db",
     "/config/data/data/grocy.db",
@@ -44,10 +45,18 @@ GROCY_DB_CANDIDATES = [
 
 SOURCE_LOG_NAME = "Spring Plowing Complete"
 SOURCE_ASSET_NAME = "Vineyard Block 1"
-BASE_NOTES = "Plowed 120 acres. Soil conditions excellent. Ready for planting."
+# This task used to compare two pre-attached farmOS photos and pick the higher-ranked one.
+# Neither the photos nor the `Vineyard Block 1` asset exist in the shipped image: farmOS has
+# no image bytes on disk at all (file_managed rows point at private://farm/... paths that
+# were never populated), the asset table has nothing matching "Vineyard", and only one
+# `Spring Plowing Complete` harvest log exists. The Drone-assisted photo the old rubric
+# expected as the answer (sha256 317c3ce0…) is absent from the whole clone, so the task was
+# unreachable by construction. It is now a single-photo classification: the agent is handed
+# the one photo that does exist and must attach it itself. See description.md.
 CANDIDATE_METHOD_BY_SHA256 = {
+    # tasks/multi-m/inputs/farmos_crop_021.jpg — stubble field with stacked harrow sections;
+    # no tractor, no self-propelled machine, no drone, so the rubric label is Manual.
     "0184ddd5515204b69cc87f1db84ffefa722fb0f4046a7dd0f742b01e35bd8922": "Manual",
-    "317c3ce01ab6cb8598a43335a61d518c926e906341946100236c8a252321e633": "Drone-assisted",
 }
 METHOD_RANK = {"Manual": 0, "Tractor-only": 1, "Drone-assisted": 2}
 EXPECTED_ATTACHMENT_SHA256 = max(
@@ -68,8 +77,9 @@ EXPECTED_ELABEL_INFO = (
     f"FIELD METHOD: {EXPECTED_METHOD}; FARMOS SOURCE: Spring Plowing Complete; "
     "Vineyard Block 1"
 )
+# The shipped `Spring Plowing Complete` log carries no notes, so there is no baseline text to
+# preserve — the notes must end up as exactly these two lines and nothing else.
 EXPECTED_FARMOS_LINES = (
-    BASE_NOTES,
     f"TRACEABILITY BATCH: {EXPECTED_BATCH}",
     f"FIELD METHOD: {EXPECTED_METHOD}",
 )
@@ -88,7 +98,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -104,7 +114,9 @@ def farmos_sql_json(query: str) -> list[dict]:
     )
     rc, stdout, stderr = docker_exec(FARMOS_CONTAINER, "php", "-r", php_script)
     if rc != 0:
-        raise RuntimeError(f"farmos php error (rc={rc}): {stderr.strip()}")
+        raise RuntimeError(f"farmos php error (rc={rc}): "
+                           # PHP CLI prints fatals to stdout, not stderr
+                           f"{(stderr.strip() or stdout.strip())[:400]}")
     return json.loads(stdout) if stdout.strip() else []
 
 
@@ -135,7 +147,9 @@ def grocy_sql_json(query: str) -> list[dict]:
     )
     rc, stdout, stderr = docker_exec(GROCY_CONTAINER, "php", "-r", php_script)
     if rc != 0:
-        raise RuntimeError(f"grocy php error (rc={rc}): {stderr.strip()}")
+        raise RuntimeError(f"grocy php error (rc={rc}): "
+                           # PHP CLI prints fatals to stdout, not stderr
+                           f"{(stderr.strip() or stdout.strip())[:400]}")
     return json.loads(stdout) if stdout.strip() else []
 
 
@@ -203,8 +217,19 @@ def _text_lines(text: str) -> list[str]:
 
 
 def _container_file_path(uri: str) -> str:
-    if uri.startswith("public://"):
-        return FARMOS_FILES_ROOT + "/" + uri.removeprefix("public://").lstrip("/")
+    # private:// must be handled, not just public://. farmOS files this image is configured
+    # with land under the private scheme (settings['file_private_path'] = '/opt/drupal/private',
+    # verified in a live container), so an image the agent uploads through the UI is recorded
+    # as e.g. private://farm/log/2026-09/foo.jpg. Resolving only public:// made this verifier
+    # reject the agent's own correctly-attached photo with "unsupported FarmOS file URI".
+    # agriculture_011's read_farmos_uri maps both schemes the same way.
+    for scheme, root in (("private://", FARMOS_PRIVATE_ROOT),
+                         ("public://", FARMOS_FILES_ROOT)):
+        if uri.startswith(scheme):
+            relative = uri.removeprefix(scheme).lstrip("/")
+            if not relative or ".." in relative.split("/"):
+                raise ValueError(f"unsafe FarmOS file URI: {uri!r}")
+            return root + "/" + relative
     if uri.startswith("/"):
         return uri
     raise ValueError(f"unsupported FarmOS file URI: {uri!r}")
@@ -217,7 +242,7 @@ def _attachment_sha256(uri: str) -> str:
         result = subprocess.run(
             ["docker", "cp", f"{FARMOS_CONTAINER}:{source_path}", local_path],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=30,
         )
         if result.returncode != 0:
@@ -237,15 +262,24 @@ _visual_source: tuple[dict, dict, str] | None = None
 def _load_candidate_logs() -> list[dict]:
     global _candidate_logs
     if _candidate_logs is None:
+        # Two separate reasons this must not compare log_field_data.name as plain text:
+        # DISTINCT deduplicates rows, and `name = '...'` compares the column directly. Either
+        # one makes SQLite resolve Drupal's custom NOCASE_UTF8 collation, which exists only
+        # inside a Drupal-managed connection, so over a plain PDO handle the query aborts with
+        #   PDOException: no such collation sequence: NOCASE_UTF8
+        # gating every check in this task to 0 regardless of what the agent did. COLLATE
+        # BINARY also gives the character-for-character match the task asks for; the join on
+        # log__asset yields at most one row per (log, asset) pair, so dropping DISTINCT
+        # changes no result. agriculture_003 / _011 / _016 / _031 query log names the same way.
         _candidate_logs = farmos_sql_json(
-            "SELECT DISTINCT lfd.id, lfd.name, lfd.type, "
+            "SELECT lfd.id, lfd.name, lfd.type, "
             "COALESCE(lfd.notes__value, '') AS notes, afd.name AS asset_name "
             "FROM log_field_data lfd "
             "JOIN log__asset la ON la.entity_id = lfd.id AND la.deleted = 0 "
             "JOIN asset_field_data afd ON afd.id = la.asset_target_id "
             "WHERE lfd.type = 'harvest' "
-            "AND lfd.name = 'Spring Plowing Complete' "
-            "AND afd.name = 'Vineyard Block 1' ORDER BY lfd.id"
+            "AND lfd.name COLLATE BINARY = 'Spring Plowing Complete' "
+            "AND afd.name COLLATE BINARY = 'Vineyard Block 1' ORDER BY lfd.id"
         )
     return _candidate_logs
 
@@ -291,8 +325,10 @@ def _find_visual_source() -> tuple[dict, dict, str]:
             )
         recognized.append((log, attachment, method, digest))
 
+    if not recognized:
+        raise RuntimeError("no candidate log carries a recognized classification image")
     digests = {match[3] for match in recognized}
-    if digests != set(CANDIDATE_METHOD_BY_SHA256):
+    if not digests <= set(CANDIDATE_METHOD_BY_SHA256):
         raise RuntimeError(
             f"candidate classification image set changed: found {sorted(digests)}"
         )
@@ -320,12 +356,13 @@ def check_1_farmos_visual_source_and_notes() -> None:
     global _farmos_ok, _source_log_id, _source_method
     try:
         candidates = _load_candidate_logs()
-        if len(candidates) != 2:
+        if len(candidates) != 1:
             check(
-                "1. FarmOS visual source and preserved notes",
+                "1. FarmOS visual source and trace lines",
                 5,
                 False,
-                f"expected two exact source candidates, found {len(candidates)}",
+                f"expected exactly one '{SOURCE_LOG_NAME}' harvest log linked to "
+                f"'{SOURCE_ASSET_NAME}', found {len(candidates)}",
             )
             return
         source_log, attachment, _source_method = _find_visual_source()
@@ -336,17 +373,12 @@ def check_1_farmos_visual_source_and_notes() -> None:
                 f"selected method={_source_method!r}, expected controlled class {EXPECTED_METHOD!r}"
             )
         if _text_lines(str(source_log.get("notes", ""))) != list(EXPECTED_FARMOS_LINES):
-            problems.append("selected record does not preserve baseline notes plus both exact trace lines")
-        for candidate in candidates:
-            if int(candidate["id"]) == _source_log_id:
-                continue
-            if _normalize(str(candidate.get("notes", ""))) != BASE_NOTES:
-                problems.append(f"non-selected candidate #{candidate['id']} was modified")
+            problems.append("record notes are not exactly the two required trace lines")
         if not str(attachment.get("filemime", "")).startswith("image/"):
             problems.append("selected attachment is not an image")
         _farmos_ok = not problems
         check(
-            "1. FarmOS visual source and preserved notes",
+            "1. FarmOS visual source and trace lines",
             5,
             _farmos_ok,
             f"log #{_source_log_id}, method={_source_method}, "
@@ -354,7 +386,7 @@ def check_1_farmos_visual_source_and_notes() -> None:
             if _farmos_ok else "; ".join(problems),
         )
     except Exception as exc:
-        check("1. FarmOS visual source and preserved notes", 5, False, f"exception: {exc}")
+        check("1. FarmOS visual source and trace lines", 5, False, f"exception: {exc}")
 
 
 def check_2_grocy_exact_trace_product() -> None:

@@ -1,0 +1,165 @@
+{{- if and .Values.gateway.enabled .Values.runRouter.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.routerName" . }}
+  labels:
+    {{- include "pg.routerLabels" . | nindent 4 }}
+data:
+  nginx.conf: |
+    {{- include "pg.runRouterConfig" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg.routerName" . }}
+  labels:
+    {{- include "pg.routerLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.runRouter.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "pg.routerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.routerSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/part-of: saas-playground
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+      annotations:
+        checksum/nginx-config: {{ include "pg.runRouterConfig" . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              {{- include "pg.routerSelectorLabels" . | nindent 14 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: router
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi /tmp/nginx-uwsgi /tmp/nginx-scgi
+              exec nginx -c /etc/saas-playground-router/nginx.conf -g 'daemon off;'
+          ports:
+            - name: http
+              containerPort: {{ .Values.runRouter.targetPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.runRouter.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/saas-playground-router
+              readOnly: true
+            - name: runtime
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pg.routerName" . }}
+        - name: runtime
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg.routerName" . }}
+  labels:
+    {{- include "pg.routerLabels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "pg.routerSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.runRouter.servicePort }}
+      targetPort: http
+---
+# Program the global Gateway once. Individual runs now create only a pod and ClusterIP Service;
+# NGINX resolves the run Service from the validated hostname inside the cluster.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "pg.name" . }}-runs
+  labels:
+    {{- include "pg.routerLabels" . | nindent 4 }}
+    saas-playground.route: "true"
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      sectionName: http
+    - name: {{ .Values.gateway.name }}
+      sectionName: https
+  hostnames:
+    - {{ .Values.gateway.wildcardHost | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ include "pg.routerName" . }}
+          port: {{ .Values.runRouter.servicePort }}
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: {{ include "pg.routerName" . }}-hc
+  labels:
+    {{- include "pg.routerLabels" . | nindent 4 }}
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck:
+        requestPath: /healthz
+        portSpecification: USE_SERVING_PORT
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "pg.routerName" . }}
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: {{ include "pg.routerName" . }}-backend
+  labels:
+    {{- include "pg.routerLabels" . | nindent 4 }}
+spec:
+  default:
+    timeoutSec: {{ .Values.runRouter.backendTimeoutSec }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "pg.routerName" . }}
+{{- end }}

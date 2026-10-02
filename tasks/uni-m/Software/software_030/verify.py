@@ -1,9 +1,20 @@
 """
 Verifier for Software-030-I1: Code Complexity Audit Across Three Workspace Projects
 
-Checks: 15 weighted checks across code-server, baserow, openproject.
-Strategy: Baserow via REST API, code-server via docker exec filesystem,
-          OpenProject via docker exec embedded postgres.
+Checks: 17 weighted checks (plus a 0pt ground-truth precheck) across
+code-server, baserow, openproject.
+Strategy: the verifier RECOMPUTES ground truth itself by re-running the three
+awk measurement commands from the task in a throwaway container from the
+code-server container's own pristine image (docker inspect → docker run), so
+agent edits to the live source tree cannot move the goalposts; every
+truth-dependent check is gated on that recomputed data. Agent-filled values
+are never trusted as a source of expectations.
+
+Dual-convention note: todo-api and data-analyzer each contain one empty
+`tests/__init__.py`, for which the task's awk command prints ",0,0,0.0"
+(empty File Path). A legal solution therefore has either 38 rows (named files
+only) or 40 rows (including the 2 empty-path rows). Both consistent conventions are
+accepted; the markdown report must agree with the table's convention.
 
 Required env vars:
   SERVER_HOSTNAME,
@@ -42,11 +53,15 @@ for var, val in _required.items():
 
 BASEROW_URL = f"http://{HOST}:{BASEROW_PORT}"
 
+AUDIT_DATE = "2025-05-15"
+EXPECTED_PROJECTS = ("blog-engine", "data-analyzer", "todo-api")
+
 # ── Result accumulator ────────────────────────────────────────────────────────
-_checks: list[tuple[str, int, bool, str]] = []
+_checks: list = []
 
 
 def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
+    detail = " ".join(str(detail).split())  # no newlines in detail
     _checks.append((label, weight, passed, detail))
     status = "PASS" if passed else "FAIL"
     tail = f"  ({detail})" if detail else ""
@@ -54,11 +69,33 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
+def docker_exec(container: str, *args: str, timeout: int = 15):
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
+    return r.returncode, r.stdout, r.stderr
+
+
+_pristine_image_cache: str | None = None
+
+
+def _pristine_image() -> str:
+    """The code-server container's own image ref — truth reads go here, immune to agent edits."""
+    global _pristine_image_cache
+    if _pristine_image_cache is None:
+        r = subprocess.run(["docker", "inspect", CODE_SERVER_CONTAINER, "--format", "{{.Image}}"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not r.stdout.strip():
+            raise RuntimeError(f"docker inspect failed: {r.stderr.strip()[:200]}")
+        _pristine_image_cache = r.stdout.strip()
+    return _pristine_image_cache
+
+
+def image_exec(*args: str, timeout: int = 60) -> tuple[int, str, str]:
+    """Run a command in a throwaway container from the PRISTINE image (not the live one)."""
+    r = subprocess.run(["docker", "run", "--rm", "--entrypoint", args[0], _pristine_image(), *args[1:]],
+                       capture_output=True, text=True, errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -75,7 +112,7 @@ def baserow_auth() -> str:
     return data.get("access_token") or data.get("token", "")
 
 
-def baserow_get(path: str, token: str, params: dict | None = None) -> dict | list:
+def baserow_get(path: str, token: str, params: dict = None):
     resp = requests.get(
         f"{BASEROW_URL}/api{path}",
         headers={"Authorization": f"JWT {token}"},
@@ -87,28 +124,142 @@ def baserow_get(path: str, token: str, params: dict | None = None) -> dict | lis
 
 
 def op_db_query(sql: str) -> str:
-    """Query OpenProject embedded postgres."""
+    """Query OpenProject embedded postgres (single-value / simple queries)."""
     rc, out, err = docker_exec(
         OPENPROJECT_CONTAINER,
-        "psql", "-U", "openproject", "-d", "openproject",
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
         "-t", "-A", "-c", sql,
         timeout=15,
     )
-    return out.strip()
+    return out.strip("\r\n")  # NOT .strip(): \x1f is Python whitespace and would eat the last row's trailing field sep
+
+
+def op_db_query_rows(sql: str):
+    """Query OpenProject postgres with unit/record separators so multi-row
+    results (and descriptions containing newlines) split per-row safely.
+
+    Returns list of field lists, or None on psql error."""
+    rc, out, err = docker_exec(
+        OPENPROJECT_CONTAINER,
+        "env", "PGPASSWORD=openproject", "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
+        "-t", "-A", "-F", "\x1f", "-R", "\x1e", "-c", sql,
+        timeout=15,
+    )
+    if rc != 0:
+        return None
+    rows = []
+    for rec in out.split("\x1e"):
+        if rec.strip():
+            rows.append(rec.split("\x1f"))
+    return rows
+
+
+# ── Ground truth: re-run the three task awk commands (pristine image) ─────────
+# Each command is stored as a single bash -c string (raw string: the \n inside
+# the awk printf and the trailing \; must reach bash literally).
+AWK_COMMANDS = {
+    "todo-api": r"""cd /home/coder/workspace/todo-api && find app tests -type f -name "*.py" -exec awk 'BEGIN{OFS=","} FNR==1{f=FILENAME; loc=0; fn=0; tl=0} {loc++} /^[[:space:]]*def[[:space:]]/{fn++} END{printf "%s,%d,%d,%.1f\n", f, loc, fn, (fn>0?loc/fn:0)}' {} \;""",
+    "data-analyzer": r"""cd /home/coder/workspace/data-analyzer && find src tests scripts -type f -name "*.py" -exec awk 'BEGIN{OFS=","} FNR==1{f=FILENAME; loc=0; fn=0} {loc++} /^[[:space:]]*def[[:space:]]/{fn++} END{printf "%s,%d,%d,%.1f\n", f, loc, fn, (fn>0?loc/fn:0)}' {} \;""",
+    "blog-engine": r"""cd /home/coder/workspace/blog-engine && find src -type f -name "*.js" -exec awk 'BEGIN{OFS=","} FNR==1{f=FILENAME; loc=0; fn=0} {loc++} /function[[:space:]]|=>|^[[:space:]]*[a-zA-Z_]+[[:space:]]*\(/{fn++} END{printf "%s,%d,%d,%.1f\n", f, loc, fn, (fn>0?loc/fn:0)}' {} \;""",
+}
+
+
+def _band_for(loc: int, avg: float) -> str:
+    if loc >= 1000 or avg >= 40:
+        return "Critical"
+    if loc >= 500 or avg >= 25:
+        return "High"
+    if loc >= 200:
+        return "Medium"
+    return "Low"
+
+
+def compute_truth():
+    """Re-run the three awk commands and parse per-file metrics.
+
+    Returns dict with:
+      named:   [entry] for rows with a non-empty File Path, sorted by
+               (project, path)
+      empties: [entry] for empty-file rows (File Path == "")
+      by_key:  {(project, path): entry} incl. one entry per empty-path project
+    or None if any command fails / parses empty (truth-dependent checks must
+    then FAIL — no fallback to agent data)."""
+    named, empties = [], []
+    for project in EXPECTED_PROJECTS:
+        cmd = AWK_COMMANDS[project]
+        try:
+            rc, out, err = image_exec("bash", "-c", cmd, timeout=120)
+        except Exception:
+            return None
+        if rc != 0 or not out.strip():
+            return None
+        for line in out.splitlines():
+            line = line.rstrip("\r")
+            if line.strip() == "":
+                # skip fully blank lines only; the empty-file row ",0,0,0.0"
+                # still contains digits and is parsed below
+                continue
+            parts = line.split(",")
+            if len(parts) < 4:
+                return None
+            path = ",".join(parts[:-3])
+            try:
+                loc = int(parts[-3])
+                fn = int(parts[-2])
+                avg_str = parts[-1].strip()
+                avg = float(avg_str)
+            except ValueError:
+                return None
+            entry = {
+                "project": project, "path": path, "loc": loc, "fn": fn,
+                "avg_str": avg_str, "avg": avg, "band": _band_for(loc, avg),
+            }
+            (empties if path == "" else named).append(entry)
+    if not named:
+        return None
+    named.sort(key=lambda e: (e["project"], e["path"]))
+    by_key = {}
+    for e in named + empties:
+        by_key[(e["project"], e["path"])] = e
+    # named (project, path) must be unique for 1-1 accounting
+    if len({(e["project"], e["path"]) for e in named}) != len(named):
+        return None
+    return {"named": named, "empties": empties, "by_key": by_key}
+
+
+def truth_top10(truth):
+    """Expected OpenProject WP source rows: High/Critical, ordered by
+    Lines Of Code desc then File Path asc, first 10."""
+    hc = [e for e in truth["named"] if e["band"] in ("High", "Critical")]
+    hc.sort(key=lambda e: (-e["loc"], e["path"], e["project"]))
+    return hc[:10]
+
+
+def wp_subject_for(e) -> str:
+    return f"Refactor: {e['path']} ({e['loc']} LOC, {e['avg_str']} avg fn length)"
+
+
+def truth_band_counts(truth):
+    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+    for e in truth["named"]:
+        counts[e["band"]] += 1
+    return counts
 
 
 # ── Shared state for cross-check consistency ──────────────────────────────────
-_baserow_rows = []  # populated by check_3
-_baserow_table_id = None  # populated by check_2
+_TRUTH = None        # set in main()
+_baserow_rows = []   # populated by check_3 (all rows)
+_rows_clean = []     # populated by check_3 (placeholder rows removed)
+_caliber = None      # "named" (38) or "all" (40), set by check_3
+_baserow_table_id = None
 
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
-def check_1_baserow_database_exists() -> dict | None:
+def check_1_baserow_database_exists():
     """Baserow database 'Code Complexity Audit Q2 2025' exists."""
     try:
         token = baserow_auth()
-        # List all applications (databases)
         apps = baserow_get("/applications/", token)
         target_db = None
         for app in apps:
@@ -124,11 +275,13 @@ def check_1_baserow_database_exists() -> dict | None:
         return None
 
 
-def check_2_table_and_fields(ctx: dict | None) -> dict | None:
-    """Table 'Complexity Metrics' exists with required fields."""
+def check_2_table_and_fields(ctx):
+    """Table 'Complexity Metrics' exists with exactly the required field
+    schema (names, primary, types, select options, decimal places)."""
     global _baserow_table_id
+    label = "2. Table 'Complexity Metrics' field schema exact"
     if not ctx or not ctx.get("db"):
-        check("2. Table 'Complexity Metrics' with required fields", 2, False, "no DB context")
+        check(label, 2, False, "no DB context")
         return ctx
     try:
         token = ctx["token"]
@@ -140,37 +293,111 @@ def check_2_table_and_fields(ctx: dict | None) -> dict | None:
                 target_table = t
                 break
         if not target_table:
-            check("2. Table 'Complexity Metrics' with required fields", 2, False, "table not found")
+            check(label, 2, False, "table not found")
             return ctx
         table_id = target_table["id"]
         _baserow_table_id = table_id
-        # Get fields
         fields = baserow_get(f"/database/fields/table/{table_id}/", token)
-        field_names = {f["name"] for f in fields}
+        fmap = {f["name"]: f for f in fields}
+        ctx["table_id"] = table_id
+        ctx["fields"] = fmap
+
         required_fields = {"Metric ID", "Project", "File Path", "Lines Of Code",
                            "Function Count", "Avg Function Length", "Complexity Band", "Captured At"}
-        missing = required_fields - field_names
-        passed = len(missing) == 0
-        detail = f"table id={table_id}, fields OK" if passed else f"missing fields: {missing}"
-        check("2. Table 'Complexity Metrics' with required fields", 2, passed, detail)
-        ctx["table_id"] = table_id
-        ctx["fields"] = {f["name"]: f for f in fields}
+        problems = []
+        names = set(fmap)
+        if names != required_fields:
+            missing = required_fields - names
+            extra = names - required_fields
+            problems.append(f"field name set mismatch: missing={sorted(missing)}, extra={sorted(extra)}")
+
+        def opt_values(f):
+            return {o.get("value") for o in (f.get("select_options") or [])}
+
+        f = fmap.get("Metric ID")
+        if f and not (f.get("primary") is True and f.get("type") == "text"):
+            problems.append(f"Metric ID: expected primary text, got primary={f.get('primary')} type={f.get('type')}")
+        f = fmap.get("Project")
+        if f:
+            if f.get("type") != "single_select":
+                problems.append(f"Project: expected single_select, got {f.get('type')}")
+            elif opt_values(f) != set(EXPECTED_PROJECTS):
+                problems.append(f"Project options != {sorted(EXPECTED_PROJECTS)}: got {sorted(opt_values(f))}")
+        f = fmap.get("File Path")
+        if f and f.get("type") != "text":
+            problems.append(f"File Path: expected text, got {f.get('type')}")
+        for name in ("Lines Of Code", "Function Count"):
+            f = fmap.get(name)
+            if f and f.get("type") != "number":
+                problems.append(f"{name}: expected number, got {f.get('type')}")
+        f = fmap.get("Avg Function Length")
+        if f:
+            if f.get("type") != "number":
+                problems.append(f"Avg Function Length: expected number, got {f.get('type')}")
+            elif f.get("number_decimal_places") != 1:
+                problems.append(f"Avg Function Length: expected 1 decimal place, got {f.get('number_decimal_places')}")
+        f = fmap.get("Complexity Band")
+        if f:
+            if f.get("type") != "single_select":
+                problems.append(f"Complexity Band: expected single_select, got {f.get('type')}")
+            elif opt_values(f) != {"Low", "Medium", "High", "Critical"}:
+                problems.append(f"Complexity Band options != Low/Medium/High/Critical: got {sorted(opt_values(f))}")
+        f = fmap.get("Captured At")
+        if f and f.get("type") != "date":
+            problems.append(f"Captured At: expected date, got {f.get('type')}")
+
+        passed = len(problems) == 0
+        check(label, 2, passed,
+              f"table id={table_id}, schema OK" if passed else "; ".join(problems)[:400])
         return ctx
     except Exception as e:
-        check("2. Table 'Complexity Metrics' with required fields", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
         return ctx
 
 
-def check_3_rows_cover_all_projects(ctx: dict | None) -> None:
-    """Rows exist for all 3 projects: blog-engine, data-analyzer, todo-api."""
-    global _baserow_rows
+def _get_field_value(row: dict, field_name: str, fields: dict):
+    """Get a field value from a row, trying both name-based and field_id-based keys."""
+    val = row.get(field_name)
+    if val is not None:
+        return val
+    field_info = fields.get(field_name, {})
+    field_key = f"field_{field_info.get('id', '')}"
+    return row.get(field_key)
+
+
+def _scalar(row: dict, field_name: str, fields: dict):
+    """Field value reduced to a scalar (single-select dicts -> their value)."""
+    val = _get_field_value(row, field_name, fields)
+    if isinstance(val, dict):
+        val = val.get("value", "")
+    return val
+
+
+def _is_blank_placeholder_row(row: dict, fields: dict) -> bool:
+    """Skip Baserow's auto-created blank placeholder rows: every checked
+    field is empty/default (text '', None, or boolean false)."""
+    for name in ("Metric ID", "Project", "File Path", "Lines Of Code",
+                 "Function Count", "Avg Function Length", "Complexity Band",
+                 "Captured At"):
+        val = _scalar(row, name, fields)
+        if val not in (None, "", False, "false", "False"):
+            return False
+    return True
+
+
+def check_3_rows_match_truth(ctx):
+    """Table rows match the recomputed awk ground truth 1-1 (rows, per-row
+    LOC / Function Count / Avg Function Length), tolerating both consistent
+    conventions: 38 named rows, or 38+2 empty-path rows = 40."""
+    global _baserow_rows, _rows_clean, _caliber
+    label = "3. Table rows match recomputed awk ground truth"
     if not ctx or "table_id" not in ctx:
-        check("3. Rows cover all 3 projects", 2, False, "no table context")
+        check(label, 2, False, "no table context")
         return
     try:
         token = ctx["token"]
         table_id = ctx["table_id"]
-        # Fetch all rows (expect not too many, <200)
+        fields = ctx.get("fields", {})
         page = 1
         all_rows = []
         while True:
@@ -181,184 +408,198 @@ def check_3_rows_cover_all_projects(ctx: dict | None) -> None:
                 break
             page += 1
         _baserow_rows = all_rows
+        _rows_clean = [r for r in all_rows if not _is_blank_placeholder_row(r, fields)]
 
-        # Extract project values — could be dict (single_select) or string
-        projects_found = set()
-        for row in all_rows:
-            proj_val = row.get("Project") or row.get("field_Project")
-            # Single-select fields return {"id": ..., "value": "..."} or just a string
-            if isinstance(proj_val, dict):
-                proj_val = proj_val.get("value", "")
-            if proj_val:
-                projects_found.add(proj_val)
+        if _TRUTH is None:
+            check(label, 2, False, "ground truth recompute failed; cannot verify table")
+            return
 
-        # If field names are by field_id, try to find them
-        if not projects_found and all_rows:
-            # Fields might be keyed by field_<id>
-            fields = ctx.get("fields", {})
-            proj_field = fields.get("Project", {})
-            proj_field_key = f"field_{proj_field.get('id', '')}"
-            for row in all_rows:
-                proj_val = row.get(proj_field_key)
-                if isinstance(proj_val, dict):
-                    proj_val = proj_val.get("value", "")
-                if proj_val:
-                    projects_found.add(proj_val)
+        named = _TRUTH["named"]
+        empties = _TRUTH["empties"]
+        n_named, n_all = len(named), len(named) + len(empties)
+        rows = _rows_clean
 
-        expected_projects = {"blog-engine", "data-analyzer", "todo-api"}
-        missing = expected_projects - projects_found
-        passed = len(missing) == 0 and len(all_rows) > 0
-        check("3. Rows cover all 3 projects", 2, passed,
-              f"{len(all_rows)} rows, projects={projects_found}" if passed
-              else f"{len(all_rows)} rows, missing projects: {missing}")
-    except Exception as e:
-        check("3. Rows cover all 3 projects", 2, False, f"exception: {e}")
+        if len(rows) == n_named:
+            _caliber = "named"
+            expected = list(named)
+        elif empties and len(rows) == n_all:
+            _caliber = "all"
+            expected = list(named) + list(empties)
+        else:
+            check(label, 2, False,
+                  f"row count {len(rows)} != {n_named} (named files) and != {n_all} (incl. empty-path rows)")
+            return
 
+        pool = {}
+        for e in expected:
+            pool.setdefault((e["project"], e["path"]), []).append(e)
 
-def _get_field_value(row: dict, field_name: str, fields: dict) -> object:
-    """Get a field value from a row, trying both name-based and field_id-based keys."""
-    val = row.get(field_name)
-    if val is not None:
-        return val
-    field_info = fields.get(field_name, {})
-    field_key = f"field_{field_info.get('id', '')}"
-    return row.get(field_key)
-
-
-def check_4_metric_ids_sequential(ctx: dict | None) -> None:
-    """Metric IDs follow CM-NNN format starting at CM-001."""
-    if not _baserow_rows or not ctx:
-        check("4. Metric IDs follow CM-NNN format sequentially", 1, False, "no rows")
-        return
-    try:
-        fields = ctx.get("fields", {})
-        ids = []
-        for row in _baserow_rows:
-            mid = _get_field_value(row, "Metric ID", fields)
-            if isinstance(mid, dict):
-                mid = mid.get("value", "")
-            ids.append(str(mid) if mid else "")
-
-        # Check format CM-NNN
-        pattern = re.compile(r"^CM-(\d{3})$")
-        valid = all(pattern.match(i) for i in ids if i)
-        # Check sequential from 001
-        nums = []
-        for i in ids:
-            m = pattern.match(i) if i else None
-            if m:
-                nums.append(int(m.group(1)))
-        expected_seq = list(range(1, len(nums) + 1))
-        sequential = nums == expected_seq
-        passed = valid and sequential and len(nums) > 0
-        check("4. Metric IDs follow CM-NNN format sequentially", 1, passed,
-              f"{len(nums)} IDs, first={ids[0] if ids else '?'}, last={ids[-1] if ids else '?'}"
-              if passed else f"valid={valid}, sequential={sequential}, ids_sample={ids[:3]}")
-    except Exception as e:
-        check("4. Metric IDs follow CM-NNN format sequentially", 1, False, f"exception: {e}")
-
-
-def check_5_complexity_band_correct(ctx: dict | None) -> None:
-    """Complexity Band correctly assigned per LOC/avg-fn-length thresholds."""
-    if not _baserow_rows or not ctx:
-        check("5. Complexity Band assigned correctly per thresholds", 2, False, "no rows")
-        return
-    try:
-        fields = ctx.get("fields", {})
-        mismatches = []
-        for row in _baserow_rows:
-            loc_val = _get_field_value(row, "Lines Of Code", fields)
-            avg_val = _get_field_value(row, "Avg Function Length", fields)
-            band_val = _get_field_value(row, "Complexity Band", fields)
-            mid_val = _get_field_value(row, "Metric ID", fields)
-            if isinstance(mid_val, dict):
-                mid_val = mid_val.get("value", "")
-
-            loc = int(loc_val) if loc_val is not None else 0
+        problems = []
+        for idx, row in enumerate(rows, 1):
+            proj = str(_scalar(row, "Project", fields) or "")
+            path = str(_scalar(row, "File Path", fields) or "")
+            key = (proj, path)
+            bucket = pool.get(key)
+            if not bucket:
+                problems.append(f"row {idx} ({proj},{path or '<empty>'}) not in truth (or duplicated)")
+                continue
+            e = bucket.pop()
+            if not bucket:
+                del pool[key]
             try:
-                avg = float(avg_val) if avg_val is not None else 0.0
-            except (ValueError, TypeError):
-                avg = 0.0
+                loc = float(_scalar(row, "Lines Of Code", fields))
+                fn = float(_scalar(row, "Function Count", fields))
+                avg = float(_scalar(row, "Avg Function Length", fields))
+            except (TypeError, ValueError):
+                problems.append(f"row {idx} ({proj},{path or '<empty>'}): non-numeric LOC/FN/avg")
+                continue
+            if abs(loc - e["loc"]) > 1e-6:
+                problems.append(f"({proj},{path or '<empty>'}): LOC {loc} != {e['loc']}")
+            if abs(fn - e["fn"]) > 1e-6:
+                problems.append(f"({proj},{path or '<empty>'}): FN {fn} != {e['fn']}")
+            if abs(avg - e["avg"]) > 0.05:
+                problems.append(f"({proj},{path or '<empty>'}): avg {avg} != {e['avg_str']}")
+            if path == "":
+                band = str(_scalar(row, "Complexity Band", fields) or "")
+                if band != "Low":
+                    problems.append(f"empty-path row ({proj}): Band '{band}' != 'Low'")
 
-            if isinstance(band_val, dict):
-                band = band_val.get("value", "")
-            else:
-                band = str(band_val) if band_val else ""
+        leftover = sum(len(v) for v in pool.values())
+        if leftover:
+            missing_keys = [f"({p},{fp or '<empty>'})" for (p, fp) in pool][:3]
+            problems.append(f"{leftover} truth rows missing from table, e.g. {missing_keys}")
 
-            # Determine expected band
-            if loc >= 1000 or avg >= 40:
-                expected = "Critical"
-            elif loc >= 500 or avg >= 25:
-                expected = "High"
-            elif loc >= 200:
-                expected = "Medium"
-            else:
-                expected = "Low"
-
-            if band != expected:
-                mismatches.append(f"{mid_val}: got '{band}' expected '{expected}' (LOC={loc}, avg={avg})")
-
-        passed = len(mismatches) == 0 and len(_baserow_rows) > 0
-        check("5. Complexity Band assigned correctly per thresholds", 2, passed,
-              f"all {len(_baserow_rows)} rows correct" if passed
-              else f"{len(mismatches)} mismatches: {mismatches[:3]}")
+        passed = len(problems) == 0
+        check(label, 2, passed,
+              f"{len(rows)} rows match truth ({_caliber} convention)" if passed
+              else f"{len(problems)} problems: " + "; ".join(problems[:4])[:350])
     except Exception as e:
-        check("5. Complexity Band assigned correctly per thresholds", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-def check_6_captured_at_date(ctx: dict | None) -> None:
+def check_4_metric_ids_sequential(ctx):
+    """Metric IDs are exactly CM-001..CM-0NN, contiguous over ALL rows in
+    physical row order (N = 38 or 40 per the truth convention); blank IDs fail."""
+    label = "4. Metric IDs exactly CM-001..CM-0NN in row order"
+    if not ctx:
+        check(label, 1, False, "no table context")
+        return
+    if _TRUTH is None:
+        check(label, 1, False, "ground truth recompute failed")
+        return
+    if not _rows_clean:
+        check(label, 1, False, "no rows")
+        return
+    try:
+        fields = ctx.get("fields", {})
+        n_named = len(_TRUTH["named"])
+        n_all = n_named + len(_TRUTH["empties"])
+        ids = [str(_scalar(row, "Metric ID", fields) or "") for row in _rows_clean]
+        expected_ids = [f"CM-{i:03d}" for i in range(1, len(ids) + 1)]
+        count_ok = len(ids) in {n_named, n_all}
+        seq_ok = ids == expected_ids
+        passed = count_ok and seq_ok
+        if passed:
+            detail = f"{len(ids)} IDs, CM-001..{expected_ids[-1]}"
+        else:
+            first_bad = next((f"row {i + 1}: got '{a}' expected '{b}'"
+                              for i, (a, b) in enumerate(zip(ids, expected_ids)) if a != b), "")
+            detail = f"count_ok={count_ok} ({len(ids)} rows), sequential={seq_ok} {first_bad}"
+        check(label, 1, passed, detail)
+    except Exception as e:
+        check(label, 1, False, f"exception: {e}")
+
+
+def check_5_complexity_band_correct(ctx):
+    """Complexity Band per row equals the band recomputed from the TRUTH
+    LOC/avg values (not from the row's own numbers)."""
+    label = "5. Complexity Band matches truth-derived thresholds"
+    if not ctx:
+        check(label, 2, False, "no table context")
+        return
+    if _TRUTH is None:
+        check(label, 2, False, "ground truth recompute failed")
+        return
+    if not _rows_clean:
+        check(label, 2, False, "no rows")
+        return
+    try:
+        fields = ctx.get("fields", {})
+        by_key = _TRUTH["by_key"]
+        mismatches = []
+        for row in _rows_clean:
+            proj = str(_scalar(row, "Project", fields) or "")
+            path = str(_scalar(row, "File Path", fields) or "")
+            band = str(_scalar(row, "Complexity Band", fields) or "")
+            e = by_key.get((proj, path))
+            if e is None:
+                mismatches.append(f"({proj},{path or '<empty>'}): not in truth")
+                continue
+            if band != e["band"]:
+                mismatches.append(
+                    f"({proj},{path or '<empty>'}): got '{band}' expected '{e['band']}' "
+                    f"(truth LOC={e['loc']}, avg={e['avg_str']})")
+        passed = len(mismatches) == 0
+        check(label, 2, passed,
+              f"all {len(_rows_clean)} rows correct" if passed
+              else f"{len(mismatches)} mismatches: " + "; ".join(mismatches[:3])[:300])
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
+def check_6_captured_at_date(ctx):
     """All rows have Captured At = 2025-05-15."""
-    if not _baserow_rows or not ctx:
+    if not _rows_clean or not ctx:
         check("6. All rows have Captured At = 2025-05-15", 1, False, "no rows")
         return
     try:
         fields = ctx.get("fields", {})
         wrong = 0
-        for row in _baserow_rows:
-            cap_val = _get_field_value(row, "Captured At", fields)
+        for row in _rows_clean:
+            cap_val = _scalar(row, "Captured At", fields)
             date_str = str(cap_val) if cap_val else ""
-            if "2025-05-15" not in date_str:
+            if AUDIT_DATE not in date_str:
                 wrong += 1
-        passed = wrong == 0 and len(_baserow_rows) > 0
+        passed = wrong == 0 and len(_rows_clean) > 0
         check("6. All rows have Captured At = 2025-05-15", 1, passed,
-              f"all {len(_baserow_rows)} rows OK" if passed else f"{wrong} rows with wrong date")
+              f"all {len(_rows_clean)} rows OK" if passed else f"{wrong} rows with wrong date")
     except Exception as e:
         check("6. All rows have Captured At = 2025-05-15", 1, False, f"exception: {e}")
 
 
-def check_7_row_ordering(ctx: dict | None) -> None:
+def check_7_row_ordering(ctx):
     """Rows ordered by Project ascending, then File Path ascending."""
-    if not _baserow_rows or not ctx:
+    if not _rows_clean or not ctx:
         check("7. Rows ordered by Project asc, File Path asc", 2, False, "no rows")
         return
     try:
         fields = ctx.get("fields", {})
         pairs = []
-        for row in _baserow_rows:
-            proj_val = _get_field_value(row, "Project", fields)
-            fp_val = _get_field_value(row, "File Path", fields)
-            if isinstance(proj_val, dict):
-                proj_val = proj_val.get("value", "")
-            proj = str(proj_val) if proj_val else ""
-            fp = str(fp_val) if fp_val else ""
+        for row in _rows_clean:
+            proj = str(_scalar(row, "Project", fields) or "")
+            fp = str(_scalar(row, "File Path", fields) or "")
             pairs.append((proj, fp))
         sorted_pairs = sorted(pairs, key=lambda x: (x[0], x[1]))
         passed = pairs == sorted_pairs and len(pairs) > 0
         check("7. Rows ordered by Project asc, File Path asc", 2, passed,
               f"{len(pairs)} rows in correct order" if passed
-              else f"order mismatch at first diff")
+              else "order mismatch at first diff")
     except Exception as e:
         check("7. Rows ordered by Project asc, File Path asc", 2, False, f"exception: {e}")
 
 
-def check_8_top_offenders_view(ctx: dict | None) -> None:
-    """'Top Offenders' Grid view exists with filter on High/Critical and sort by LOC desc."""
+def check_8_top_offenders_view(ctx):
+    """'Top Offenders' Grid view: filter semantics = Complexity Band IN
+    (High, Critical) (both legal encodings accepted) and exactly one sort:
+    Lines Of Code DESC."""
+    label = "8. 'Top Offenders' grid view filter/sort exact"
     if not ctx or "table_id" not in ctx:
-        check("8. 'Top Offenders' Grid view exists", 2, False, "no table context")
+        check(label, 2, False, "no table context")
         return
     try:
         token = ctx["token"]
         table_id = ctx["table_id"]
+        fields = ctx.get("fields", {})
         views = baserow_get(f"/database/views/table/{table_id}/", token)
         target = None
         for v in views:
@@ -366,31 +607,72 @@ def check_8_top_offenders_view(ctx: dict | None) -> None:
                 target = v
                 break
         if not target:
-            check("8. 'Top Offenders' Grid view exists", 2, False, "view not found")
+            check(label, 2, False, "view not found")
             return
         is_grid = target.get("type") == "grid"
-        # Check filters and sorts via view detail
         view_id = target["id"]
-        # Get filters
         filters_data = baserow_get(f"/database/views/{view_id}/filters/", token)
-        # Get sorts
         sorts_data = baserow_get(f"/database/views/{view_id}/sortings/", token)
+        if not isinstance(filters_data, list):
+            filters_data = []
+        if not isinstance(sorts_data, list):
+            sorts_data = []
 
-        has_filter = len(filters_data) > 0 if isinstance(filters_data, list) else False
-        has_sort = len(sorts_data) > 0 if isinstance(sorts_data, list) else False
+        band_field = fields.get("Complexity Band") or {}
+        loc_field = fields.get("Lines Of Code") or {}
+        band_id = band_field.get("id")
+        loc_id = loc_field.get("id")
+        opt_ids = {o.get("value"): o.get("id") for o in (band_field.get("select_options") or [])}
+        want_ids = {opt_ids.get("High"), opt_ids.get("Critical")}
+        want_known = None not in want_ids
 
-        passed = is_grid and (has_filter or has_sort)
-        check("8. 'Top Offenders' Grid view exists", 2, passed,
-              f"grid={is_grid}, filters={len(filters_data) if isinstance(filters_data, list) else '?'}, "
-              f"sorts={len(sorts_data) if isinstance(sorts_data, list) else '?'}")
+        def _val_ids(raw):
+            out = set()
+            for part in str(raw).split(","):
+                part = part.strip()
+                if part.isdigit():
+                    out.add(int(part))
+            return out
+
+        filter_ok = False
+        filter_why = f"{len(filters_data)} filters"
+        if not want_known or band_id is None:
+            filter_why = "High/Critical option ids unresolved"
+        elif len(filters_data) == 1:
+            f = filters_data[0]
+            filter_ok = (f.get("field") == band_id
+                         and f.get("type") == "single_select_is_any_of"
+                         and _val_ids(f.get("value")) == want_ids)
+            filter_why = f"single filter field={f.get('field')} type={f.get('type')} value={f.get('value')}"
+        elif len(filters_data) == 2:
+            vals = set()
+            shape_ok = True
+            for f in filters_data:
+                if f.get("field") != band_id or f.get("type") != "single_select_equal":
+                    shape_ok = False
+                vals |= _val_ids(f.get("value"))
+            filter_ok = (shape_ok and vals == want_ids
+                         and target.get("filter_type") == "OR")
+            filter_why = (f"2 filters shape_ok={shape_ok} values={sorted(vals)} "
+                          f"filter_type={target.get('filter_type')}")
+
+        sort_ok = (len(sorts_data) == 1
+                   and sorts_data[0].get("field") == loc_id
+                   and sorts_data[0].get("order") == "DESC")
+        sort_why = (f"{len(sorts_data)} sorts" if len(sorts_data) != 1 else
+                    f"sort field={sorts_data[0].get('field')} order={sorts_data[0].get('order')}")
+
+        passed = is_grid and filter_ok and sort_ok
+        check(label, 2, passed,
+              f"grid={is_grid}; filter: {filter_why}; sort: {sort_why}"[:350])
     except Exception as e:
-        check("8. 'Top Offenders' Grid view exists", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-def check_9_by_band_kanban_view(ctx: dict | None) -> None:
-    """'By Band' Kanban view exists stacked by Complexity Band."""
+def check_9_by_band_gallery_view(ctx):
+    """'By Band' Gallery view exists."""
     if not ctx or "table_id" not in ctx:
-        check("9. 'By Band' Kanban view exists", 1, False, "no table context")
+        check("9. 'By Band' Gallery view exists", 1, False, "no table context")
         return
     try:
         token = ctx["token"]
@@ -402,155 +684,206 @@ def check_9_by_band_kanban_view(ctx: dict | None) -> None:
                 target = v
                 break
         if not target:
-            check("9. 'By Band' Kanban view exists", 1, False, "view not found")
+            check("9. 'By Band' Gallery view exists", 1, False, "view not found")
             return
-        is_kanban = target.get("type") == "kanban"
-        check("9. 'By Band' Kanban view exists", 1, is_kanban,
+        is_gallery = target.get("type") == "gallery"
+        check("9. 'By Band' Gallery view exists", 1, is_gallery,
               f"type={target.get('type')}")
     except Exception as e:
-        check("9. 'By Band' Kanban view exists", 1, False, f"exception: {e}")
+        check("9. 'By Band' Gallery view exists", 1, False, f"exception: {e}")
 
 
-def check_10_audit_file_exists() -> list[str]:
-    """File devops-configs/docs/complexity-audit-2025-05-15.md exists in code-server."""
+def check_10_audit_file_exists():
+    """File devops-configs/docs/complexity-audit-2025-05-15.md exists with
+    exactly five lines."""
+    label = "10. Audit markdown file exists with exactly 5 lines"
     try:
         rc, out, err = docker_exec(
             CODE_SERVER_CONTAINER, "cat",
-            "/home/coder/project/devops-configs/docs/complexity-audit-2025-05-15.md",
+            "/home/coder/workspace/devops-configs/docs/complexity-audit-2025-05-15.md",
             timeout=10,
         )
         if rc != 0:
-            # Try alternate path
-            rc, out, err = docker_exec(
-                CODE_SERVER_CONTAINER, "cat",
-                "/home/coder/devops-configs/docs/complexity-audit-2025-05-15.md",
-                timeout=10,
-            )
-        lines = out.strip().split("\n") if rc == 0 and out.strip() else []
-        check("10. Audit markdown file exists in code-server", 1, rc == 0 and len(lines) >= 5,
-              f"{len(lines)} lines" if rc == 0 else f"file not found (rc={rc})")
+            check(label, 1, False, f"file not found (rc={rc})")
+            return []
+        lines = [l.rstrip("\r") for l in out.rstrip("\n").split("\n")] if out.strip() else []
+        passed = len(lines) == 5
+        check(label, 1, passed, f"{len(lines)} lines (need exactly 5)")
         return lines
     except Exception as e:
-        check("10. Audit markdown file exists in code-server", 1, False, f"exception: {e}")
+        check(label, 1, False, f"exception: {e}")
         return []
 
 
-def check_11_audit_file_header(lines: list[str]) -> None:
-    """Lines 1-2: heading and sorted project list."""
+def check_11_audit_file_header(lines):
+    """Lines 1-2 exactly: heading with em-dash and sorted project list."""
+    label = "11. Audit file lines 1-2 exact"
     if len(lines) < 2:
-        check("11. Audit file header and project list (lines 1-2)", 2, False, "fewer than 2 lines")
+        check(label, 2, False, "fewer than 2 lines")
         return
     try:
-        line1_ok = "# Complexity Audit" in lines[0] and "2025-05-15" in lines[0]
-        line2 = lines[1] if len(lines) > 1 else ""
-        # Projects should be sorted alphabetically: blog-engine, data-analyzer, todo-api
-        projects_ok = ("blog-engine" in line2 and "data-analyzer" in line2 and "todo-api" in line2)
-        passed = line1_ok and projects_ok
-        check("11. Audit file header and project list (lines 1-2)", 2, passed,
-              f"line1_ok={line1_ok}, projects_ok={projects_ok}, line1='{lines[0][:60]}', line2='{line2[:60]}'")
+        exp1 = "# Complexity Audit — 2025-05-15"
+        exp2 = "Projects scanned: blog-engine, data-analyzer, todo-api"
+        line1_ok = lines[0].strip() == exp1
+        line2_ok = lines[1].strip() == exp2
+        passed = line1_ok and line2_ok
+        check(label, 2, passed,
+              "lines 1-2 exact" if passed else
+              f"line1_ok={line1_ok} ('{lines[0][:50]}'), line2_ok={line2_ok} ('{lines[1][:60]}')")
     except Exception as e:
-        check("11. Audit file header and project list (lines 1-2)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-def check_12_audit_file_body(lines: list[str]) -> None:
-    """Lines 3-5: total files, band counts, top file."""
+def check_12_audit_file_body(lines):
+    """Lines 3-5 exactly equal the truth-recomputed totals, band counts and
+    top file (consistent with the table's convention)."""
+    label = "12. Audit file lines 3-5 match recomputed truth"
+    if _TRUTH is None:
+        check(label, 2, False, "ground truth recompute failed")
+        return
     if len(lines) < 5:
-        check("12. Audit file body lines 3-5 (counts and top file)", 2, False,
-              f"only {len(lines)} lines, need 5")
+        check(label, 2, False, f"only {len(lines)} lines, need 5")
         return
     try:
-        line3 = lines[2]
-        line4 = lines[3]
-        line5 = lines[4]
+        named = _TRUTH["named"]
+        empties = _TRUTH["empties"]
+        counts = truth_band_counts(_TRUTH)
+        n_named = len(named)
+        n_all = n_named + len(empties)
 
-        # Line 3: "Total files measured: <N>"
-        line3_ok = "Total files measured:" in line3
-        # Line 4: "Critical: <C>; High: <H>; Medium: <M>; Low: <L>"
-        line4_ok = all(band in line4 for band in ["Critical:", "High:", "Medium:", "Low:"])
-        # Line 5: "Top file: <path> (<project>, <LOC> LOC)"
-        line5_ok = "Top file:" in line5 and "LOC" in line5
+        def expected_34(n, low_extra):
+            line3 = f"Total files measured: {n}"
+            line4 = (f"Critical: {counts['Critical']}; High: {counts['High']}; "
+                     f"Medium: {counts['Medium']}; Low: {counts['Low'] + low_extra}")
+            return line3, line4
 
-        passed = line3_ok and line4_ok and line5_ok
-        check("12. Audit file body lines 3-5 (counts and top file)", 2, passed,
-              f"line3_ok={line3_ok}, line4_ok={line4_ok}, line5_ok={line5_ok}")
+        top = sorted(named, key=lambda e: (-e["loc"], e["path"], e["project"]))[0]
+        exp5 = f"Top file: {top['path']} ({top['project']}, {top['loc']} LOC)"
+
+        got3, got4, got5 = lines[2].strip(), lines[3].strip(), lines[4].strip()
+
+        if _caliber == "named":
+            candidates = [expected_34(n_named, 0)]
+        elif _caliber == "all":
+            candidates = [expected_34(n_all, len(empties))]
+        else:
+            # table convention undetermined (ck3 failed): accept either consistent pair
+            candidates = [expected_34(n_named, 0)]
+            if empties:
+                candidates.append(expected_34(n_all, len(empties)))
+
+        pair_ok = any(got3 == c3 and got4 == c4 for c3, c4 in candidates)
+        line5_ok = got5 == exp5
+        passed = pair_ok and line5_ok
+        check(label, 2, passed,
+              f"lines 3-5 match truth ({_caliber or 'either'} convention)" if passed else
+              f"lines3-4_ok={pair_ok} (expected e.g. '{candidates[0][0]}' / '{candidates[0][1]}', "
+              f"got '{got3[:40]}' / '{got4[:60]}'), line5_ok={line5_ok} (expected '{exp5}', got '{got5[:60]}')")
     except Exception as e:
-        check("12. Audit file body lines 3-5 (counts and top file)", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-def check_13_op_work_packages_exist() -> list[dict]:
-    """OpenProject: Task work packages exist in 'security-audit' project for High/Critical rows."""
+def _fetch_refactor_wps():
+    """All Task-type WPs in 'security-audit' with subject LIKE 'Refactor:%',
+    per-row split via unit/record separators. Returns list of dicts or None."""
+    proj_row = op_db_query(
+        "SELECT id FROM projects WHERE identifier = 'security-audit' LIMIT 1;"
+    )
+    if not proj_row:
+        return None
+    project_id = int(proj_row.strip())
+    type_row = op_db_query("SELECT id FROM types WHERE name = 'Task' LIMIT 1;")
+    task_type_id = int(type_row.strip()) if type_row.strip() else None
+    type_filter = f" AND type_id = {task_type_id}" if task_type_id else ""
+    rows = op_db_query_rows(
+        f"SELECT wp.id, wp.subject, wp.description, "
+        f"u.login AS assignee_login, "
+        f"s.name AS status_name, "
+        f"e.name AS priority_name "
+        f"FROM work_packages wp "
+        f"LEFT JOIN users u ON wp.assigned_to_id = u.id "
+        f"LEFT JOIN statuses s ON wp.status_id = s.id "
+        f"LEFT JOIN enumerations e ON wp.priority_id = e.id "
+        f"WHERE wp.project_id = {project_id}{type_filter} "
+        f"AND wp.subject LIKE 'Refactor:%' "
+        f"ORDER BY wp.id;"
+    )
+    if rows is None:
+        return None
+    wps = []
+    for parts in rows:
+        if len(parts) >= 6:
+            wps.append({
+                "id": parts[0].strip(),
+                "subject": parts[1].strip(),
+                "description": parts[2].strip(),
+                "assignee": parts[3].strip(),
+                "status": parts[4].strip(),
+                "priority": parts[5].strip(),
+            })
+    return wps
+
+
+def check_13_op_work_packages_exact_set():
+    """OpenProject: the set of 'Refactor:' Task WPs in 'security-audit' is
+    EXACTLY the truth-derived top-10 (High/Critical rows by LOC desc then
+    File Path asc); one more or one fewer fails."""
+    label = "13. 'Refactor:' WP set exactly matches truth top-10"
+    if _TRUTH is None:
+        check(label, 2, False, "ground truth recompute failed")
+        return []
     try:
-        # Find project id for security-audit
-        proj_row = op_db_query(
-            "SELECT id FROM projects WHERE identifier = 'security-audit' LIMIT 1;"
-        )
-        if not proj_row:
-            check("13. Work packages exist in 'security-audit' project", 2, False,
-                  "project 'security-audit' not found")
+        wps = _fetch_refactor_wps()
+        if wps is None:
+            check(label, 2, False, "OpenProject query failed (project/psql)")
             return []
-        project_id = int(proj_row.strip())
-
-        # Get Task type id
-        type_row = op_db_query("SELECT id FROM types WHERE name = 'Task' LIMIT 1;")
-        task_type_id = int(type_row.strip()) if type_row.strip() else None
-
-        # Get work packages in this project
-        type_filter = f" AND type_id = {task_type_id}" if task_type_id else ""
-        wp_rows = op_db_query(
-            f"SELECT wp.id, wp.subject, wp.description, "
-            f"u.login AS assignee_login, "
-            f"s.name AS status_name, "
-            f"e.name AS priority_name "
-            f"FROM work_packages wp "
-            f"LEFT JOIN users u ON wp.assigned_to_id = u.id "
-            f"LEFT JOIN statuses s ON wp.status_id = s.id "
-            f"LEFT JOIN enumerations e ON wp.priority_id = e.id "
-            f"WHERE wp.project_id = {project_id}{type_filter} "
-            f"ORDER BY wp.id;"
-        )
-        wps = []
-        if wp_rows:
-            for line in wp_rows.split("\n"):
-                if not line.strip():
-                    continue
-                parts = line.split("|")
-                if len(parts) >= 6:
-                    wps.append({
-                        "id": parts[0].strip(),
-                        "subject": parts[1].strip(),
-                        "description": parts[2].strip(),
-                        "assignee": parts[3].strip(),
-                        "status": parts[4].strip(),
-                        "priority": parts[5].strip(),
-                    })
-
-        # Should have up to 10 work packages
-        passed = 1 <= len(wps) <= 10
-        check("13. Work packages exist in 'security-audit' project", 2, passed,
-              f"{len(wps)} Task work packages found")
+        expected = [wp_subject_for(e) for e in truth_top10(_TRUTH)]
+        subjects = [wp["subject"] for wp in wps]
+        missing = sorted(set(expected) - set(subjects))
+        extra = sorted(set(subjects) - set(expected))
+        dupes = len(subjects) != len(set(subjects))
+        passed = (len(wps) == len(expected)
+                  and not missing and not extra and not dupes)
+        check(label, 2, passed,
+              f"{len(wps)} WPs, exact match with truth top-10" if passed else
+              f"{len(wps)} WPs (expected {len(expected)}); missing={missing[:2]}; "
+              f"extra={extra[:2]}; duplicates={dupes}")
         return wps
     except Exception as e:
-        check("13. Work packages exist in 'security-audit' project", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
         return []
 
 
-def check_14_wp_subject_format(wps: list[dict]) -> None:
-    """Work package subjects match 'Refactor: <path> (<LOC> LOC, <avg> avg fn length)'."""
+def check_14_wp_subject_format(wps):
+    """Each WP subject exactly equals a truth-derived
+    'Refactor: <path> (<LOC> LOC, <avg %.1f> avg fn length)' string, each
+    expected subject appearing exactly once."""
+    label = "14. WP subjects exactly equal truth-derived strings"
+    if _TRUTH is None:
+        check(label, 2, False, "ground truth recompute failed")
+        return
     if not wps:
-        check("14. Work package subjects match format", 2, False, "no work packages")
+        check(label, 2, False, "no work packages")
         return
     try:
-        pattern = re.compile(r"^Refactor: .+ \(\d+ LOC, [\d.]+ avg fn length\)$")
-        matching = sum(1 for wp in wps if pattern.match(wp["subject"]))
-        passed = matching == len(wps)
-        check("14. Work package subjects match format", 2, passed,
-              f"{matching}/{len(wps)} match pattern"
-              + (f", sample='{wps[0]['subject'][:70]}'" if wps and not passed else ""))
+        expected = [wp_subject_for(e) for e in truth_top10(_TRUTH)]
+        actual = [wp["subject"] for wp in wps]
+        exp_counts = {}
+        for s in expected:
+            exp_counts[s] = exp_counts.get(s, 0) + 1
+        act_counts = {}
+        for s in actual:
+            act_counts[s] = act_counts.get(s, 0) + 1
+        passed = exp_counts == act_counts
+        bad = [s[:70] for s in actual if s not in exp_counts][:2]
+        check(label, 2, passed,
+              f"all {len(actual)} subjects exact" if passed else
+              f"subject multiset mismatch; unexpected sample={bad}")
     except Exception as e:
-        check("14. Work package subjects match format", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-def check_15_wp_assignee_admin(wps: list[dict]) -> None:
+def check_15_wp_assignee_admin(wps):
     """All work packages assigned to admin."""
     if not wps:
         check("15. Work packages assigned to admin", 1, False, "no work packages")
@@ -564,65 +897,101 @@ def check_15_wp_assignee_admin(wps: list[dict]) -> None:
         check("15. Work packages assigned to admin", 1, False, f"exception: {e}")
 
 
-def check_16_wp_priority_mapping(wps: list[dict]) -> None:
-    """Priority: High for Critical band, Normal for High band (from description)."""
+def check_16_wp_priority_mapping(wps):
+    """Priority derived from the TRUTH band of each WP's file (Critical file
+    -> High priority, High file -> Normal) — not from the WP's own
+    description."""
+    label = "16. WP priority matches truth-band mapping"
+    if _TRUTH is None:
+        check(label, 2, False, "ground truth recompute failed")
+        return
     if not wps:
-        check("16. Work package priority mapping correct", 2, False, "no work packages")
+        check(label, 2, False, "no work packages")
         return
     try:
+        band_by_subject = {wp_subject_for(e): e["band"] for e in truth_top10(_TRUTH)}
         mismatches = []
         for wp in wps:
-            desc = wp.get("description", "")
-            priority = wp.get("priority", "")
-            # Extract band from description: "Band: <band>"
-            band_match = re.search(r"Band:\s*(Critical|High)", desc)
-            if band_match:
-                band = band_match.group(1)
-                expected_priority = "High" if band == "Critical" else "Normal"
-                if priority != expected_priority:
-                    mismatches.append(
-                        f"subject='{wp['subject'][:40]}': band={band}, "
-                        f"priority={priority}, expected={expected_priority}")
-            else:
-                mismatches.append(f"subject='{wp['subject'][:40]}': band not found in description")
-
+            band = band_by_subject.get(wp["subject"])
+            if band is None:
+                mismatches.append(f"'{wp['subject'][:50]}': subject not in truth top-10")
+                continue
+            expected_priority = "High" if band == "Critical" else "Normal"
+            if wp.get("priority", "") != expected_priority:
+                mismatches.append(
+                    f"'{wp['subject'][:50]}': truth band={band}, "
+                    f"priority={wp.get('priority')}, expected={expected_priority}")
         passed = len(mismatches) == 0 and len(wps) > 0
-        check("16. Work package priority mapping correct", 2, passed,
-              f"all {len(wps)} correct" if passed else f"{len(mismatches)} issues: {mismatches[:2]}")
+        check(label, 2, passed,
+              f"all {len(wps)} correct" if passed
+              else f"{len(mismatches)} issues: " + "; ".join(mismatches[:2])[:300])
     except Exception as e:
-        check("16. Work package priority mapping correct", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
-def check_17_wp_description_format(wps: list[dict]) -> None:
-    """Description: 'Project: <P>; Function Count: <FC>; Band: <B>; Audit: 2025-05-15'."""
+def check_17_wp_description_exact(wps):
+    """Description exactly equals the truth-derived
+    'Project: <P>; Function Count: <FC>; Band: <B>; Audit: 2025-05-15'
+    (compared after stripping CKEditor backslash escapes)."""
+    label = "17. WP descriptions exactly match truth"
+    if _TRUTH is None:
+        check(label, 2, False, "ground truth recompute failed")
+        return
     if not wps:
-        check("17. Work package descriptions match format", 2, False, "no work packages")
+        check(label, 2, False, "no work packages")
         return
     try:
-        pattern = re.compile(
-            r"Project: .+; Function Count: \d+; Band: (Critical|High); Audit: 2025-05-15"
-        )
-        matching = sum(1 for wp in wps if pattern.search(wp.get("description", "")))
-        passed = matching == len(wps)
-        check("17. Work package descriptions match format", 2, passed,
-              f"{matching}/{len(wps)} match"
-              + (f", sample='{wps[0].get('description', '')[:70]}'" if wps and not passed else ""))
+        desc_by_subject = {
+            wp_subject_for(e):
+                f"Project: {e['project']}; Function Count: {e['fn']}; "
+                f"Band: {e['band']}; Audit: {AUDIT_DATE}"
+            for e in truth_top10(_TRUTH)
+        }
+        mismatches = []
+        for wp in wps:
+            expected = desc_by_subject.get(wp["subject"])
+            if expected is None:
+                mismatches.append(f"'{wp['subject'][:50]}': subject not in truth top-10")
+                continue
+            actual = wp.get("description", "").replace("\\", "").strip()
+            if actual != expected:
+                mismatches.append(
+                    f"'{wp['subject'][:40]}': desc '{actual[:60]}' != '{expected[:60]}'")
+        passed = len(mismatches) == 0 and len(wps) > 0
+        check(label, 2, passed,
+              f"all {len(wps)} descriptions exact" if passed
+              else f"{len(mismatches)} issues: " + "; ".join(mismatches[:2])[:300])
     except Exception as e:
-        check("17. Work package descriptions match format", 2, False, f"exception: {e}")
+        check(label, 2, False, f"exception: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main() -> None:
+def main():
+    global _TRUTH
+    # Ground truth precheck (0pt): re-run the three task awk commands.
+    try:
+        _TRUTH = compute_truth()
+    except Exception:
+        _TRUTH = None
+    if _TRUTH is not None:
+        n_named = len(_TRUTH["named"])
+        n_all = n_named + len(_TRUTH["empties"])
+        detail = (f"{n_named} named files (+{len(_TRUTH['empties'])} empty-path rows = {n_all}); "
+                  f"bands={truth_band_counts(_TRUTH)}")
+    else:
+        detail = "awk recompute in pristine-image container failed; all truth-dependent checks will FAIL"
+    check("0. Ground truth recompute (3 awk commands)", 0, _TRUTH is not None, detail)
+
     # Baserow checks
     ctx = check_1_baserow_database_exists()
     ctx = check_2_table_and_fields(ctx)
-    check_3_rows_cover_all_projects(ctx)
+    check_3_rows_match_truth(ctx)
     check_4_metric_ids_sequential(ctx)
     check_5_complexity_band_correct(ctx)
     check_6_captured_at_date(ctx)
     check_7_row_ordering(ctx)
     check_8_top_offenders_view(ctx)
-    check_9_by_band_kanban_view(ctx)
+    check_9_by_band_gallery_view(ctx)
 
     # code-server checks
     lines = check_10_audit_file_exists()
@@ -630,11 +999,11 @@ def main() -> None:
     check_12_audit_file_body(lines)
 
     # OpenProject checks
-    wps = check_13_op_work_packages_exist()
+    wps = check_13_op_work_packages_exact_set()
     check_14_wp_subject_format(wps)
     check_15_wp_assignee_admin(wps)
     check_16_wp_priority_mapping(wps)
-    check_17_wp_description_format(wps)
+    check_17_wp_description_exact(wps)
 
     total = sum(w for _, w, _, _ in _checks)
     earned = sum(w for _, w, p, _ in _checks if p)

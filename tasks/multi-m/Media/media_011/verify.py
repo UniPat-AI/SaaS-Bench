@@ -68,7 +68,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -117,12 +117,12 @@ def watcharr_sql(sql: str, timeout: int = 15) -> tuple[int, str, str]:
     try:
         local_db = os.path.join(tmpdir, os.path.basename(db))
         r = subprocess.run(["docker", "cp", f"{WATCHARR_CONTAINER}:{db}", local_db],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
         if r.returncode != 0:
             return r.returncode, "", r.stderr
         for suffix in ("-wal", "-shm"):
             subprocess.run(["docker", "cp", f"{WATCHARR_CONTAINER}:{db}{suffix}", tmpdir],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
         con = sqlite3.connect(local_db)
         try:
             rows = con.execute(sql).fetchall()
@@ -147,7 +147,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
             "-D", "booklore",
             "-N", "-B", "-e", query,
         ],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     if r.returncode != 0:
         r2 = subprocess.run(
@@ -159,7 +159,7 @@ def mariadb_query(query: str, timeout: int = 15) -> str:
                 "-D", "booklore",
                 "-N", "-B", "-e", query,
             ],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, errors="replace", timeout=timeout,
         )
         return r2.stdout.strip()
     return r.stdout.strip()
@@ -244,10 +244,16 @@ def md_sections(md: str) -> list[tuple[int, str, list[str]]]:
 
 # ── LLM judge helper ────────────────────────────────────────────────────────
 def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
-    if not api_key:
-        return False, "MINDRA_API_KEY not set"
+    _missing = [_n for _n in ("JUDGE_MODEL", "JUDGE_BASE_URL", "JUDGE_API_KEY")
+                if not os.getenv(_n, "").strip()]
+    if _missing:
+        # The judge is configured independently of the agent's model (see
+        # saas_bench.verify_runner.normalize_judge_env): a benchmark needs ONE fixed grader, or
+        # columns scored by different models are not comparable. Say which piece is missing rather
+        # than posting an empty model name and reporting the provider's HTTP error.
+        return False, "judge not configured: " + ", ".join(_missing) + " not set"
+    api_base = os.getenv("JUDGE_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY", "")
     prompt = (
         f"Does the following content satisfy this condition?\n"
         f"Condition: {condition}\n\n"
@@ -259,7 +265,7 @@ def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, st
             f"{api_base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}",
                      "Content-Type": "application/json"},
-            json={"model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+            json={"model": os.getenv("JUDGE_MODEL", ""),
                   "messages": [{"role": "user", "content": prompt}],
                   "max_tokens": 512},
             timeout=timeout,

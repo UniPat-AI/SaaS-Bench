@@ -2,7 +2,7 @@
 """
 Verifier for Software-035-I3: Coordinate v1.5.0 Release Across vue-hackernews-2.0 and tabler
 
-Checks: 13 weighted checks across openproject, code-server, baserow.
+Checks: 14 weighted checks across openproject, code-server, baserow.
 Strategy: docker exec (OpenProject DB, code-server filesystem), Baserow REST API.
 
 Required env vars:
@@ -110,7 +110,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -122,7 +122,7 @@ def op_sql(query: str) -> str:
          OPENPROJECT_CONTAINER,
          "psql", "-h", "127.0.0.1", "-U", "openproject", "-d", "openproject",
          "-t", "-A", "-c", query],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, errors="replace", timeout=15,
     )
     if r.returncode != 0:
         raise RuntimeError(f"psql error: {r.stderr.strip()}")
@@ -174,6 +174,60 @@ def _find_project_dir(project_name: str) -> str:
     return ""
 
 
+def _expected_changelog_lines(features: list[str]) -> list[str]:
+    """The exact 5-line release block the finished CHANGELOG.md must contain."""
+    return [
+        "## [Unreleased]",
+        f"## [{VERSION_NAME}] - {VERSION_DUE}",
+        "### Added",
+        f"- {features[0]}",
+        f"- {features[1]}",
+    ]
+
+
+def _changelog_block_issues(content: str, features: list[str]) -> list[str]:
+    """Whole-file contiguous-block assertion for a finished CHANGELOG.md.
+
+    Seed CHANGELOG.md in both repos is exactly one line ("## [Unreleased]",
+    verified untracked/single-line in code-server-bundle:latest), so the
+    finished file is fully determined: exactly 5 lines, in order. Each line is
+    rstrip()ed and trailing blank lines are dropped before comparison.
+
+    NOTE (plan risk ①): if a future image rebuild ships a longer seed
+    CHANGELOG, downgrade this to the anchored contiguous-block regex instead
+    of reverting to scattered substring checks, e.g.:
+        re.search(
+            r"(?m)^## \\[Unreleased\\]\\n## \\[v1\\.5\\.0\\] - 2025-09-20\\n"
+            r"### Added\\n- <feat1>\\n- <feat2>\\s*$",
+            content,
+        )
+    """
+    lines = [ln.rstrip() for ln in content.split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    expected = _expected_changelog_lines(features)
+    if len(lines) != len(expected):
+        return [f"expected exactly {len(expected)} lines, got {len(lines)}"]
+    issues = []
+    for i, (got, exp) in enumerate(zip(lines, expected), 1):
+        if got != exp:
+            issues.append(f"line {i}: {got!r} != {exp!r}")
+    return issues
+
+
+def _find_table_id(headers: dict) -> int | None:
+    """Locate the 'Release Readiness' table id via the Baserow API."""
+    r = requests.get(f"{BASEROW_BASE}/api/applications/", headers=headers, timeout=10)
+    r.raise_for_status()
+    for app in r.json():
+        if app.get("name") == "Release v1.5.0 Coordination":
+            for tbl in app.get("tables", []):
+                if tbl.get("name") == "Release Readiness":
+                    return tbl["id"]
+            return None
+    return None
+
+
 # ── Individual checks ─────────────────────────────────────────────────────────
 
 def check_1_op_version() -> None:
@@ -211,7 +265,7 @@ def check_1_op_version() -> None:
 
 
 def _check_changelog(check_num: int, project_name: str, features: list[str]) -> None:
-    """Verify CHANGELOG.md in a project has the correct v1.5.0 release section."""
+    """Verify CHANGELOG.md is exactly the 5-line release block (contiguous, in order)."""
     label = f"{check_num}. {project_name} CHANGELOG.md"
     try:
         proj_dir = _find_project_dir(project_name)
@@ -223,27 +277,9 @@ def _check_changelog(check_num: int, project_name: str, features: list[str]) -> 
         if rc != 0:
             check(label, 2, False, f"file not found: {changelog_path}")
             return
-        issues = []
-        # Check ## [Unreleased] is present
-        if "## [Unreleased]" not in content:
-            issues.append("missing ## [Unreleased]")
-        # Check ## [v1.5.0] - 2025-09-20 is present
-        if f"## [{VERSION_NAME}] - {VERSION_DUE}" not in content:
-            issues.append(f"missing ## [{VERSION_NAME}] - {VERSION_DUE}")
-        # Check [Unreleased] comes before [v1.5.0]
-        unreleased_pos = content.find("## [Unreleased]")
-        version_pos = content.find(f"## [{VERSION_NAME}] - {VERSION_DUE}")
-        if unreleased_pos >= 0 and version_pos >= 0 and unreleased_pos > version_pos:
-            issues.append("[Unreleased] not before [v1.5.0]")
-        # Check ### Added
-        if "### Added" not in content:
-            issues.append("missing ### Added")
-        # Check features
-        for feat in features:
-            if f"- {feat}" not in content:
-                issues.append(f"missing feature: {feat}")
+        issues = _changelog_block_issues(content, features)
         check(label, 2, not issues,
-              "correct release section" if not issues else "; ".join(issues))
+              "exact 5-line release block" if not issues else "; ".join(issues[:3]))
     except Exception as e:
         check(label, 2, False, f"exception: {e}")
 
@@ -256,40 +292,84 @@ def check_3_changelog_b() -> None:
     _check_changelog(3, PROJECT_B, FEATURES_B)
 
 
-def _check_git_commit(check_num: int, project_name: str) -> None:
-    """Verify a git commit with exact message exists touching CHANGELOG.md."""
+def _check_git_commit(check_num: int, project_name: str, features: list[str]) -> None:
+    """Three-stage git assertion for the changelog commit.
+
+    (a) `git log --all` contains a commit whose subject is EXACTLY the
+        required message; (b) that commit touches exactly one file,
+        CHANGELOG.md ("stage only that file" — for untracked-new files
+        `git show --name-only` still lists the path); (c) the committed
+        blob (`git show <sha>:CHANGELOG.md`) passes the same 5-line block
+        assertion as the working tree (commit content, not just message).
+    """
     label = f"{check_num}. Git commit {project_name}"
     try:
         proj_dir = _find_project_dir(project_name)
         if not proj_dir:
             check(label, 1, False, "project directory not found")
             return
-        rc, out, _ = docker_exec(
-            CODE_SERVER_CONTAINER,
-            "git", "-c", f"safe.directory={proj_dir}",
-            "-C", proj_dir, "log", "--oneline", "--all",
-            f"--grep={COMMIT_MSG}", "--format=%s",
+        git = ["git", "-c", f"safe.directory={proj_dir}", "-C", proj_dir]
+        # (a) locate commit(s) with the exact subject
+        rc, out, err = docker_exec(
+            CODE_SERVER_CONTAINER, *git,
+            "log", "--all", "--format=%H%x00%s",
             timeout=10,
         )
         if rc != 0:
-            check(label, 1, False, "git log failed")
+            check(label, 1, False, f"git log failed: {err.strip()[:120]}")
             return
-        commits = [line.strip() for line in out.strip().split("\n") if line.strip()]
-        found = any(c == COMMIT_MSG for c in commits)
-        if not found:
-            check(label, 1, False, f"no commit with exact message '{COMMIT_MSG}'; found: {commits[:3]}")
-        else:
-            check(label, 1, True, "commit found")
+        shas = []
+        for line in out.splitlines():
+            if "\x00" not in line:
+                continue
+            sha, subj = line.split("\x00", 1)
+            if subj == COMMIT_MSG:
+                shas.append(sha.strip())
+        if not shas:
+            check(label, 1, False, f"no commit with exact subject {COMMIT_MSG!r}")
+            return
+        # (b)+(c): pass if any exact-subject commit satisfies both stages
+        fail_details = []
+        for sha in shas:
+            issues = []
+            rc, out, err = docker_exec(
+                CODE_SERVER_CONTAINER, *git,
+                "show", "--name-only", "--format=", sha,
+                timeout=10,
+            )
+            if rc != 0:
+                issues.append(f"git show --name-only failed: {err.strip()[:80]}")
+            else:
+                names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+                if names != ["CHANGELOG.md"]:
+                    issues.append(
+                        f"commit touches {names!r}, expected exactly ['CHANGELOG.md']")
+            rc, blob, err = docker_exec(
+                CODE_SERVER_CONTAINER, *git,
+                "show", f"{sha}:CHANGELOG.md",
+                timeout=10,
+            )
+            if rc != 0:
+                issues.append("CHANGELOG.md missing from commit tree")
+            else:
+                issues.extend(
+                    f"committed {i}" for i in _changelog_block_issues(blob, features))
+            if not issues:
+                check(label, 1, True,
+                      f"commit {sha[:10]}: single-file CHANGELOG.md, 5-line block OK")
+                return
+            fail_details.append(f"{sha[:10]}: {'; '.join(issues[:3])}")
+        check(label, 1, False, " | ".join(fail_details[:2]))
     except Exception as e:
         check(label, 1, False, f"exception: {e}")
 
 
 def check_4_git_commit_a() -> None:
-    _check_git_commit(4, PROJECT_A)
+    _check_git_commit(4, PROJECT_A, FEATURES_A)
 
 
 def check_5_git_commit_b() -> None:
-    _check_git_commit(5, PROJECT_B)
+    _check_git_commit(5, PROJECT_B, FEATURES_B)
 
 
 def check_6_baserow_database() -> None:
@@ -307,29 +387,71 @@ def check_6_baserow_database() -> None:
 
 
 def check_7_baserow_table_fields() -> None:
-    """Baserow table 'Release Readiness' exists with expected fields."""
+    """Field schema: EXACTLY the 6 specified fields, correct types/options.
+
+    Field name set must equal the 6 spec fields (residual default fields
+    like Notes/Active fail); Gate ID primary text; Gate Name/Project/Status
+    single-selects with exact option sets; Target Date date; Owner text.
+    """
+    label = "7. Baserow table & fields"
     try:
-        row = baserow_sql(
-            "SELECT t.id FROM database_table t "
-            "JOIN core_application a ON t.database_id = a.id "
-            "WHERE a.name = 'Release v1.5.0 Coordination' "
-            "AND t.name = 'Release Readiness';"
-        )
-        if not row.strip():
-            check("7. Baserow table & fields", 1, False, "table not found")
+        token = baserow_auth()
+        headers = {"Authorization": f"JWT {token}"}
+        table_id = _find_table_id(headers)
+        if table_id is None:
+            check(label, 1, False, "table not found via API")
             return
-        table_id = row.strip()
-        fields_raw = baserow_sql(
-            f"SELECT f.name FROM database_field f WHERE f.table_id = {table_id} ORDER BY f.order;"
+        r = requests.get(
+            f"{BASEROW_BASE}/api/database/fields/table/{table_id}/",
+            headers=headers, timeout=10,
         )
-        field_names = [f.strip() for f in fields_raw.split("\n") if f.strip()]
-        expected_fields = {"Gate ID", "Gate Name", "Project", "Target Date", "Status", "Owner"}
-        found_fields = set(field_names)
-        missing = expected_fields - found_fields
-        check("7. Baserow table & fields", 1, not missing,
-              f"fields: {field_names}" if not missing else f"missing fields: {missing}")
+        r.raise_for_status()
+        by_name = {f.get("name"): f for f in r.json()}
+        issues = []
+        expected_names = {"Gate ID", "Gate Name", "Project", "Target Date", "Status", "Owner"}
+        actual_names = set(by_name)
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names)
+            extra = sorted(actual_names - expected_names)
+            if missing:
+                issues.append(f"missing fields: {missing}")
+            if extra:
+                issues.append(f"extra fields: {extra}")
+
+        def _opts(f: dict) -> set:
+            return {o.get("value") for o in (f.get("select_options") or [])}
+
+        expected_types = {
+            "Gate ID": "text",
+            "Gate Name": "single_select",
+            "Project": "single_select",
+            "Target Date": "date",
+            "Status": "single_select",
+            "Owner": "text",
+        }
+        expected_options = {
+            "Gate Name": set(GATES),
+            "Project": {PROJECT_A, PROJECT_B, "Both"},
+            "Status": {"NotStarted", "InProgress", "Done", "Blocked"},
+        }
+        for name, exp_type in expected_types.items():
+            f = by_name.get(name)
+            if f is None:
+                continue  # already reported as missing
+            if f.get("type") != exp_type:
+                issues.append(f"{name}: type={f.get('type')!r}, expected {exp_type!r}")
+            elif name in expected_options and _opts(f) != expected_options[name]:
+                issues.append(
+                    f"{name}: options={sorted(_opts(f))}, "
+                    f"expected {sorted(expected_options[name])}")
+        gate_id = by_name.get("Gate ID")
+        if gate_id is not None and not gate_id.get("primary"):
+            issues.append("Gate ID is not the primary field")
+        check(label, 1, not issues,
+              "schema exact (6 fields, types, option sets)" if not issues
+              else "; ".join(issues[:4]))
     except Exception as e:
-        check("7. Baserow table & fields", 1, False, f"exception: {e}")
+        check(label, 1, False, f"exception: {e}")
 
 
 def check_8_baserow_rows() -> None:
@@ -337,24 +459,9 @@ def check_8_baserow_rows() -> None:
     try:
         token = baserow_auth()
         headers = {"Authorization": f"JWT {token}"}
-
-        # Find the table ID via API
-        # List all applications
-        r = requests.get(f"{BASEROW_BASE}/api/applications/", headers=headers, timeout=10)
-        r.raise_for_status()
-        apps = r.json()
-
-        table_id = None
-        for app in apps:
-            if app.get("name") == "Release v1.5.0 Coordination":
-                for tbl in app.get("tables", []):
-                    if tbl.get("name") == "Release Readiness":
-                        table_id = tbl["id"]
-                        break
-                break
-
+        table_id = _find_table_id(headers)
         if table_id is None:
-            check("8. Baserow 8 rows", 3, False, "table not found via API")
+            check("8. Baserow 8 rows", 2, False, "table not found via API")
             return
 
         # Get rows
@@ -367,7 +474,7 @@ def check_8_baserow_rows() -> None:
         rows = data.get("results", [])
 
         if len(rows) != 8:
-            check("8. Baserow 8 rows", 3, False, f"expected 8 rows, got {len(rows)}")
+            check("8. Baserow 8 rows", 2, False, f"expected 8 rows, got {len(rows)}")
             return
 
         issues = []
@@ -410,32 +517,20 @@ def check_8_baserow_rows() -> None:
             if row_issues:
                 issues.append(f"row {i+1} ({exp['gate_id']}): {', '.join(row_issues)}")
 
-        check("8. Baserow 8 rows", 3, not issues,
+        check("8. Baserow 8 rows", 2, not issues,
               "all 8 rows correct" if not issues else "; ".join(issues[:3]))
     except Exception as e:
-        check("8. Baserow 8 rows", 3, False, f"exception: {e}")
+        check("8. Baserow 8 rows", 2, False, f"exception: {e}")
 
 
-def check_9_baserow_kanban_view() -> None:
-    """Baserow Kanban view 'Gate Progress' exists on Release Readiness table."""
+def check_9_baserow_gallery_view() -> None:
+    """Baserow Gallery view 'Gate Progress' exists on Release Readiness table."""
     try:
         token = baserow_auth()
         headers = {"Authorization": f"JWT {token}"}
-
-        # Find table ID
-        r = requests.get(f"{BASEROW_BASE}/api/applications/", headers=headers, timeout=10)
-        r.raise_for_status()
-        apps = r.json()
-        table_id = None
-        for app in apps:
-            if app.get("name") == "Release v1.5.0 Coordination":
-                for tbl in app.get("tables", []):
-                    if tbl.get("name") == "Release Readiness":
-                        table_id = tbl["id"]
-                        break
-                break
+        table_id = _find_table_id(headers)
         if table_id is None:
-            check("9. Baserow Kanban view", 1, False, "table not found")
+            check("9. Baserow Gallery view", 1, False, "table not found")
             return
 
         # List views
@@ -445,17 +540,17 @@ def check_9_baserow_kanban_view() -> None:
         )
         r.raise_for_status()
         views = r.json()
-        kanban_views = [v for v in views if v.get("name") == "Gate Progress"]
-        if not kanban_views:
+        gallery_views = [v for v in views if v.get("name") == "Gate Progress"]
+        if not gallery_views:
             view_names = [v.get("name") for v in views]
-            check("9. Baserow Kanban view", 1, False, f"view not found; existing views: {view_names}")
+            check("9. Baserow Gallery view", 1, False, f"view not found; existing views: {view_names}")
             return
-        v = kanban_views[0]
-        is_kanban = v.get("type") == "kanban"
-        check("9. Baserow Kanban view", 1, is_kanban,
-              f"type={v.get('type')}" if not is_kanban else "kanban view found")
+        v = gallery_views[0]
+        is_gallery = v.get("type") == "gallery"
+        check("9. Baserow Gallery view", 1, is_gallery,
+              f"type={v.get('type')}" if not is_gallery else "gallery view found")
     except Exception as e:
-        check("9. Baserow Kanban view", 1, False, f"exception: {e}")
+        check("9. Baserow Gallery view", 1, False, f"exception: {e}")
 
 
 def check_10_op_milestones_exist() -> None:
@@ -484,10 +579,10 @@ def check_10_op_milestones_exist() -> None:
             issues.append(f"missing: {missing}")
         if extra:
             issues.append(f"extra: {extra}")
-        check("10. OP 8 Milestones exist", 2, not issues,
+        check("10. OP 8 Milestones exist", 1, not issues,
               f"all 8 found" if not issues else "; ".join(issues))
     except Exception as e:
-        check("10. OP 8 Milestones exist", 2, False, f"exception: {e}")
+        check("10. OP 8 Milestones exist", 1, False, f"exception: {e}")
 
 
 def check_11_op_milestone_priorities() -> None:
@@ -592,6 +687,52 @@ def check_13_op_milestones_version() -> None:
         check("13. OP Milestones → v1.5.0", 1, False, f"exception: {e}")
 
 
+def check_a_op_milestone_dates() -> None:
+    """Each Milestone's start date == its gate's Target Date (spec: 'start date =
+    Target Date'); Milestone type also implies due_date == start_date."""
+    label = "A. OP Milestone start dates"
+    try:
+        rows_raw = op_sql(
+            f"SELECT wp.subject, wp.start_date, wp.due_date "
+            f"FROM work_packages wp "
+            f"JOIN projects p ON wp.project_id = p.id "
+            f"JOIN types t ON wp.type_id = t.id "
+            f"JOIN versions v ON wp.version_id = v.id "
+            f"WHERE p.name = '{OP_PROJECT}' AND t.name = 'Milestone' "
+            f"AND v.name = '{VERSION_NAME}';"
+        )
+        issues = []
+        lines_found = 0
+        for line in rows_raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            lines_found += 1
+            parts = line.split("|")
+            subject = parts[0].strip()
+            start = parts[1].strip() if len(parts) > 1 else ""
+            due = parts[2].strip() if len(parts) > 2 else ""
+            m = re.match(r"\[(\w+)\]", subject)
+            if not m:
+                issues.append(f"cannot parse subject: {subject}")
+                continue
+            gate = m.group(1)
+            expected = GATE_DATES.get(gate)
+            if expected is None:
+                issues.append(f"unknown gate in subject: {subject}")
+                continue
+            if start != expected:
+                issues.append(f"{subject}: start_date={start!r}, expected={expected!r}")
+            if due != start:
+                issues.append(f"{subject}: due_date={due!r} != start_date={start!r}")
+        if lines_found == 0:
+            issues.append("no milestone work packages found")
+        check(label, 2, not issues,
+              "all start dates == Target Date" if not issues else "; ".join(issues[:3]))
+    except Exception as e:
+        check(label, 2, False, f"exception: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     check_1_op_version()
@@ -602,11 +743,12 @@ def main() -> None:
     check_6_baserow_database()
     check_7_baserow_table_fields()
     check_8_baserow_rows()
-    check_9_baserow_kanban_view()
+    check_9_baserow_gallery_view()
     check_10_op_milestones_exist()
     check_11_op_milestone_priorities()
     check_12_op_milestone_descriptions()
     check_13_op_milestones_version()
+    check_a_op_milestone_dates()
 
     total = sum(w for _, w, _, _ in _checks)
     earned = sum(w for _, w, p, _ in _checks if p)

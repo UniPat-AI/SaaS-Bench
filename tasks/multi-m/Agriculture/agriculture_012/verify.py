@@ -51,7 +51,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -325,9 +325,17 @@ def check_4_grocy_generated_code_link() -> None:
         )
         return
     lines = description_lines(_grocy_rows[0].get("description") or "")
+    # Compare the code case-insensitively. The e-label app renders the generated identifier
+    # lowercase in the public /l/ URL — which is the value the task tells the agent to copy
+    # ("use it exactly as shown") — while MSSQL returns the same uniqueidentifier uppercase.
+    # A GUID is case-insensitive by definition, so a case-sensitive compare here failed
+    # agents that had transcribed the URL exactly as instructed. Everything else stays exact:
+    # the prefix, the line count, and the two following lines.
+    code_prefix = "e-label code: "
     _grocy_link_ok = (
         len(lines) == 3
-        and lines[0] == f"e-label code: {_label_code}"
+        and lines[0].startswith(code_prefix)
+        and lines[0][len(code_prefix):].strip().casefold() == _label_code.casefold()
         and lines[1].startswith("125 mL servings per bottle:")
         and lines[2] == "Producer: Boutique Organic Farm"
     )

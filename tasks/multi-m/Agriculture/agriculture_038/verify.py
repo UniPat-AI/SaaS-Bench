@@ -75,7 +75,7 @@ def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -108,7 +108,9 @@ def grocy_sql_json(query: str) -> list[dict]:
     )
     rc, stdout, stderr = docker_exec(GROCY_CONTAINER, "php", "-r", php_script)
     if rc != 0:
-        raise RuntimeError(f"grocy php error (rc={rc}): {stderr.strip()}")
+        raise RuntimeError(f"grocy php error (rc={rc}): "
+                           # PHP CLI prints fatals to stdout, not stderr
+                           f"{(stderr.strip() or stdout.strip())[:400]}")
     return json.loads(stdout) if stdout.strip() else []
 
 
@@ -122,7 +124,9 @@ def farmos_sql_json(query: str) -> list[dict]:
     )
     rc, stdout, stderr = docker_exec(FARMOS_CONTAINER, "php", "-r", php_script)
     if rc != 0:
-        raise RuntimeError(f"farmos php error (rc={rc}): {stderr.strip()}")
+        raise RuntimeError(f"farmos php error (rc={rc}): "
+                           # PHP CLI prints fatals to stdout, not stderr
+                           f"{(stderr.strip() or stdout.strip())[:400]}")
     return json.loads(stdout) if stdout.strip() else []
 
 

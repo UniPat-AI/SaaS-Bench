@@ -63,7 +63,7 @@ def check(label: str, weight: int, passed: bool, detail: str = "") -> None:
 def docker_exec(container: str, *args: str, timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(
         ["docker", "exec", container, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, errors="replace", timeout=timeout,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -97,7 +97,7 @@ def _get_watcharr_db() -> str:
     tmp.close()
     r = subprocess.run(
         ["docker", "cp", f"{WATCHARR_CONTAINER}:{WATCHARR_DB}", tmp_path],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, errors="replace", timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"docker cp failed (watcharr db): {r.stderr.strip()}")
@@ -200,8 +200,16 @@ def siyuan_api_call(endpoint: str, payload: dict = None) -> dict:
 
 
 def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+    _missing = [_n for _n in ("JUDGE_MODEL", "JUDGE_BASE_URL", "JUDGE_API_KEY")
+                if not os.getenv(_n, "").strip()]
+    if _missing:
+        # The judge is configured independently of the agent's model (see
+        # saas_bench.verify_runner.normalize_judge_env): a benchmark needs ONE fixed grader, or
+        # columns scored by different models are not comparable. Say which piece is missing rather
+        # than posting an empty model name and reporting the provider's HTTP error.
+        return False, "judge not configured: " + ", ".join(_missing) + " not set"
+    api_base = os.getenv("JUDGE_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY", "")
     prompt = (
         f"Does the following content satisfy this condition?\n"
         f"Condition: {condition}\n\n"
@@ -209,7 +217,7 @@ def llm_judge(content: str, condition: str, timeout: int = 30) -> tuple[bool, st
         f"Answer only YES or NO."
     )
     body = json.dumps({
-        "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+        "model": os.getenv("JUDGE_MODEL", ""),
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 512,
     }).encode()
@@ -237,8 +245,16 @@ def llm_judge_vision(
     condition: str,
     timeout: int = 45,
 ) -> tuple[bool, str]:
-    api_base = os.getenv("MINDRA_BASE_URL", "https://api.mindracode.com/v1")
-    api_key = os.getenv("MINDRA_API_KEY", "")
+    _missing = [_n for _n in ("JUDGE_MODEL", "JUDGE_BASE_URL", "JUDGE_API_KEY")
+                if not os.getenv(_n, "").strip()]
+    if _missing:
+        # The judge is configured independently of the agent's model (see
+        # saas_bench.verify_runner.normalize_judge_env): a benchmark needs ONE fixed grader, or
+        # columns scored by different models are not comparable. Say which piece is missing rather
+        # than posting an empty model name and reporting the provider's HTTP error.
+        return False, "judge not configured: " + ", ".join(_missing) + " not set"
+    api_base = os.getenv("JUDGE_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY", "")
 
     ext = os.path.splitext(image_path)[1].lower().lstrip(".")
     mime = {
@@ -266,7 +282,7 @@ def llm_judge_vision(
         {"type": "text", "text": prompt},
     ]
     body = json.dumps({
-        "model": os.getenv("MINDRA_MODEL", "gemini-3.0-flash-preview"),
+        "model": os.getenv("JUDGE_MODEL", ""),
         "messages": [{"role": "user", "content": msg_content}],
         "max_tokens": 512,
     }).encode()

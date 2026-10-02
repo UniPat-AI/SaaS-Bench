@@ -48,7 +48,7 @@ def docker_exec(container: str, *args: str, timeout: int = 20) -> tuple[int, str
     result = subprocess.run(
         ["docker", "exec", container, *args],
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
@@ -154,9 +154,17 @@ def load_context() -> None:
         _asset_id = int(_asset_rows[0]["id"])
 
     safe_log_name = TASK_LOG_NAME.replace("'", "''")
+    # COLLATE BINARY is mandatory here. log_field_data.name is declared with Drupal's custom
+    # NOCASE_UTF8 collation, which only exists inside a Drupal-managed connection; comparing
+    # that column over a plain PDO handle aborts the whole query with
+    #   PDOException: no such collation sequence: NOCASE_UTF8
+    # so this lookup returned nothing on every run no matter what the agent did — while the
+    # asset lookup above kept working, because asset_field_data.name carries no such collation.
+    # BINARY additionally gives the character-for-character match the task asks for.
+    # agriculture_016 / _031 already query log names this way.
     _log_rows = farmos_query(
         "SELECT id, name, type, timestamp, notes__value FROM log_field_data "
-        f"WHERE type = 'harvest' AND name = '{safe_log_name}' ORDER BY id"
+        f"WHERE type = 'harvest' AND name COLLATE BINARY = '{safe_log_name}' ORDER BY id"
     )
     if len(_log_rows) == 1:
         _log_id = int(_log_rows[0]["id"])
