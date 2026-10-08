@@ -1,0 +1,19 @@
+**任务要求：**
+
+构建一个工程指标仪表板，用于衡量 4 个工作区项目的代码与测试文件比率。在 code-server 中，对每个项目 ["todo-api", "blog-engine", "data-analyzer", "json"]，在文件资源管理器里右键该项目文件夹并选择 'Open in Integrated Terminal'，然后运行与该项目对应的 shell 命令，命令映射为 {"todo-api": "echo \"$(find app -type f -name '*.py' | wc -l) $(find tests -type f -name 'test_*.py' | wc -l)\"", "blog-engine": "echo \"$(find src -type f -name '*.js' | wc -l) $(find tests -type f -name '*.test.js' 2>/dev/null | wc -l)\"", "data-analyzer": "echo \"$(find src -type f -name '*.py' | wc -l) $(find tests -type f -name 'test_*.py' | wc -l)\"", "json": "echo \"$(find include -type f -name '*.hpp' | wc -l) $(find tests/src -type f -name 'unit-*.cpp' | wc -l)\""}（这是一个从项目名到 shell 命令的映射，命令会输出两个整数：源文件数和测试文件数，顺序如此，以空白分隔）。记录每个项目的源文件数（S）和测试文件数（T）。在 Baserow 中创建一个名为 "Engineering Quality Metrics" 的数据库，并创建一个表 "Project Metrics"（字段：Project [primary single-select，且仅包含 ["todo-api", "blog-engine", "data-analyzer", "json"] 中的值]、Source Files [number]、Test Files [number]、Test Coverage Ratio [number，保留 3 位小数]、Quality Tier [single-select: Gold/Silver/Bronze/AtRisk]、Measured At [date]）。按 Project 的字母顺序恰好插入每个项目一行；计算 Test Coverage Ratio = round(T / S, 3)（当 S=0 时设为 0.000）；当 Test Coverage Ratio >= 0.8 时 Quality Tier 设为 "Gold"，当 >= 0.5 时设为 "Silver"，当 >= 0.2 时设为 "Bronze"，否则设为 "AtRisk"；Measured At = 2026-04-01。添加一个按 Test Coverage Ratio 降序排序的 Grid 视图 "Quality Ranking"，以及一个按 Quality Tier 堆叠的 Kanban 视图 "By Tier"。在 Metabase 中，打开 Admin → Databases，并对 Baserow Postgres 数据库触发一次手动 schema sync，使 "Project Metrics" 表变得可见。创建一个名为 "Code Quality Audit Q2 2026" 的 collection，并在其中针对 Baserow Postgres 数据库保存三个问题： (1) "Source vs Test File Counts" — 一个条形图，x-axis=Project，并将 Source Files 和 Test Files 作为分组条形；(2) "Tier Distribution" — 按 Quality Tier 分组的项目计数饼图；(3) "Ratio Ranking" — 一张表，列出每一行的 Project、Test Coverage Ratio 和 Quality Tier，并按 Test Coverage Ratio 降序排序。在 "Code Quality Audit Q2 2026" 中创建一个名为 "Code-to-Test Coverage Audit" 的 Metabase dashboard，dashboard description 精确为 "Code-to-test ratio audit 2026-04-01 across 4 projects"，并添加这三个问题作为 cards。在 OpenProject 项目 "Customer Portal Redesign" 中，对每个 Quality Tier IN (Bronze, AtRisk) 的 Baserow 行创建恰好一个 Task 类型工作包，subject 为 "Raise test coverage: <Project> (ratio <Test Coverage Ratio>)"，assignee 为 qa_lead，Quality Tier=AtRisk 时 priority 为 High，否则为 Normal，description 精确为 "Source: <Source Files>; Tests: <Test Files>; Tier: <Quality Tier>; Measured: 2026-04-01"。
+
+**步骤：**
+
+1. 在 code-server 中打开文件资源管理器，对 ["todo-api", "blog-engine", "data-analyzer", "json"] 中的每个项目文件夹右键，选择 'Open in Integrated Terminal'，运行来自 {"todo-api": "echo \"$(find app -type f -name '*.py' | wc -l) $(find tests -type f -name 'test_*.py' | wc -l)\"", "blog-engine": "echo \"$(find src -type f -name '*.js' | wc -l) $(find tests -type f -name '*.test.js' 2>/dev/null | wc -l)\"", "data-analyzer": "echo \"$(find src -type f -name '*.py' | wc -l) $(find tests -type f -name 'test_*.py' | wc -l)\"", "json": "echo \"$(find include -type f -name '*.hpp' | wc -l) $(find tests/src -type f -name 'unit-*.cpp' | wc -l)\""} 的映射命令；记录每个项目的 S（源文件）和 T（测试文件）
+2. 在 Baserow 中创建数据库 "Engineering Quality Metrics" 和表 "Project Metrics"，使用指定 schema；按字母顺序插入每个项目一行，计算 Test Coverage Ratio 和 Quality Tier；添加 Grid 视图 "Quality Ranking"（按 ratio 降序）和 Kanban 视图 "By Tier"
+3. 在 Metabase Admin → Databases 中，对 Baserow Postgres 连接触发手动 schema sync，使新表可见
+4. 在 Metabase 中创建 collection "Code Quality Audit Q2 2026"，并将三个必需的问题保存到 Baserow Postgres 数据库中
+5. 创建 Metabase dashboard "Code-to-Test Coverage Audit"，放入 "Code Quality Audit Q2 2026" 中，并使用精确 description，然后添加全部三个问题作为 cards
+6. 在 OpenProject 项目 "Customer Portal Redesign" 中，为每个 Bronze/AtRisk 项目创建一个 Task 工作包，使用指定的 subject、assignee qa_lead、priority 和精确 description
+
+**登录凭据：**
+
+- code-server: (no username) / 8a128206e2177bce1e48e565
+- baserow: admin@example.com / Admin1234
+- metabase: admin@metabase.local / mw-admin-123
+- openproject: admin / AdminPass123!
