@@ -1,0 +1,55 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  disruption:
+    budgets:
+      - nodes: 30%
+    consolidateAfter: 5m
+    consolidationPolicy: WhenEmptyOrUnderutilized
+  limits:
+    cpu: "64"
+    memory: 256Gi
+    nodes: "8"
+  template:
+    metadata:
+      labels:
+        kubernetes.azure.com/ebpf-dataplane: cilium
+        kubernetes.azure.com/mode: user
+    spec:
+      expireAfter: Never
+      nodeClassRef:
+        group: karpenter.azure.com
+        kind: AKSNodeClass
+        name: default
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+        - key: kubernetes.io/os
+          operator: In
+          values:
+            - linux
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - on-demand
+        - key: karpenter.azure.com/sku-family
+          operator: In
+          values:
+            - D
+        - key: karpenter.azure.com/sku-name
+          operator: In
+          values:
+            - Standard_D8as_v5
+            - Standard_D8s_v5
+      startupTaints:
+        - effect: NoExecute
+          key: node.cilium.io/agent-not-ready
+          value: "true"
+      taints:
+        - effect: NoSchedule
+          key: saas-bench.io/fakeapp
+          value: "true"
